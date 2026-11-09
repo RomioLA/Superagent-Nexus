@@ -4,7 +4,7 @@
 import { createHash } from 'node:crypto'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
 import type { Trigger } from '../core/index.ts'
 import type { SourceContext } from './host.ts'
 import { taskKind, normalizedTask, cheapReadmeQuery, readReadmeFromProject, legacyResult, nativeTicketStatus } from './feishu-task-router.ts'
@@ -41,7 +41,9 @@ export function intentOf(text: string): ChatIntent {
 }
 export function projectOf(text: string, projects: Project[]): Project | undefined {
   const lower = text.toLowerCase()
-  return projects.find(project => [project.id, project.name, ...project.aliases].some(alias => alias && lower.includes(alias.toLowerCase())))
+  // Project IDs are for explicit /project selection, not substring matching:
+  // id 'test' must not capture a different project's 'Testing' request.
+  return projects.find(project => [project.name, ...project.aliases].some(alias => alias && lower.includes(alias.toLowerCase())))
 }
 export function projectList(projects: Project[]): string {
   if (!projects.length) return '目前没有登记的项目。'
@@ -78,13 +80,15 @@ function belongs(ctx: SourceContext, id: string, actorId: string, chatId: string
   const origin = ticket && ctx.triggers.get(ticket.origin.triggerId)
   return !!ticket && origin?.actor.id === actorId && origin.meta.chatId === chatId
 }
-export function nativeTaskRequest(trigger: Trigger, text: string, kind: 'read' | 'write', repository: string) {
+export function nativeTaskRequest(trigger: Trigger, text: string, kind: 'read' | 'write', repository: string, primaryRepository = repository) {
   const detail = normalizedTask(text)
   const localOnly = /(?:只在本地|仅本地|不要(?:创建|生成|提交|发起) ?PR|不(?:创建|生成|提交|发起) ?PR|不推送|无需PR|no ?PR\b|without (?:a )?pull request)/i.test(detail)
+  const crossRepoNotice = repository.toLowerCase() === primaryRepository.toLowerCase() ? '' :
+    ' This repository is not monitored by the primary GitHub Source: include the PR URL in the result summary and omit pr_number in orchestrator_report; do not claim the primary repository PR.'
   const note = kind === 'write'
     ? (localOnly
       ? 'Use the native DSH Ticket worktree. For complex edits consider orchestrator_codex mode=write; use native DSH tools for simple text changes to avoid double model calls. Run available tests, then report ready with the local worktree path. Do not commit, push, merge, deploy or create a PR. Only report tests actually run.'
-      : 'Use the native DSH Ticket worktree. For complex edits use orchestrator_codex mode=write; for simple edits use native DSH tools directly to avoid duplicate model calls. Inspect diff, run available project tests, commit and create a reviewable GitHub PR on the Ticket branch. Do not merge or deploy; only report tests actually run.')
+      : 'Use the native DSH Ticket worktree. For complex edits use orchestrator_codex mode=write; for simple edits use native DSH tools directly to avoid duplicate model calls. Inspect diff, run available project tests, commit and create a reviewable GitHub PR on the Ticket branch. Do not merge or deploy; only report tests actually run.' + crossRepoNotice)
     : 'Read-only task in native DSH Ticket. Use orchestrator_codex mode=read-only as appropriate. Do not edit, commit, publish or create a PR. Report findings to the requester.'
   return {
     title: detail.slice(0, 90),
@@ -149,13 +153,14 @@ export async function handleFeishuChat(ctx: SourceContext, trigger: Trigger): Pr
     const project = cfg.projects.find(p => p.id === data.selected[chatId])
       ?? cfg.projects.find(p => p.status === 'test')
     const mentioned = projectOf(text, cfg.projects)
+    const target = mentioned ?? project
     let response: string | undefined
     const select = intentOf(text)
     if (select === 'help') response = '可直接说「修改 README 简介」或「检查 README 标题」，无需 /task。/projects 查看项目，/project 选择，/tasks 查 DSH 工单，/result 编号 查看结果，/cancel 编号 停止任务；开发任务默认创建 PR，不自动合并。'
     else if (select === 'projects') response = projectList(cfg.projects)
     else if (select === 'select') {
       const name = text.replace(/^(?:\/project|切换项目|选择项目)(?:\s+|[：:])?/i, '').trim()
-      const chosen = projectOf(name, cfg.projects)
+      const chosen = cfg.projects.find(p => p.id.toLowerCase() === name.toLowerCase()) ?? projectOf(name, cfg.projects)
       if (!chosen) response = '请选择项目：\n' + projectList(cfg.projects)
       else if (chosen.status === 'disabled') response = chosen.name + '尚未接入，不会执行任务。'
       else { data.selected[chatId] = chosen.id; response = '已选择 ' + chosen.name + '。可直接使用自然语言派工，不需要 /task。' }
@@ -177,13 +182,17 @@ export async function handleFeishuChat(ctx: SourceContext, trigger: Trigger): Pr
       else { ctx.retryTask(id); response = '已按原生 DSH 机制重试工单 ' + id + '，沿用原工作区。' }
     } else if (/^\/confirm\s+[0-9a-f]{16}$/i.test(text)) {
       response = '不再需要二次确认。直接用自然语言描述要执行的任务即可。'
-    } else if (mentioned?.status === 'disabled' && kind) {
-      response = mentioned.name + '尚未接入。当前仅测试仓库支持自动派工。'
     } else if (kind) {
-      if (!project || project.status !== 'test' || project.repository !== ctx.deployment.repository) response = '当前选定项目没有与原生 DSH 配置的仓库匹配，未执行。'
-      else if (kind === 'read' && project.directory && cheapReadmeQuery(normalizedTask(text))) response = await readReadmeFromProject(project.directory)
+      if (!target || target.status !== 'test') response = (target?.name ?? '所选项目') + '尚未接入。'
+      else if (!target.repository || !/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/i.test(target.repository)
+        || (target.directory !== undefined && !isAbsolute(target.directory))
+        || (target.repository.toLowerCase() !== ctx.deployment.repository.toLowerCase() && !target.directory))
+        response = '项目缺少有效的 GitHub 仓库或本地目录配置，未派工。'
+      else if (kind === 'read' && target.directory && cheapReadmeQuery(normalizedTask(text))) response = await readReadmeFromProject(target.directory)
       else {
-        const result = ctx.acceptTask(trigger, nativeTaskRequest(trigger, text, kind, project.repository))
+        const routed = { ...trigger, meta: { ...trigger.meta, projectRepository: target.repository,
+          ...(target.directory ? { projectRoot: target.directory } : {}) } }
+        const result = ctx.acceptTask(routed, nativeTaskRequest(routed, text, kind, target.repository, ctx.deployment.repository))
         if (result.received === 'stored') {
           // Native Engine persists the Ticket and queues the acknowledgement/recovery; this chat Router creates neither.
           data.handled = [...data.handled, messageId].slice(-4000)

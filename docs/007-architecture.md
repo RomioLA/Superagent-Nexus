@@ -416,6 +416,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/feishu-chat-router.spec.ts` | Feishu chat text normalization, intent classification and project alias/status handling |
 | `tests/feishu-task-router.spec.ts` | Explicit read-only request parsing, prohibited writes and disabled-project routing protection |
 | `tests/codex-ticket.spec.ts` | Codex Worker tool schema, worktree target and CLI token reporting |
+| `tests/project-environment.spec.ts` | Per-Ticket GitHub repository and worktree root environment routing, including default fallback |
 | `tests/feishu-native-engine.spec.ts` | Native Engine two-Ticket admission, duplicate suppression, independent worktrees, retry and cancellation |
 | `tests/feishu-task-route-smoke.spec.ts` | Single-owner Feishu intake uses native acceptTask once per message; new JSON task ledger is absent |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
@@ -623,3 +624,10 @@ Point `DSH_HOME` at a temporary directory and create a new profile there. Copy t
 
 - Trust: which Trigger fields are trusted, such as the Source's actor and Thread membership, and which are not, such as the body and quotes.
 - Deployment isolation: the agent's profile on its own pinned DeepSeek Harness installation, so upgrading DeepSeek Harness elsewhere does not break it.
+
+
+### Feishu-selected project worktrees (incremental multi-repository support)
+
+The single-owner Feishu chat configuration can select an enabled project's GitHub owner/repo and absolute local Git root. A new request carries those values in its original Trigger metadata, so native Ticket, Assignment, WorkerSlots, retry, and Outbox remain the sole lifecycle. The Executor's existing prepare command reads DSH_SUPERAGENT_PROJECT_ROOT and DSH_SUPERAGENT_GITHUB_REPOSITORY from that Ticket's environment and prepares the correct repository worktree. Legacy and GitHub-origin Tickets keep the primary repository fallback. Disabled projects cannot receive tasks.
+
+The existing GitHub Source still observes the primary configured repository. For a different project, its Worker reports the full PR URL in its completion summary and omits pr_number; this deliberately does not claim the unrelated primary-repository PR number. Automatic PR merge/close tracking for non-primary repositories is not yet provided. Do not describe this stage as full cross-repository GitHub lifecycle support.

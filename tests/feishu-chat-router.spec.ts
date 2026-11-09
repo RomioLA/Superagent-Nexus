@@ -25,6 +25,7 @@ describe('single-user Feishu chat/native Ticket integration', () => {
     expect(projectOf('检查 Cinderella', projects)?.status).toBe('disabled')
     expect(projectList(projects)).toContain('暂未接入')
     expect(projectOf('你好', projects)).toBeUndefined()
+    expect(projectOf('Add a Testing section', projects)).toBeUndefined()
   })
   it('constructs native worktree ticket instructions instead of a second Codex job', () => {
     const request = nativeTaskRequest(trigger, '修改 README 标题', 'write', 'Saworker/superagent-integration-test')
@@ -35,6 +36,9 @@ describe('single-user Feishu chat/native Ticket integration', () => {
     expect(request.scope).toContain('Saworker/superagent-integration-test')
     const readonly = nativeTaskRequest(trigger, '检查 README', 'read', 'Saworker/superagent-integration-test')
     expect(readonly.note).toContain('mode=read-only')
+    const secondary = nativeTaskRequest(trigger, '修改 README', 'write', 'Saworker/second-repo', 'Saworker/superagent-integration-test')
+    expect(secondary.note).toContain('include the PR URL')
+    expect(secondary.scope).toContain('Saworker/second-repo')
     const local = nativeTaskRequest(trigger, '修改 README，但只在本地，不创建PR', 'write', 'Saworker/superagent-integration-test')
     expect(local.note).toContain('Do not commit')
     expect(local.note).toContain('Do not commit, push, merge, deploy or create a PR')

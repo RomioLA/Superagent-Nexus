@@ -27,7 +27,9 @@ describe('Feishu → native DSH Ticket', () => {
     await writeFile(join(cfgDir, 'chat-router.json'), JSON.stringify({
       enabled: true, allowedUser: actor,
       projects: [{ id: 'test', name: 'Super-agent 测试仓库', aliases: ['测试仓库'],
-        status: 'test', repository: 'Saworker/superagent-integration-test' }],
+        status: 'test', repository: 'Saworker/superagent-integration-test' },
+        { id: 'other', name: '第二项目', aliases: ['第二项目'], status: 'test',
+          repository: 'Saworker/second-repo', directory: '/tmp/second-repo' }],
     }))
     const acceptTask = vi.fn((_trigger: Trigger, _request: NativeTaskRequest) => ({ received: 'stored', ticketId: 'f'.repeat(32) }))
     const lark = vi.fn()
@@ -52,6 +54,12 @@ describe('Feishu → native DSH Ticket', () => {
     expect(acceptTask).toHaveBeenCalledTimes(1)
     const state = JSON.parse(await readFile(join(cfgDir, 'chat-router-state.json'), 'utf8'))
     expect(state.handled).toEqual([id])
+    const projectTask = await handleFeishuChat(ctx, msg('在第二项目的 README 中增加说明', 'om_second'))
+    expect(projectTask).toBe(true)
+    expect(acceptTask).toHaveBeenCalledTimes(2)
+    const second = acceptTask.mock.calls[1]!
+    expect(second[0].meta).toMatchObject({ projectRepository: 'Saworker/second-repo', projectRoot: '/tmp/second-repo' })
+    expect(second[1].note).toContain('omit pr_number')
     expect(existsSync(join(cfgDir, 'task-router-state.json'))).toBe(false)
   })
 })

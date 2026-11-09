@@ -87,6 +87,12 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
       execute: async (args, signal) => {
         const current = host.store.tickets.get(ticketId)
         if (!current || !liveTicket(current)) throw new Error('Ticket ended (PR was closed or work finished); do not resume it')
+        // The native GitHub watcher is bound to its configured primary repository.
+        // A PR number from a different project may refer to an unrelated PR in that repository.
+        const originRepo = host.github.triggers.get(current.origin.triggerId)?.meta.projectRepository
+        if (args.pr_number != null && typeof originRepo === 'string'
+          && originRepo.toLowerCase() !== host.github.deployment.repository.toLowerCase())
+          throw new Error('This ticket targets another repository: omit pr_number and include the full PR URL in summary')
         const pull = args.pr_number != null ? await readPull(host.github, args.pr_number, signal) : undefined
         // Claim the PR, record the report, and queue the relay atomically so a rejected PR claim or invalid report leaves no partial state, and a recorded report always reaches the main Session.
         return host.store.atomic(() => {
