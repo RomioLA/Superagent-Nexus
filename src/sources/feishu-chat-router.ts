@@ -39,6 +39,18 @@ export function intentOf(text: string): ChatIntent {
   if (/^(?:\/project|切换项目|选择项目)(?:\s+|[：:])?/i.test(phrase)) return 'select'
   return taskKind(phrase) ? 'task' : 'chat'
 }
+/** Only identify explicit references to prior work; native DSH alone resolves and attaches the Ticket. */
+export function referencesPriorTicket(text: string): boolean {
+  const value = text.trim()
+  // An explicit new-task command retains its existing task semantics.
+  if (/^\/(?:task|run|exec)(?:\s|$)/i.test(value)) return false
+  return /https?:\/\/github\.com\/[a-z0-9_.-]+\/[a-z0-9_.-]+\/(?:pull|issues)\/\d+\b/i.test(value)
+    || /\b(?:PR|pull request|issue)\s*#?\s*\d+\b/i.test(value)
+    || /(?:Ticket|工单)[\s#:：]*[a-f0-9]{16,32}\b/i.test(value)
+    || /(?:上次|上回|上一个|此前|之前|先前|刚才|刚刚|前面|那个|那条|这个|这条|已有的|历史的).{0,35}?(?:PR\b|pull request|issue\b|Ticket\b|工单|任务|话题|改动|修改|提交|分支|测试)/i.test(value)
+    || /(?:继续|接着|跟进|复查|复核|返工|再改|再修|回到).{0,35}?(?:上次|上回|此前|之前|刚才|刚刚|那个|那条|上一个)/i.test(value)
+}
+
 export function projectOf(text: string, projects: Project[]): Project | undefined {
   const lower = text.toLowerCase()
   // Project IDs are for explicit /project selection, not substring matching:
@@ -182,6 +194,17 @@ export async function handleFeishuChat(ctx: SourceContext, trigger: Trigger): Pr
       else { ctx.retryTask(id); response = '已按原生 DSH 机制重试工单 ' + id + '，沿用原工作区。' }
     } else if (/^\/confirm\s+[0-9a-f]{16}$/i.test(text)) {
       response = '不再需要二次确认。直接用自然语言描述要执行的任务即可。'
+    } else if (referencesPriorTicket(text)) {
+      // Let the original DSH Engine and orchestrator decide whether this belongs to
+      // an existing Ticket. Preserve the selected project's execution context if
+      // it instead becomes new work; never invent a Ticket mapping here.
+      const routed = { ...trigger, meta: { ...trigger.meta,
+        ...(target?.status === 'test' && target.repository ? { projectRepository: target.repository,
+          ...(target.directory ? { projectRoot: target.directory } : {}) } : {}) } }
+      await ctx.receive(routed)
+      data.handled = [...data.handled, messageId].slice(-4000)
+      await save(data)
+      return true
     } else if (kind) {
       if (!target || target.status !== 'test') response = (target?.name ?? '所选项目') + '尚未接入。'
       else if (!target.repository || !/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/i.test(target.repository)

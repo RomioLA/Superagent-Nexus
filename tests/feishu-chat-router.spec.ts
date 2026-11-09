@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { intentOf, plainText, projectOf, projectList, arrivalWindow,
-  nativeTaskRequest } from '../src/sources/feishu-chat-router.ts'
+  nativeTaskRequest, referencesPriorTicket } from '../src/sources/feishu-chat-router.ts'
 import type { Trigger } from '../src/core/index.ts'
 const projects = [
   { id: 'test', name: '测试仓库', aliases: ['integration-test'], status: 'test' as const },
@@ -20,6 +20,20 @@ describe('single-user Feishu chat/native Ticket integration', () => {
     expect(intentOf('帮我检查仓库')).toBe('task')
     expect(intentOf('README 是否需要修改？')).toBe('chat')
     expect(intentOf('你好')).toBe('chat')
+  })
+  it('hands explicit history references to native DSH, not the chat or fresh-task router', () => {
+    for (const message of [
+      '灰姑娘刚刚那个 PR 现在怎么样了？',
+      '继续修复上次那个任务',
+      '检查此前的工单有没有完成',
+      'https://github.com/RomioLA/cinderella-companion/pull/8 的情况',
+      'PR #6 审核到哪了',
+      'Ticket 83f9b10375c64f577019c856a3243237 的结果',
+    ]) expect(referencesPriorTicket(message), message).toBe(true)
+    for (const message of [
+      'PR 是什么意思？', '你好', '修改 README 并创建 PR', '/task 修改上次那个 PR',
+      '在 README 里增加 Testing 小节', '我想讨论历史话题是什么',
+    ]) expect(referencesPriorTicket(message), message).toBe(false)
   })
   it('keeps single-project selection without additional per-project user roles', () => {
     expect(projectOf('检查 Cinderella', projects)?.status).toBe('disabled')

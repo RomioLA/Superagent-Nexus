@@ -32,10 +32,11 @@ describe('Feishu → native DSH Ticket', () => {
           repository: 'Saworker/second-repo', directory: '/tmp/second-repo' }],
     }))
     const acceptTask = vi.fn((_trigger: Trigger, _request: NativeTaskRequest) => ({ received: 'stored', ticketId: 'f'.repeat(32) }))
+    const receive = vi.fn((_trigger: Trigger) => 'stored' as const)
     const lark = vi.fn()
     const ctx = {
       deployment: { repository: 'Saworker/superagent-integration-test' },
-      acceptTask,
+      acceptTask, receive,
       commands: { lark },
     } as unknown as SourceContext
     const first = await handleFeishuChat(ctx, msg('在 README 末尾添加一段英文 Testing 说明'))
@@ -49,17 +50,34 @@ describe('Feishu → native DSH Ticket', () => {
     } } as Trigger
     expect(await handleFeishuChat(ctx, followup)).toBe(false)
     expect(acceptTask).toHaveBeenCalledTimes(1)
+    // A new top-level message that refers to an old task must reach DSH's
+    // original cross-thread Ticket lookup/attach flow; not the new-Ticket ingress.
+    const historical = await handleFeishuChat(ctx, msg('查看灰姑娘刚刚那个 PR #8 的状态', 'om_history'))
+    expect(historical).toBe(true)
+    const historicalWrite = await handleFeishuChat(ctx, msg('修改上次那个任务的说明', 'om_history_edit'))
+    expect(historicalWrite).toBe(true)
+    expect(receive).toHaveBeenCalledTimes(2)
+    expect(receive.mock.calls[0]![0].meta).toMatchObject({ projectRepository: 'Saworker/superagent-integration-test' })
+    expect(acceptTask).toHaveBeenCalledTimes(1)
+    expect(lark).not.toHaveBeenCalled()
     const next = await handleFeishuChat(ctx, msg('在 README 末尾添加一段英文 Testing 说明'))
     expect(next).toBe(true)
     expect(acceptTask).toHaveBeenCalledTimes(1)
     const state = JSON.parse(await readFile(join(cfgDir, 'chat-router-state.json'), 'utf8'))
-    expect(state.handled).toEqual([id])
+    expect(state.handled).toEqual([id, 'om_history', 'om_history_edit'])
     const projectTask = await handleFeishuChat(ctx, msg('在第二项目的 README 中增加说明', 'om_second'))
     expect(projectTask).toBe(true)
     expect(acceptTask).toHaveBeenCalledTimes(2)
     const second = acceptTask.mock.calls[1]!
     expect(second[0].meta).toMatchObject({ projectRepository: 'Saworker/second-repo', projectRoot: '/tmp/second-repo' })
     expect(second[1].note).toContain('omit pr_number')
+    const crossThread = await handleFeishuChat(ctx, msg('第二项目上次那个 PR 怎么样了？', 'om_second_followup'))
+    expect(crossThread).toBe(true)
+    expect(acceptTask).toHaveBeenCalledTimes(2)
+    expect(receive).toHaveBeenCalledTimes(3)
+    expect(receive.mock.calls[2]![0].meta).toMatchObject({
+      projectRepository: 'Saworker/second-repo', projectRoot: '/tmp/second-repo',
+    })
     expect(existsSync(join(cfgDir, 'task-router-state.json'))).toBe(false)
   })
 })
