@@ -5,6 +5,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { z } from 'zod'
 import { threadKey, type Thread, type Trigger } from '../core/index.ts'
 import { feishuChatLink } from './feishu-channel.ts'
+import { handleFeishuChat } from './feishu-chat-router.ts'
 import type { FeishuBot } from '../deployment.ts'
 import { validItems, type Tally } from '../infra/commands.ts'
 import { readFeishu, type FeishuRef } from './feishu-read.ts'
@@ -24,6 +25,14 @@ const bot = (ctx: SourceContext): FeishuBot => {
   return resolved
 }
 async function receive(ctx: SourceContext, trigger: Trigger): Promise<void> {
+  // Chat messages share this consumer with coding Tickets; do not open a second Feishu event stream.
+  // Fail closed on a chat-router error rather than forwarding the message as an executable request.
+  try {
+    if (await handleFeishuChat(ctx, trigger)) return
+  } catch (error) {
+    ctx.report('feishu', { state: 'error', detail: `Chat router: ${String(error).slice(0, 250)}` })
+    return
+  }
   await ctx.receive(trigger)
   const chatId = String(trigger.meta.chatId ?? '')
   if (!chatId) return

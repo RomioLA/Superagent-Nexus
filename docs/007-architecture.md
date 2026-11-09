@@ -342,6 +342,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/tools/tool.ts` | The `Tool` type, `readTool`, the `orchestrator_read` of both roles, and `AcknowledgementSchema` |
 | `src/app/tools/main.ts` | The main Session's tools |
 | `src/app/tools/executor.ts` | An Executor Session's tools |
+| `src/app/tools/codex.ts` | DSH ticket-scoped Linux Codex tool; DSH manages workers, worktrees, recovery and PR |
 | `src/app/http.ts` | The `/orchestrator/api` routes: the same-origin check, request limits and one status per kind of failure |
 | `src/app/api.ts` | `Api`, every route with its parameters, query, body and response, and the filters of the lists; it imports only types, so the panel bundles it |
 | `src/app/views/text.ts` | The two forms of a view's text: `preview`, plain text on one line, and `markdown` without HTML; `plain` and `readable` |
@@ -370,6 +371,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/feishu.ts` | The Feishu kind and plugin entry, exported as `./feishu-watch` |
 | `src/sources/feishu-trigger.ts` | Feishu messages as Triggers, by one rule for live events, history pages and topic pages |
 | `src/sources/feishu-loops.ts` | The Feishu loops: the event consumer, history recovery, chat names and polling of subscribed topics |
+| `src/sources/feishu-chat-router.ts` | Single-owner Feishu dialogue and direct natural-language request admission into native Engine/Ticket; no second task queue or forced slash commands |
+| `src/sources/feishu-task-router.ts` | Pure natural-language intent parsing, cheap README reads, legacy V0.3 result readback; native Engine owns all new Tickets |
 | `src/sources/feishu-channel.ts` | The Feishu Channel: topic replies, `sent` or `gone` |
 | `src/sources/feishu-read.ts` | The `feishu/` reads of a Trigger's message, its root, parent and topic, and `feishuThreadContext`, which gives them to assessments with their images |
 | `src/sources/admission-context.ts` | The bounded window an assessment starts from: the first pages of a Trigger's Thread, read through its kind, and the messages around the Trigger |
@@ -410,6 +413,11 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, the pull request rules, health |
 | `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls |
 | `tests/feishu-read.spec.ts`, `tests/github-read.spec.ts` | Feishu and GitHub reads |
+| `tests/feishu-chat-router.spec.ts` | Feishu chat text normalization, intent classification and project alias/status handling |
+| `tests/feishu-task-router.spec.ts` | Explicit read-only request parsing, prohibited writes and disabled-project routing protection |
+| `tests/codex-ticket.spec.ts` | Codex Worker tool schema, worktree target and CLI token reporting |
+| `tests/feishu-native-engine.spec.ts` | Native Engine two-Ticket admission, duplicate suppression, independent worktrees, retry and cancellation |
+| `tests/feishu-task-route-smoke.spec.ts` | Single-owner Feishu intake uses native acceptTask once per message; new JSON task ledger is absent |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |
 | `tests/background.spec.ts` | Waiting for a worker's shell jobs and subagents: an end that woke it, and a host that stops |

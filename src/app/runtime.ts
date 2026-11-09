@@ -158,7 +158,27 @@ export class Runtime extends Service implements SourceHost {
         health: this.runtimeHealth, lifetime: this.lifetime, configured: () => setup.configured(), closing: () => this.closing() })
       this.sourceDeps = { store, engine, outbox, commands, sources, get ready() { return runtime.ready },
         get deployment() { return setup.deployment }, configured: () => setup.configured(),
-        get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => passes.receive(trigger) }
+        get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem },
+        receive: trigger => passes.receive(trigger),
+        acceptTask: (trigger, request) => {
+          if (!setup.configured() || store.settings().paused || runtime.closing()) throw new Error('Orchestrator not accepting new tasks')
+          // Atomic intake+decision ensures the request cannot become a stray native Eval on failure.
+          runtime.quiet++
+          try {
+            const accepted = store.atomic(() => {
+              const received = engine.receive(trigger)
+              if (received !== 'stored') return { received }
+              const outcome = engine.decide(trigger.id, { kind: 'accept', ...request, reason: 'Explicit owner request via Feishu' })
+              if (outcome.kind !== 'accept' || !outcome.ticketId) throw new Error('Native Ticket was not accepted')
+              return { received, ticketId: outcome.ticketId }
+            })
+            passes.request()
+            return accepted
+          } finally { runtime.quiet-- }
+        },
+        stopTask: (ticketId, reason) => engine.stopTicket(ticketId, reason),
+        retryTask: ticketId => engine.retryTicket(ticketId),
+      }
       this.toolHost = { context: ctx, engine, store, prompts, sessions, settings: this.settings, assessor, resources,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(),

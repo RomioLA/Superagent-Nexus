@@ -40,7 +40,17 @@ function host(overrides: Partial<SourceContextDeps> = {}) {
   const receive = vi.fn(async (trigger: Trigger) => { const result = engine.receive(trigger); engine.evaluateDue(); return result })
   // Record outbound messages in the store without sending them.
   const parts: SourceContextDeps = { store, engine, outbox: { send: message => { store.receipts.add(message) } }, commands, sources, deployment,
-    ready: Promise.resolve(), configured: () => true, receive, ...overrides }
+    ready: Promise.resolve(), configured: () => true, receive,
+    acceptTask: (trigger, request) => store.atomic(() => {
+      const received = engine.receive(trigger)
+      if (received !== 'stored') return { received }
+      const accepted = engine.decide(trigger.id, { kind: 'accept', ...request, reason: 'explicit test request' })
+      if (!accepted.ticketId) throw new Error('No ticket')
+      return { received, ticketId: accepted.ticketId }
+    }),
+    stopTask: (id, reason) => engine.stopTicket(id, reason),
+    retryTask: id => engine.retryTicket(id),
+    ...overrides }
   // The Sources' functions take the context; plugin entries and kind callbacks take the host, which builds each kind's context.
   const value = { ...parts, context: (kind: { kind: string; health: readonly string[] }) => sourceContextOf(parts, kind) }
   const context = sourceContextOf(parts, { kind: 'feishu', health: ['github', 'feishu', 'history'] })
@@ -1077,7 +1087,17 @@ describe('feishu event consumer', () => {
     const health = board.all
     const commands = new Commands(() => deployment, {}, controller.signal)
     const deps: SourceContextDeps = { store, engine, outbox: { send: () => {} }, commands, sources, deployment, ready: Promise.resolve(), configured: () => true,
-      receive: (trigger: Trigger) => engine.receive(trigger) }
+      receive: (trigger: Trigger) => engine.receive(trigger),
+      acceptTask: (trigger, request) => store.atomic(() => {
+        const received = engine.receive(trigger)
+        if (received !== 'stored') return { received }
+        const accepted = engine.decide(trigger.id, { kind: 'accept', ...request, reason: 'explicit test' })
+        if (!accepted.ticketId) throw new Error('No ticket')
+        return { received, ticketId: accepted.ticketId }
+      }),
+      stopTask: (id, reason) => engine.stopTicket(id, reason),
+      retryTask: id => engine.retryTicket(id),
+    }
     const turnOff = () => store.saveSettings(SettingsSchema.parse({ sources: { feishu: { enabled: false, config: { chats: [] } } } }))
     return { ctx: sourceContextOf(deps, feishuKind), health, store, turnOff }
   }
