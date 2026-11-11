@@ -3,7 +3,7 @@
  * Ticket-specific directory beside its workspace, so parallel Tickets never share them. Existing Codex and
  * Antigravity credentials are reused through symlinks; Grok gets a private home and never borrows shared auth.
  */
-import { chmod, lstat, mkdir, realpath, symlink, unlink, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, readFile, realpath, symlink, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join, parse, resolve } from 'node:path'
 
@@ -64,6 +64,45 @@ export const sharedCodexHome = (): string => join(homedir(), '.config/superagent
 export async function prepareGrokHome(root: string): Promise<string> {
   const home = await ensureCliDir(join(root, 'grok-user-home'))
   return ensureCliDir(join(home, '.grok'))
+}
+
+const grokSandboxProfile = [
+  '[profiles.dsh-ticket]',
+  'extends = "workspace"',
+  'restrict_network = true',
+  'deny = [',
+  '  "**/.env*",',
+  '  "**/.npmrc",',
+  '  "**/.pypirc",',
+  '  "**/.netrc",',
+  '  "**/auth.json",',
+  '  "**/mcp_credentials.json",',
+  '  "**/.git",',
+  '  "**/.git/**",',
+  '  "**/*.pem",',
+  '  "**/*.key",',
+  '  "**/*.p12",',
+  '  "**/*.pfx",',
+  '  "**/.aws/**",',
+  '  "**/.ssh/**",',
+  ']',
+  '',
+].join('\n')
+
+/** Configures Grok's official workspace sandbox for this Ticket's isolated home, preserving unknown settings. */
+export async function prepareGrokSandboxProfile(grokHome: string): Promise<void> {
+  const path = join(grokHome, 'sandbox.toml')
+  try {
+    const info = await lstat(path)
+    if (info.isSymbolicLink() || !info.isFile()) throw new Error('Grok sandbox config is not a regular file')
+    const existing = await readFile(path, 'utf8')
+    if (existing !== '' && existing !== grokSandboxProfile)
+      throw new Error('Grok sandbox config already contains unexpected settings')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
+  await writeFile(path, grokSandboxProfile, { mode: 0o600 })
+  await chmod(path, 0o600)
 }
 
 /** Narrow AGY grants for native development commands; no general shell or interpreter grant. */

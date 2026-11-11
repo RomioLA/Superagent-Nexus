@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { grokArgs, grokCliArgs, isGrokAuthFailure, parseGrokOutput, ticketGrokTool } from '../src/app/tools/grok.ts'
+import { diagnoseGrokStream, grokArgs, grokCliArgs, isGrokAuthFailure, parseGrokOutput, parseGrokStreamingOutput, ticketGrokTool } from '../src/app/tools/grok.ts'
 import type { Ticket } from '../src/core/index.ts'
 
 describe('Grok Build is a native Executor CLI tool', () => {
@@ -14,17 +14,24 @@ describe('Grok Build is a native Executor CLI tool', () => {
     expect(tool.description).toContain('No fallback')
   })
 
-  it('uses the official headless JSON command with exact workspace, model and fail-closed permissions', () => {
+  it('uses official streaming JSON with ticket-scoped file tools and fail-closed permissions for writes', () => {
     const write = grokCliArgs(grokArgs.parse({ task: 'Change one source file' }), 'prompt', '/tickets/one')
     expect(write.slice(write.indexOf('--cwd'), write.indexOf('--cwd') + 2)).toEqual(['--cwd', '/tickets/one'])
     expect(write.slice(write.indexOf('--model'), write.indexOf('--model') + 2)).toEqual(['--model', 'grok-4.7-build-fast'])
-    expect(write.slice(write.indexOf('--output-format'), write.indexOf('--output-format') + 2)).toEqual(['--output-format', 'json'])
-    expect(write.slice(write.indexOf('--sandbox'), write.indexOf('--sandbox') + 2)).toEqual(['--sandbox', 'strict'])
+    expect(write.slice(write.indexOf('--output-format'), write.indexOf('--output-format') + 2)).toEqual(['--output-format', 'streaming-json'])
+    expect(write.slice(write.indexOf('--sandbox'), write.indexOf('--sandbox') + 2)).toEqual(['--sandbox', 'dsh-ticket'])
     expect(write.slice(write.indexOf('--permission-mode'), write.indexOf('--permission-mode') + 2)).toEqual(['--permission-mode', 'dontAsk'])
-    expect(write.slice(write.indexOf('--tools'), write.indexOf('--tools') + 2)[1]).toBe('read_file,grep,list_dir,search_replace')
+    expect(write.slice(write.indexOf('--tools'), write.indexOf('--tools') + 2)[1]).toBe('read_file,grep,search_replace')
+    expect(write).toContain('Read(/tickets/one/**)')
+    expect(write).toContain('Grep(/tickets/one/**)')
+    expect(write).toContain('Edit(/tickets/one/**)')
+    expect(write).not.toContain('list_dir')
+    expect(write).not.toContain('grep_search')
     expect(write.some(value => value.startsWith('Bash('))).toBe(false)
     expect(write).toContain('Read(**/.env*)')
     expect(write).not.toContain('memory_search')
+    expect(() => grokCliArgs(grokArgs.parse({ task: 'Change one source file' }), 'prompt', '/tickets/unsafe*(x)'))
+      .toThrow('cannot be safely represented')
     expect(write).toContain('--deny')
     expect(write).not.toContain('--always-approve')
 
@@ -56,6 +63,45 @@ describe('Grok Build is a native Executor CLI tool', () => {
       request_id: 'request-456',
       usage: { inputTokens: 120, outputTokens: 32, totalTokens: 152, modelCalls: 1, costUSD: 0.0008 },
     })
+  })
+
+  it('parses streaming-json completion events and records tool metadata without event contents', () => {
+    const output = [
+      { type: 'available_commands', tools: ['GrokBuild:read_file', 'GrokBuild:grep', 'GrokBuild:search_replace'] },
+      { type: 'tool_call', toolCallId: 'tool-1', toolName: 'search_replace', status: 'in_progress',
+        rawInput: { path: '/private/secret.txt', old_string: 'SENSITIVE_CONTENT' } },
+      { type: 'tool_call_update', toolCallId: 'tool-1', status: 'in_progress', content: [] },
+      { type: 'tool_call_update', toolCallId: 'tool-1', status: 'completed',
+        rawOutput: { result: 'SENSITIVE_CONTENT' } },
+      { type: 'text', data: 'Updated the acceptance marker.' },
+      { type: 'usage', signature: { input_tokens: 120, output_tokens: 32 } },
+      { type: 'end', stopReason: 'end_turn', sessionId: 'session-123', requestId: 'request-456',
+        modelUsage: { 'grok-4.7-build-fast': { inputTokens: 120, outputTokens: 32, totalTokens: 152, modelCalls: 1, costUSD: 0.0008 } },
+        total_cost_usd: 0.0008 },
+    ].map(event => JSON.stringify(event)).join('\n') + '\n'
+    const parsed = parseGrokStreamingOutput(output)
+    expect(parsed).toMatchObject({ summary: 'Updated the acceptance marker.', requested_model: 'grok-4.7-build-fast',
+      session_id: 'session-123', request_id: 'request-456', usage: { totalTokens: 152, costUSD: 0.0008 },
+      diagnostics: { phase: 'completed', availableTools: ['grep', 'read_file', 'search_replace'],
+        toolCalls: [{ tool: 'search_replace', status: 'completed' }] } })
+    expect(JSON.stringify(parsed.diagnostics)).not.toContain('secret.txt')
+    expect(JSON.stringify(parsed.diagnostics)).not.toContain('SENSITIVE_CONTENT')
+  })
+
+  it('diagnoses permission denial and a tool call left pending without retaining arguments', () => {
+    expect(diagnoseGrokStream(JSON.stringify({ type: 'error', message: "Couldn't set model; unknown model id" })))
+      .toMatchObject({ phase: 'model_error', eventTypes: ['error'] })
+
+    const denied = diagnoseGrokStream(JSON.stringify({ type: 'permission_denied', tool_name: 'search_replace',
+      reason: 'Edit denied for /private/secret.txt' }))
+    expect(denied).toMatchObject({ phase: 'permission_denied', toolCalls: [{ tool: 'search_replace', status: 'permission_denied' }] })
+    expect(JSON.stringify(denied)).not.toContain('secret.txt')
+
+    const pending = diagnoseGrokStream(JSON.stringify({ type: 'tool_call', toolCallId: 'tool-2', toolName: 'search_replace', status: 'in_progress',
+      rawInput: { path: '/private/secret.txt', new_string: 'SENSITIVE_CONTENT' } }))
+    expect(pending).toMatchObject({ phase: 'tool_execution_pending', toolCalls: [{ tool: 'search_replace', status: 'requested' }] })
+    expect(JSON.stringify(pending)).not.toContain('secret.txt')
+    expect(JSON.stringify(pending)).not.toContain('SENSITIVE_CONTENT')
   })
 
   it('rejects chat text, incomplete turns, errors and output without Grok model usage', () => {

@@ -4,7 +4,7 @@ import { realpath, stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import { z } from 'zod'
 import type { Ticket } from '../../core/index.ts'
-import { cliStateDir, ensureCliDir, prepareGrokHome } from './cli-isolation.ts'
+import { cliStateDir, ensureCliDir, prepareGrokHome, prepareGrokSandboxProfile } from './cli-isolation.ts'
 import type { Tool } from './tool.ts'
 
 export const grokArgs = z.object({
@@ -26,44 +26,61 @@ export interface GrokRunResult {
   requested_model: typeof GROK_BUILD_MODEL
   models: string[]
   cli_version: string
+  diagnostics?: GrokDiagnosticReport
   session_id?: string
   request_id?: string
   usage?: GrokUsage
 }
 
+export type GrokDiagnosticPhase = 'startup' | 'model_error' | 'waiting_model_response' | 'assistant_response' |
+  'tool_execution_pending' | 'waiting_model_after_tool' | 'permission_denied' | 'completed'
+export interface GrokDiagnosticReport {
+  phase: GrokDiagnosticPhase
+  eventTypes: string[]
+  availableTools: string[]
+  toolCalls: Array<{ tool: string; status: 'requested' | 'completed' | 'failed' | 'permission_denied' }>
+}
+
 const timeoutMs = (mode: GrokArgs['mode']) => mode === 'read-only' ? 150_000 : 8 * 60_000
 const maxCapture = 2_000_000
 const stderrCapture = 8_000
+const grokBuildTools = ['read_file', 'grep', 'search_replace'] as const
+const diagnosticToolNames = new Set([
+  ...grokBuildTools, 'grep_search', 'write', 'write_file', 'hashline_read', 'hashline_grep', 'hashline_edit', 'run_terminal_cmd',
+])
 const installHint = 'Install Grok Build from the official xAI CLI docs (Linux/WSL: curl -fsSL https://x.ai/cli/install.sh | bash, or npm install -g @xai-official/grok). No installation was attempted.'
 const protectedPaths = [
   '**/.env*', '**/.npmrc', '**/.pypirc', '**/.netrc',
   '**/auth.json', '**/mcp_credentials.json', '**/.git', '**/.git/**',
   '**/*.pem', '**/*.key', '**/*.p12', '**/*.pfx', '**/.aws/**', '**/.ssh/**',
 ]
-/** Official Grok Build headless flags with Ticket-scoped tools, permission rules and sandbox profile. */
+/** Official Grok Build 1.0.80 headless flags. Read/Grep/Edit aliases map to read_file/grep/search_replace. */
 export function grokCliArgs(args: Pick<GrokArgs, 'mode'>, prompt: string, workspace: string): string[] {
   const write = args.mode === 'write'
+  if (write && (workspace === '/' || !/^\/[A-Za-z0-9._/-]+$/.test(workspace) || workspace.split('/').includes('..')))
+    throw new Error('Ticket workspace path cannot be safely represented in Grok permission rules')
+  const ticketScope = workspace.replace(/\/$/, '') + '/**'
   return [
     '--no-auto-update',
     '--cwd', workspace,
     '--model', GROK_BUILD_MODEL,
-    '--output-format', 'json',
+    '--output-format', write ? 'streaming-json' : 'json',
     '--permission-mode', 'dontAsk',
-    '--sandbox', write ? 'strict' : 'read-only',
+    '--sandbox', write ? 'dsh-ticket' : 'read-only',
     '--max-turns', '50',
     '--no-subagents',
     '--no-memory',
     '--disable-web-search',
     // Do not expose run_terminal_cmd: an allowlisted project script can read files denied to Grok's file tools.
     // DSH runs verification commands outside the Grok agent after reviewing its file changes.
-    '--tools', write ? 'read_file,grep,list_dir,search_replace' : 'read_file,grep,list_dir',
+    '--tools', write ? grokBuildTools.join(',') : 'read_file,grep,list_dir',
     '--disallowed-tools', 'Agent,task,kill_task,get_task_output,web_search,web_fetch,search_tool,use_tool,lsp',
     '--deny', 'MCPTool',
     '--deny', 'WebSearch',
     '--deny', 'WebFetch',
-    '--allow', 'Read',
-    '--allow', 'Grep',
-    ...(write ? ['--allow', 'Edit'] : []),
+    '--allow', write ? 'Read(' + ticketScope + ')' : 'Read',
+    '--allow', write ? 'Grep(' + ticketScope + ')' : 'Grep',
+    ...(write ? ['--allow', 'Edit(' + ticketScope + ')'] : []),
     ...protectedPaths.flatMap(path => [
       '--deny', 'Read(' + path + ')',
       '--deny', 'Grep(' + path + ')',
@@ -143,9 +160,180 @@ export function parseGrokOutput(output: string): Omit<GrokRunResult, 'cli_versio
   }
 }
 
+function normalizedEventType(event: Record<string, unknown>): string {
+  const value = event.type ?? event.event ?? event.kind
+  return typeof value === 'string' && /^[a-z0-9_-]{1,64}$/i.test(value) ? value.toLowerCase() : 'event'
+}
+function normalizedToolName(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const name = value.split(':').at(-1)?.toLowerCase()
+  return name && diagnosticToolNames.has(name) ? name : undefined
+}
+function eventToolName(event: Record<string, unknown>): string | undefined {
+  for (const value of [event.tool_name, event.toolName, event.name, event.tool]) {
+    const direct = normalizedToolName(value)
+    if (direct) return direct
+    const nested = record(value)
+    const fromNested = nested && normalizedToolName(nested.name ?? nested.tool_name ?? nested.toolName)
+    if (fromNested) return fromNested
+  }
+  return undefined
+}
+function eventId(event: Record<string, unknown>): string | undefined {
+  return cleanId(event.toolCallId ?? event.tool_call_id ?? event.tool_use_id ?? event.call_id ?? event.request_id ?? event.id)
+}
+
+/** Collect only event names and allowlisted tool names; never retain or log tool arguments, file paths, or results. */
+class GrokStreamObserver {
+  private pending = ''
+  private readonly eventTypes: string[] = []
+  private readonly availableTools = new Set<string>()
+  private readonly toolCalls: Array<{ id?: string; tool: string; status: 'requested' | 'completed' | 'failed' | 'permission_denied' }> = []
+  private readonly textChunks: string[] = []
+  private endEvent?: Record<string, unknown>
+  private sawUsage = false
+  private sawError = false
+  private permissionDenied = false
+
+  push(chunk: string): void {
+    this.pending += chunk
+    let newline = this.pending.indexOf('\n')
+    while (newline >= 0) {
+      this.observeLine(this.pending.slice(0, newline))
+      this.pending = this.pending.slice(newline + 1)
+      newline = this.pending.indexOf('\n')
+    }
+  }
+
+  finish(): void {
+    if (this.pending.trim()) this.observeLine(this.pending)
+    this.pending = ''
+  }
+
+  private observeLine(line: string): void {
+    let event: Record<string, unknown> | undefined
+    try { event = record(JSON.parse(line)) } catch { return }
+    if (!event) return
+    const type = normalizedEventType(event)
+    if (!this.eventTypes.includes(type) && this.eventTypes.length < 16) this.eventTypes.push(type)
+    if (type === 'text') {
+      const text = typeof event.data === 'string' ? event.data : typeof event.text === 'string' ? event.text : ''
+      if (text) this.textChunks.push(text)
+    }
+    if (type === 'usage') this.sawUsage = true
+    if (type === 'error') this.sawError = true
+    if (type === 'end' || type === 'result') this.endEvent = event
+
+    const tools = event.tools
+    if (Array.isArray(tools)) for (const candidate of tools) {
+      const tool = typeof candidate === 'string' ? normalizedToolName(candidate)
+        : record(candidate) && normalizedToolName(record(candidate)!.name ?? record(candidate)!.tool_name ?? record(candidate)!.toolName)
+      if (tool) this.availableTools.add(tool)
+    }
+
+    const statusText = [event.type, event.code, event.status, event.reason, event.message, event.error]
+      .map(value => typeof value === 'string' ? value : JSON.stringify(value ?? ''))
+      .join(' ')
+    if (/permission[_\s-]?denied|permission.{0,20}(?:refused|rejected|blocked)|tool.{0,20}(?:not allowed|denied)/i.test(statusText))
+      this.permissionDenied = true
+    this.observeToolActions(event)
+  }
+
+  private observeToolActions(value: unknown, depth = 0): void {
+    if (depth > 6) return
+    if (Array.isArray(value)) {
+      for (const child of value) this.observeToolActions(child, depth + 1)
+      return
+    }
+    const event = record(value)
+    if (!event) return
+    const type = normalizedEventType(event)
+    const isToolAction = /tool[_-]?(?:use|call|request|result|completed|failure)|permission[_-]denied/.test(type)
+    const id = eventId(event)
+    const tool = eventToolName(event) ?? (id ? this.toolCalls.findLast(call => call.id === id)?.tool : undefined)
+    if (isToolAction && tool) {
+      const state = typeof event.status === 'string' ? event.status.toLowerCase() : ''
+      const status = this.permissionDenied || /permission[_\s-]?denied|permission.{0,20}(?:refused|rejected|blocked)/i.test(type + ' ' + state)
+        ? 'permission_denied'
+        : /fail|error/.test(type) || /^(?:failed|error)$/.test(state) ? 'failed'
+          : /result|completed/.test(type) || /^(?:completed|succeeded|success|done)$/.test(state) ? 'completed'
+            : 'requested'
+      if (status === 'requested') {
+        const alreadyPending = this.toolCalls.findLast(call => call.tool === tool && call.status === 'requested' &&
+          (!id || !call.id || call.id === id))
+        if (!alreadyPending) this.toolCalls.push({ ...(id ? { id } : {}), tool, status })
+      } else {
+        const previous = this.toolCalls.findLast(call => call.tool === tool && call.status === 'requested' && (!id || call.id === id)) ??
+          this.toolCalls.findLast(call => call.tool === tool && call.status === 'requested' && (!id || !call.id))
+        if (previous) previous.status = status
+        else this.toolCalls.push({ ...(id ? { id } : {}), tool, status })
+      }
+    }
+    for (const key of ['message', 'content', 'update', 'data', 'events']) {
+      const child = event[key]
+      if (child && typeof child === 'object') this.observeToolActions(child, depth + 1)
+    }
+  }
+
+  report(): GrokDiagnosticReport {
+    const phase: GrokDiagnosticPhase = this.endEvent ? 'completed'
+      : this.permissionDenied ? 'permission_denied'
+        : this.sawError ? 'model_error'
+          : this.toolCalls.some(call => call.status === 'requested') ? 'tool_execution_pending'
+            : this.toolCalls.length ? 'waiting_model_after_tool'
+              : this.textChunks.length ? 'assistant_response'
+                : this.sawUsage ? 'assistant_response'
+                  : this.eventTypes.includes('available_commands') ? 'waiting_model_response' : 'startup'
+    return {
+      phase,
+      eventTypes: [...this.eventTypes],
+      availableTools: [...this.availableTools].sort(),
+      toolCalls: this.toolCalls.map(({ tool, status }) => ({ tool, status })),
+    }
+  }
+
+  envelope(): Record<string, unknown> | undefined {
+    if (!this.endEvent) return undefined
+    return {
+      text: this.textChunks.join(''),
+      stopReason: this.endEvent.stopReason,
+      modelUsage: this.endEvent.modelUsage,
+      sessionId: this.endEvent.sessionId,
+      requestId: this.endEvent.requestId,
+      total_cost_usd: this.endEvent.total_cost_usd,
+      usage: this.endEvent.usage,
+    }
+  }
+}
+
+function formatGrokDiagnostics(report: GrokDiagnosticReport): string {
+  const events = report.eventTypes.length ? report.eventTypes.join(',') : 'none'
+  const tools = report.availableTools.length ? report.availableTools.join(',') : 'none'
+  const calls = report.toolCalls.length ? report.toolCalls.map(call => call.tool + ':' + call.status).join(',') : 'none'
+  return `phase=${report.phase}; events=${events}; available_tools=${tools}; tool_calls=${calls}`
+}
+
+/** Return only safe event and tool metadata, for diagnosing an incomplete streaming-json transcript. */
+export function diagnoseGrokStream(output: string): GrokDiagnosticReport {
+  const observer = new GrokStreamObserver()
+  observer.push(output)
+  observer.finish()
+  return observer.report()
+}
+
+/** Convert documented streaming-json events back into the final result envelope, retaining safe diagnostics. */
+export function parseGrokStreamingOutput(output: string): Omit<GrokRunResult, 'cli_version'> {
+  const observer = new GrokStreamObserver()
+  observer.push(output)
+  observer.finish()
+  const envelope = observer.envelope()
+  if (!envelope) throw new Error('Grok stream ended without an end event; ' + formatGrokDiagnostics(observer.report()))
+  return { ...parseGrokOutput(JSON.stringify(envelope)), diagnostics: observer.report() }
+}
+
 interface ProcessResult { exitCode: number | null; exitSignal: NodeJS.Signals | null; stdout: string; stderr: string }
 async function runProcess(args: string[], workspace: string, env: NodeJS.ProcessEnv,
-  signal: AbortSignal, timeout: number): Promise<ProcessResult> {
+  signal: AbortSignal, timeout: number, observer?: GrokStreamObserver): Promise<ProcessResult> {
   signal.throwIfAborted()
   const merged = AbortSignal.any([signal, AbortSignal.timeout(timeout)])
   let stdout = ''
@@ -170,6 +358,7 @@ async function runProcess(args: string[], workspace: string, env: NodeJS.Process
       if (merged.aborted) onAbort()
       child.stdout.on('data', (chunk: Buffer) => {
         const text = chunk.toString()
+        observer?.push(text)
         if (stdout.length + text.length > maxCapture) {
           stdout += text.slice(0, Math.max(0, maxCapture - stdout.length))
           exceeded = true
@@ -180,19 +369,22 @@ async function runProcess(args: string[], workspace: string, env: NodeJS.Process
       child.once('error', error => { merged.removeEventListener('abort', onAbort); reject(error) })
       child.once('close', (code, sig) => {
         merged.removeEventListener('abort', onAbort)
+        observer?.finish()
         exitCode = code
         exitSignal = sig
         resolve()
       })
     })
   } catch (error) {
-    if (signal.aborted) throw new Error('Grok cancelled; inspect partial workspace changes before retrying.', { cause: error })
-    if (merged.aborted) throw new Error('Grok timed out; inspect partial workspace changes before retrying.', { cause: error })
+    const diagnostics = observer ? '; ' + formatGrokDiagnostics(observer.report()) : ''
+    if (signal.aborted) throw new Error('Grok cancelled' + diagnostics + '; inspect partial workspace changes before retrying.', { cause: error })
+    if (merged.aborted) throw new Error('Grok timed out' + diagnostics + '; inspect partial workspace changes before retrying.', { cause: error })
     throw error
   }
   if (merged.aborted) {
     if (signal.aborted) throw new Error('Grok cancelled; inspect partial workspace changes before retrying.')
-    throw new Error('Grok timed out after ' + Math.round(timeout / 1000) + 's; inspect partial workspace changes before retrying.')
+    const diagnostics = observer ? '; ' + formatGrokDiagnostics(observer.report()) : ''
+    throw new Error('Grok timed out after ' + Math.round(timeout / 1000) + 's' + diagnostics + '; inspect partial workspace changes before retrying.')
   }
   if (exceeded) throw new Error('Grok output exceeded the capture limit; inspect the Ticket workspace and partial changes.')
   return { exitCode, exitSignal, stdout, stderr }
@@ -222,19 +414,32 @@ function safeFailureDetail(text: string): string | undefined {
     .trim().slice(0, 500)
   return safe || undefined
 }
+function safeFailureCategory(text: string): string | undefined {
+  if (!text.trim()) return undefined
+  if (isGrokAuthFailure(text)) return 'authentication failure'
+  if (/permission[_\s-]?denied|permission.{0,20}(?:refused|rejected|blocked)|tool.{0,20}(?:not allowed|denied)/i.test(text))
+    return 'permission failure'
+  if (/unknown model id|couldn't set model/i.test(text)) return 'model selection failure'
+  if (/sandbox|landlock|seatbelt/i.test(text)) return 'sandbox failure'
+  return 'CLI error'
+}
 
 /**
  * Run the installed official CLI in this Ticket's exact worktree. Grok credentials live in a private per-Ticket
  * GROK_HOME; the shared user profile and XAI_API_KEY are deliberately not inherited.
  */
 export async function runTicketGrok(directory: string, ticketId: string, task: string,
-  options: { mode: 'read-only' | 'write' }, signal: AbortSignal): Promise<GrokRunResult> {
+  options: { mode: 'read-only' | 'write' }, signal: AbortSignal, timeoutOverrideMs?: number): Promise<GrokRunResult> {
   signal.throwIfAborted()
+  const taskTimeoutMs = timeoutOverrideMs ?? timeoutMs(options.mode)
+  if (!Number.isInteger(taskTimeoutMs) || taskTimeoutMs < 1_000 || taskTimeoutMs > timeoutMs(options.mode))
+    throw new Error('Invalid Grok task timeout')
   const workspace = await realpath(directory)
   if (workspace !== directory || !(await stat(workspace)).isDirectory()) throw new Error('Ticket workspace unavailable')
 
   const root = cliStateDir(directory, ticketId)
   const grokHome = await prepareGrokHome(root)
+  if (options.mode === 'write') await prepareGrokSandboxProfile(grokHome)
   const home = join(root, 'grok-user-home')
   const tmp = await ensureCliDir(join(root, 'tmp'))
   const cache = await ensureCliDir(join(root, 'cache'))
@@ -279,8 +484,9 @@ export async function runTicketGrok(directory: string, ticketId: string, task: s
     task,
   ].join('\n\n')
   let run: ProcessResult
+  const observer = options.mode === 'write' ? new GrokStreamObserver() : undefined
   try {
-    run = await runProcess(grokCliArgs(options, prompt, workspace), workspace, env, signal, timeoutMs(options.mode))
+    run = await runProcess(grokCliArgs(options, prompt, workspace), workspace, env, signal, taskTimeoutMs, observer)
   } catch (error) {
     if (missingCli(error)) throw new Error('Grok Build CLI disappeared before the run started. ' + installHint)
     throw error
@@ -292,10 +498,16 @@ export async function runTicketGrok(directory: string, ticketId: string, task: s
         grokHome + '" grok login --device-auth; shared credentials were not used.')
     }
     const ended = run.exitCode === null ? 'signal ' + (run.exitSignal ?? 'unknown') : 'exit code ' + run.exitCode
-    const detail = safeFailureDetail(run.stdout) ?? safeFailureDetail(run.stderr)
-    throw new Error('Grok Build failed with ' + ended + (detail ? ': ' + detail : '') + '; inspect partial workspace changes before retrying.')
+    const detail = observer
+      ? safeFailureCategory(run.stderr + '\n' + run.stdout)
+      : safeFailureDetail(run.stdout) ?? safeFailureDetail(run.stderr)
+    const diagnostics = observer ? '; ' + formatGrokDiagnostics(observer.report()) : ''
+    throw new Error('Grok Build failed with ' + ended + (detail ? ': ' + detail : '') + diagnostics + '; inspect partial workspace changes before retrying.')
   }
-  try { return { ...parseGrokOutput(run.stdout), cli_version: cliVersion } }
+  try {
+    const parsed = observer ? parseGrokStreamingOutput(run.stdout) : parseGrokOutput(run.stdout)
+    return { ...parsed, cli_version: cliVersion }
+  }
   catch (error) {
     if (error instanceof Error && isGrokAuthFailure(run.stdout + '\n' + run.stderr)) {
       throw new Error('Grok authentication failed for this Ticket. Sign in only to its isolated profile with GROK_HOME="' +
@@ -305,7 +517,7 @@ export async function runTicketGrok(directory: string, ticketId: string, task: s
   }
 }
 
-export function ticketGrokTool(ticket: Ticket): Tool<typeof grokArgs> {
+export function ticketGrokTool(ticket: Ticket, control: { timeoutMs?: number } = {}): Tool<typeof grokArgs> {
   return {
     name: 'orchestrator_grok',
     description: 'Ticket worktree: isolated Grok Build CLI at grok-4.7-build-fast. No fallback or shell; inspect partial changes on failure.',
@@ -314,7 +526,7 @@ export function ticketGrokTool(ticket: Ticket): Tool<typeof grokArgs> {
       const args = grokArgs.parse(raw)
       const directory = ticket.execution?.directory
       if (!directory) throw new Error('Native Ticket has no prepared workspace')
-      return { status: 'finished', ...await runTicketGrok(directory, ticket.id, args.task, args, signal) }
+      return { status: 'finished', ...await runTicketGrok(directory, ticket.id, args.task, args, signal, control.timeoutMs) }
     },
   } satisfies Tool<typeof grokArgs>
 }
