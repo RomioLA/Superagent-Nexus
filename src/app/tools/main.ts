@@ -46,7 +46,7 @@ function routed(host: MainToolsHost, result: { decision?: DecisionKind; reason: 
 const fromDecision = (decision: Decision) => ({ decision: decision.kind, reason: reasonText(decision.reason), ticketId: decision.ticketId })
 /** The Harness and model an owner explicitly requires; the model supplies it, so no keyword parsing guesses it. */
 const HarnessSpecSchema = z.object({
-  harness: z.enum(['dsh', 'agy', 'codex']).describe('Execution backend.'),
+  harness: z.enum(['dsh', 'agy', 'codex', 'grok']).describe('Execution backend.'),
   model: z.enum(['3.8f', '4a']).optional().describe('AGY default: 3.8f. 4a needs explicit authorization.'),
   forbid4a: z.boolean().optional().describe('Never upgrade to 4a.'),
   allowFallback: z.boolean().optional().describe('Only explicit authorization permits fallback.'),

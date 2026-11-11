@@ -1,7 +1,7 @@
 /**
  * Per-Ticket isolation for the executor CLIs: temporary files, caches and per-run artifacts live under a
- * Ticket-specific directory beside its workspace, so parallel Tickets never share them. Existing credentials
- * are reused through symlinks, never copied or modified, so Codex and Antigravity stay authenticated.
+ * Ticket-specific directory beside its workspace, so parallel Tickets never share them. Existing Codex and
+ * Antigravity credentials are reused through symlinks; Grok gets a private home and never borrows shared auth.
  */
 import { chmod, lstat, mkdir, realpath, symlink, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
@@ -59,6 +59,12 @@ export async function reuseCredential(target: string, link: string): Promise<voi
 export const sharedAgyHome = (): string => join(homedir(), '.gemini')
 /** The shared Codex home the deployment already authenticated. */
 export const sharedCodexHome = (): string => join(homedir(), '.config/superagent/codex-home')
+
+/** Creates a private Grok home for one Ticket. No shared Grok credential is copied or linked into it. */
+export async function prepareGrokHome(root: string): Promise<string> {
+  const home = await ensureCliDir(join(root, 'grok-user-home'))
+  return ensureCliDir(join(home, '.grok'))
+}
 
 /** Narrow AGY grants for native development commands; no general shell or interpreter grant. */
 export function agyPermissionGrants(

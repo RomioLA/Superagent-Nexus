@@ -40,7 +40,7 @@ export interface Candidate {
 /** Execution target selected only from the deployment's project mapping. */
 export interface ProjectTarget { repository: string; root?: string; localOnly?: boolean }
 /** The executing Harness a person explicitly requires; the model chooses it, so no keyword parsing stands in for its judgement. */
-export type HarnessName = 'dsh' | 'agy' | 'codex'
+export type HarnessName = 'dsh' | 'agy' | 'codex' | 'grok'
 export interface HarnessSpec {
   harness: HarnessName
   /** The AGY model the owner allows, when they named one; omitted leaves the Harness default. */

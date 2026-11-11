@@ -96,11 +96,13 @@ export function mandateInstructions(mandate: Pick<Mandate, 'strength'>): string 
 /** One sentence per requirement the owner set on the executing Harness, so the worker cannot silently substitute or upgrade. */
 export function harnessInstructions(harness: HarnessSpec): string {
   const line = harness.harness === 'dsh'
-    ? 'Harness required by the owner: DSH-native tools; do not delegate this work to AGY or Codex.'
+    ? 'Harness required by the owner: DSH-native tools; do not delegate this work to AGY, Codex or Grok.'
     : harness.harness === 'agy'
       ? 'Harness required by the owner: the AGY native CLI via orchestrator_agy'
         + (harness.model ? ` (model=${harness.model})` : '') + '; do not substitute Codex or DSH-native coding, and never report another Harness\'s work as AGY\'s.'
-      : 'Harness required by the owner: Codex via orchestrator_codex; do not substitute AGY or DSH-native coding.'
+      : harness.harness === 'codex'
+        ? 'Harness required by the owner: Codex via orchestrator_codex; do not substitute AGY, Grok or DSH-native coding.'
+        : 'Harness required by the owner: Grok Build via orchestrator_grok using the grok-4.7-build-fast model; do not substitute AGY, Codex or DSH-native coding.'
   const parts = [line]
   if (harness.forbid4a) parts.push('Do not use model=4a for any reason; if the required model is unavailable, report blocked rather than upgrading to 4a.')
   if (harness.allowFallback === false) parts.push('Do not fall back to a different Harness on failure; report the failure instead.')
@@ -114,7 +116,7 @@ export function ticketExecution(ticket: Ticket, outcome: Extract<AssessmentOutco
   const name = ticketWorktreeName(outcome.name ?? '', ticket.id)
   const source = ticket.origin.triggerId
   const harness = outcome.harness ? `\nHarness: ${harnessInstructions(outcome.harness)}` : ''
-  const local = outcome.project?.localOnly ? '\nDelivery: local work only; do not commit, push, merge, deploy or create a PR. AGY and Codex execution remain allowed.' : ''
+  const local = outcome.project?.localOnly ? '\nDelivery: local work only; do not commit, push, merge, deploy or create a PR. AGY, Codex and Grok execution remain allowed.' : ''
   const scoped = outcome.scope !== outcome.title ? `\nAuthorized scope: ${outcome.scope}. The original source retains authority.` : ''
   const note = scoped + local + (outcome.note ? `\nRouting note (not the source request): ${outcome.note}` : '') + harness
   const ruleIds = ticket.mandate.basis.rules

@@ -61,5 +61,5 @@ Relay concrete worker blockers briefly, without forwarding internal deliberation
 Default to one Ticket; prefer native subagents for collaboration. If unsure, keep one Ticket.
 Accept tasks[] only for two to six independent subrequests, each retaining the original source and its constraints; steps of one task stay together.
 Use the selected project or a justified project_id from projects (also per task); ask if ambiguous. /project selects context, not work. Never default to a test repository.
-Set harness for actual required execution. AGY defaults to 3.8f; 4a or fallback requires explicit authorization. localOnly limits delivery, not authorized AGY/Codex execution.
+Set harness for actual required execution. AGY defaults to 3.8f; 4a or fallback requires explicit authorization. Grok uses its native Grok Build CLI and grok-4.7-build-fast model; a Grok failure must be reported and never silently replaced. localOnly limits delivery, not authorized AGY/Codex/Grok execution.
 Use native tools for retries, queries, chat and stops; a refused action is not success.

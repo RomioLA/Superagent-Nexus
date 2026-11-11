@@ -2,7 +2,7 @@ import { lstat, mkdir, mkdtemp, readFile, readlink, rm, stat, symlink, writeFile
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { cliStateDir, prepareAgyHome, prepareCodexHome, reuseCredential } from '../src/app/tools/cli-isolation.ts'
+import { cliStateDir, prepareAgyHome, prepareCodexHome, prepareGrokHome, reuseCredential } from '../src/app/tools/cli-isolation.ts'
 
 let dir: string
 beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'cli-isolation-')) })
@@ -98,5 +98,12 @@ describe('per-Ticket CLI isolation', () => {
     expect(await readlink(join(home, 'auth.json'))).toBe(join(shared, 'auth.json'))
     expect(await readlink(join(home, 'config.toml'))).toBe(join(shared, 'config.toml'))
     expect(await readFile(join(shared, 'auth.json'), 'utf8')).toBe('{"a":1}')
+  })
+
+  it('creates a private Grok home without linking shared credentials', async () => {
+    const grokHome = await prepareGrokHome(join(dir, 'root'))
+    expect(grokHome).toBe(join(dir, 'root', 'grok-user-home', '.grok'))
+    expect((await lstat(grokHome)).isSymbolicLink()).toBe(false)
+    await expect(lstat(join(grokHome, 'auth.json'))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 })
