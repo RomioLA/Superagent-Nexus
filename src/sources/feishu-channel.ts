@@ -36,10 +36,14 @@ export async function sendFeishu(host: Pick<SourceContext, 'commands'>, message:
     && message.channel.address.direct === 'true' && chatId) {
     let link = feishuChatLink('feishu', chatId)
     let label = '原聊天'
-    try {
-      link = await readFeishuLink(host.commands, { triggerId: feishuTriggerId(messageId), chatId, messageId })
-      label = '原话题'
-    } catch { /* A chat link still lets the owner find the original result. */ }
+    // A just-created topic can be briefly unavailable to the link lookup. Retry only this read, not the sent result.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        link = await readFeishuLink(host.commands, { triggerId: feishuTriggerId(messageId), chatId, messageId })
+        label = '原话题'
+        break
+      } catch { /* After the bounded read attempts, keep the existing chat-link fallback. */ }
+    }
     await host.commands.lark(['im', '+messages-send', '--chat-id', chatId,
       '--markdown', `工单结果已更新（${message.ticketId.slice(0, 8)}）：[查看${label}](${link})`,
       '--idempotency-key', key('feishu-result-main', message.id)])

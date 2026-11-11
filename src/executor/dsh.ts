@@ -102,7 +102,7 @@ export function harnessInstructions(harness: HarnessSpec): string {
         + (harness.model ? ` (model=${harness.model})` : '') + '; do not substitute Codex or DSH-native coding, and never report another Harness\'s work as AGY\'s.'
       : harness.harness === 'codex'
         ? 'Harness required by the owner: Codex via orchestrator_codex; do not substitute AGY, Grok or DSH-native coding.'
-        : 'Harness required by the owner: Grok Build via orchestrator_grok using the grok-4.7-build-fast model; do not substitute AGY, Codex or DSH-native coding.'
+        : 'Harness required by the owner: Grok Build via orchestrator_grok using the grok-4.7-build-fast model; never report another Harness or model as Grok.'
   const parts = [line]
   if (harness.forbid4a) parts.push('Do not use model=4a for any reason; if the required model is unavailable, report blocked rather than upgrading to 4a.')
   if (harness.allowFallback === false) parts.push('Do not fall back to a different Harness on failure; report the failure instead.')

@@ -123,6 +123,7 @@ function feishu(id: string, text: string, overrides: Record<string, unknown> = {
 const worktreeName = 'fix-regression'
 /** Route one decision with the main Session's orchestrator_route, answering its result; a refused one throws its reason. */
 async function route(item: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (item.kind === 'accept' && !item.harness && !item.tasks) item = { ...item, harness: { harness: 'dsh' } }
   const { results } = await runTool(runtime.masterId, 'orchestrator_route', { decisions: [item] }) as { results: Record<string, unknown>[] }
   if (results[0]!.refused) throw new Error(String(results[0]!.refused))
   return results[0]!
@@ -235,9 +236,9 @@ it('relays an explicit member mention as a candidate and creates the ticket, ack
   expect(runtime.store.replyStatus(key('ack', trigger.id))).toBe('sent')
   const larkCalls = vi.mocked(Commands.prototype.lark).mock.calls.map(([args]) => args)
   expect(larkCalls.find(args => args[1] === '+messages-reply')).toEqual(expect.arrayContaining(['--message-id', 'om_1', '--markdown', '收到，修复回归。']))
-  // The first message holds the request itself: an explicit ticket has no assignment text beyond it, and nothing to read first.
+  // The first message holds the request itself: the ordinary task explicitly selected its default native backend; nothing to read first.
   const first = relays(sessionId)[0]!
-  expect(first).toEqual({ ticket_id: ticket.id, title: '修复回归', trigger: expect.objectContaining({ trigger_id: trigger.id, from: MEMBER,
+  expect(first).toEqual({ ticket_id: ticket.id, title: '修复回归', assignment: expect.stringContaining('DSH-native tools'), trigger: expect.objectContaining({ trigger_id: trigger.id, from: MEMBER,
     thread: `feishu:${CHAT}:om_1`, text: trigger.text }) })
   expect(first.trigger).not.toHaveProperty('read')
   expect(await route({ kind: 'accept', trigger_id: trigger.id, title: 'again', worktree_name: worktreeName, acknowledgement: 'x' })).toMatchObject({ ticket: { ticket_id: ticket.id } })

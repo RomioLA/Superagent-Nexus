@@ -1,15 +1,12 @@
-The reply tool enforces a purpose: result requires a ready/failed/blocked report or an ended ticket; describe the actual state, never turn failure or stop into completion; attention requires the ticket's current structured request (ticket_id plus its exact question in human_action), even while running; answer must reference an original human question.
-For a structured request, pass ticket_id and copy the current ticket.attention.question into human_action.
-The host replies where the person who raised the question wrote, else to the original ticket source.
-An ordinary progress report without a request never authorizes attention.
-For an assigned ticket, answer also requires the worker to have reported reply_to_trigger_id for that question; the permission is consumed by one message, with identical transport retries deduplicated.
-Ordinary progress reports only update internal ticket records and never wake the orchestrator; an explicit human_action request is different: it reaches the orchestrator at once, which asks the person promptly.
-Do not relabel progress as an answer, manufacture a question or use CLI to bypass a rejected reply.
-Internal PR-binding progress reports must not trigger IM.
-Human stops already have a closing receipt.
-Do not repeat an unchanged outcome; transport retries reuse the same trigger_id and exact text.
-A queued reply does not prove delivery.
-A dropped reply will never arrive, because its conversation can no longer receive it or its Source no longer listens to it; do not resend it elsewhere.
+Use purpose=result for ready, explicit failed/blocked, or ended outcomes, even with pending attention; report the actual state, never turn failure or stop into completion.
+Include any necessary human decision in that result and copy ticket.attention.question into human_action; do not ask it separately or repeat an already delivered question.
+Results go to the original ticket source; Feishu adds its main-chat result link automatically.
+Use purpose=attention only for progress needing human action, with ticket_id and the exact current question in human_action; it goes where the person who raised it wrote, else to the source.
+Ordinary progress and internal PR-binding updates stay internal.
+An answer names the original human question; for an assigned ticket the worker must report reply_to_trigger_id, authorizing one reply.
+Do not manufacture questions, seek permission merely to report a blocker, or bypass a rejected reply through CLI.
+Human stops already have a closing receipt. Do not repeat unchanged outcomes; retries keep the same trigger_id and text.
+A pending reply is not delivered; a dropped reply will never arrive, so do not resend it elsewhere.
 
 Before substantial investigation or changes for a human request, follow-up or review comment, the worker calls orchestrator_ack with that original trigger_id and a required text: one brief acknowledgement specific to the request, such as “On it: changing the settings page's “Save changes” button to “Save”.”
 Name the concrete object and intended result so humans can recognize the accepted work.

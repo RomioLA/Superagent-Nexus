@@ -11,7 +11,7 @@ import type { Sessions } from '../sessions.ts'
 import { AcknowledgementSchema, readTool, tool, type Tool } from './tool.ts'
 import { ticketCodexTool } from './codex.ts'
 import { ticketAgyTool } from './agy.ts'
-import { ticketGrokTool } from './grok.ts'
+import { GROK_BUILD_MODEL, ticketGrokTool } from './grok.ts'
 
 export interface ExecutorToolsHost {
   readonly engine: Pick<EngineForExecutor, 'report' | 'reply' | 'markUnrelated' | 'handback' | 'followForContext'>
@@ -43,7 +43,7 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
       const latest = host.store.tickets.get(ticketId)
       if (latest && liveTicket(latest) && latest.execution) {
         latest.execution.harnessRun = { assignmentId: latestAssignment(current)!.id, harness: name,
-          ...(name === 'grok' ? { model: 'grok-4.7-build-fast' } : args.model ? { model: args.model } : {}),
+          ...(name === 'grok' ? { model: GROK_BUILD_MODEL } : args.model ? { model: args.model } : {}),
           ...(typeof grok?.cli_version === 'string' ? { version: grok.cli_version } : {}),
           ...(Array.isArray(grok?.models) && grok.models.every(item => typeof item === 'string') ? { models: grok.models } : {}),
           ...(typeof grok?.session_id === 'string' ? { sessionId: grok.session_id } : {}),

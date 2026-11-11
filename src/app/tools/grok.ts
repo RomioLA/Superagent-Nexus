@@ -13,6 +13,7 @@ export const grokArgs = z.object({
 }).strict()
 
 type GrokArgs = z.infer<typeof grokArgs>
+export const GROK_BUILD_MODEL = 'grok-4.7-build-fast' as const
 export interface GrokUsage {
   inputTokens?: number
   outputTokens?: number
@@ -22,7 +23,7 @@ export interface GrokUsage {
 }
 export interface GrokRunResult {
   summary: string
-  requested_model: 'grok-4.7-build-fast'
+  requested_model: typeof GROK_BUILD_MODEL
   models: string[]
   cli_version: string
   session_id?: string
@@ -39,40 +40,13 @@ const protectedPaths = [
   '**/auth.json', '**/mcp_credentials.json', '**/.git', '**/.git/**',
   '**/*.pem', '**/*.key', '**/*.p12', '**/*.pfx', '**/.aws/**', '**/.ssh/**',
 ]
-const allowedBashCommands = [
-  'git --version',
-  'git status --short',
-  'git diff',
-  'git diff --check',
-  'git diff --stat',
-  'git log -5 --oneline',
-  'git show --stat --oneline HEAD',
-  'git ls-files',
-  'node --version',
-  './node_modules/.bin/vitest run',
-  'pnpm test',
-  'pnpm run test',
-  'pnpm typecheck',
-  'pnpm run typecheck',
-  'pnpm build',
-  'pnpm run build',
-  'pnpm exec vitest run',
-]
-const deniedBashPatterns = [
-  'Bash(git push*)', 'Bash(git commit*)', 'Bash(git merge*)', 'Bash(git reset*)',
-  'Bash(git clean*)', 'Bash(git checkout*)', 'Bash(git switch*)',
-  'Bash(gh*)', 'Bash(sudo*)',
-  'Bash(npm install*)', 'Bash(pnpm install*)', 'Bash(yarn*)', 'Bash(bun install*)',
-  'Bash(curl*)', 'Bash(wget*)', 'Bash(docker*)', 'Bash(kubectl*)',
-]
-
 /** Official Grok Build headless flags with Ticket-scoped tools, permission rules and sandbox profile. */
 export function grokCliArgs(args: Pick<GrokArgs, 'mode'>, prompt: string, workspace: string): string[] {
   const write = args.mode === 'write'
   return [
     '--no-auto-update',
     '--cwd', workspace,
-    '--model', 'grok-4.7-build-fast',
+    '--model', GROK_BUILD_MODEL,
     '--output-format', 'json',
     '--permission-mode', 'dontAsk',
     '--sandbox', write ? 'strict' : 'read-only',
@@ -80,23 +54,21 @@ export function grokCliArgs(args: Pick<GrokArgs, 'mode'>, prompt: string, worksp
     '--no-subagents',
     '--no-memory',
     '--disable-web-search',
-    '--tools', write
-      ? 'read_file,grep,list_dir,search_replace,run_terminal_cmd'
-      : 'read_file,grep,list_dir',
+    // Do not expose run_terminal_cmd: an allowlisted project script can read files denied to Grok's file tools.
+    // DSH runs verification commands outside the Grok agent after reviewing its file changes.
+    '--tools', write ? 'read_file,grep,list_dir,search_replace' : 'read_file,grep,list_dir',
     '--disallowed-tools', 'Agent,task,kill_task,get_task_output,web_search,web_fetch,search_tool,use_tool,lsp',
     '--deny', 'MCPTool',
     '--deny', 'WebSearch',
     '--deny', 'WebFetch',
     '--allow', 'Read',
     '--allow', 'Grep',
-    ...(write ? ['--allow', 'Edit', '--allow', 'Write'] : []),
+    ...(write ? ['--allow', 'Edit'] : []),
     ...protectedPaths.flatMap(path => [
       '--deny', 'Read(' + path + ')',
       '--deny', 'Grep(' + path + ')',
       ...(write ? ['--deny', 'Edit(' + path + ')', '--deny', 'Write(' + path + ')'] : []),
     ]),
-    ...(write ? allowedBashCommands.flatMap(command => ['--allow', 'Bash(' + command + ')']) : []),
-    ...(write ? deniedBashPatterns.flatMap(rule => ['--deny', rule]) : []),
     '-p', prompt,
   ]
 }
@@ -141,8 +113,8 @@ export function parseGrokOutput(output: string): Omit<GrokRunResult, 'cli_versio
       .map(([name]) => name)
       .sort()
     : []
-  if (models.length === 0) {
-    throw new Error('Grok did not report a Grok model call in modelUsage; execution is unverified.')
+  if (!models.includes(GROK_BUILD_MODEL)) {
+    throw new Error('Grok did not report the requested model ' + GROK_BUILD_MODEL + ' in modelUsage; execution is unverified.')
   }
 
   const rawUsage = record(data.usage)
@@ -163,7 +135,7 @@ export function parseGrokOutput(output: string): Omit<GrokRunResult, 'cli_versio
   }
   return {
     summary: summary.slice(0, 5500),
-    requested_model: 'grok-4.7-build-fast',
+    requested_model: GROK_BUILD_MODEL,
     models,
     ...(sessionId ? { session_id: sessionId } : {}),
     ...(requestId ? { request_id: requestId } : {}),
@@ -231,6 +203,24 @@ export function isGrokAuthFailure(text: string): boolean {
 }
 function missingCli(error: unknown): boolean {
   return !!error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT'
+}
+function safeFailureDetail(text: string): string | undefined {
+  let detail = text.trim()
+  if (!detail) return undefined
+  try {
+    const data = record(JSON.parse(detail))
+    if (data && (data.type === 'error' || data.error)) {
+      const nested = record(data.error)
+      detail = typeof data.message === 'string' ? data.message
+        : typeof nested?.message === 'string' ? nested.message : 'structured CLI error'
+    }
+  } catch { /* stderr may be plain text */ }
+  const safe = detail
+    .replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
+    .replace(/\b(?:xai-|sk-)[A-Za-z0-9._-]{12,}\b/gi, '[redacted credential]')
+    .replace(/[\r\n\t ]+/g, ' ')
+    .trim().slice(0, 500)
+  return safe || undefined
 }
 
 /**
@@ -302,7 +292,8 @@ export async function runTicketGrok(directory: string, ticketId: string, task: s
         grokHome + '" grok login --device-auth; shared credentials were not used.')
     }
     const ended = run.exitCode === null ? 'signal ' + (run.exitSignal ?? 'unknown') : 'exit code ' + run.exitCode
-    throw new Error('Grok Build failed with ' + ended + '; inspect partial workspace changes before retrying.')
+    const detail = safeFailureDetail(run.stdout) ?? safeFailureDetail(run.stderr)
+    throw new Error('Grok Build failed with ' + ended + (detail ? ': ' + detail : '') + '; inspect partial workspace changes before retrying.')
   }
   try { return { ...parseGrokOutput(run.stdout), cli_version: cliVersion } }
   catch (error) {
@@ -317,7 +308,7 @@ export async function runTicketGrok(directory: string, ticketId: string, task: s
 export function ticketGrokTool(ticket: Ticket): Tool<typeof grokArgs> {
   return {
     name: 'orchestrator_grok',
-    description: 'Run Grok Build in this Ticket worktree with model grok-4.7-build-fast and isolated login. No fallback; inspect partial changes after failure.',
+    description: 'Ticket worktree: isolated Grok Build CLI at grok-4.7-build-fast. No fallback or shell; inspect partial changes on failure.',
     schema: grokArgs,
     execute: async (raw: unknown, signal: AbortSignal) => {
       const args = grokArgs.parse(raw)

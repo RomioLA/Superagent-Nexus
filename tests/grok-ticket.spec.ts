@@ -21,8 +21,8 @@ describe('Grok Build is a native Executor CLI tool', () => {
     expect(write.slice(write.indexOf('--output-format'), write.indexOf('--output-format') + 2)).toEqual(['--output-format', 'json'])
     expect(write.slice(write.indexOf('--sandbox'), write.indexOf('--sandbox') + 2)).toEqual(['--sandbox', 'strict'])
     expect(write.slice(write.indexOf('--permission-mode'), write.indexOf('--permission-mode') + 2)).toEqual(['--permission-mode', 'dontAsk'])
-    expect(write).toContain('Bash(pnpm test)')
-    expect(write).toContain('Bash(git push*)')
+    expect(write.slice(write.indexOf('--tools'), write.indexOf('--tools') + 2)[1]).toBe('read_file,grep,list_dir,search_replace')
+    expect(write.some(value => value.startsWith('Bash('))).toBe(false)
     expect(write).toContain('Read(**/.env*)')
     expect(write).not.toContain('memory_search')
     expect(write).toContain('--deny')
@@ -71,6 +71,10 @@ describe('Grok Build is a native Executor CLI tool', () => {
       text: 'Completed', stopReason: 'end_turn',
       modelUsage: { 'other-provider-model': { modelCalls: 1 } },
     }))).toThrow('execution is unverified')
+    expect(() => parseGrokOutput(JSON.stringify({
+      text: 'Completed', stopReason: 'end_turn',
+      modelUsage: { 'grok-4.7': { modelCalls: 1 } },
+    }))).toThrow('did not report the requested model grok-4.7-build-fast')
     expect(() => parseGrokOutput(JSON.stringify({
       text: 'Completed', stopReason: 'end_turn',
       modelUsage: { 'grok-4.7-build-fast': { modelCalls: 0 } },

@@ -9,14 +9,14 @@ const ticket = (overrides: Record<string, unknown> = {}) => ({
 }) as unknown as Ticket
 
 describe('native worker notification routing', () => {
-  it('keeps progress internal and routes failed/blocked questions only to the current attention', () => {
+  it('keeps progress internal and preserves terminal results with their attention', () => {
     const asked = ticket({ attention: { id: 'question-1', question: 'Which option?' } })
     expect(reportRelay(asked, { state: 'progress', summary: 'Halfway.' })).toBeUndefined()
     expect(reportRelay(asked, { state: 'blocked', summary: 'Which option?', question: 'Which option?' })).toMatchObject({
-      id: 'attention:ticket-1234567890:question-1', text: expect.stringContaining('"kind":"worker_attention"'),
+      id: expect.stringMatching(/^report:/), text: expect.stringContaining('"kind":"worker_report"'),
     })
     expect(reportRelay(asked, { state: 'failed', summary: 'Need a decision.', question: 'Which option?' })).toMatchObject({
-      id: 'attention:ticket-1234567890:question-1', text: expect.stringContaining('"kind":"worker_attention"'),
+      id: expect.stringMatching(/^report:/), text: expect.stringContaining('"kind":"worker_report"'),
     })
     expect(reportRelay(asked, { state: 'failed', summary: 'Worker crashed.' })).toMatchObject({
       id: expect.stringMatching(/^report:/), text: expect.stringContaining('"kind":"worker_report"'),
@@ -121,4 +121,35 @@ it('reuses the native PR merge receipt when the main Session requests a result',
   expect(host.runtime.store.replyStatus(nativeId)).toBe('sent')
   const mainResultId = key('result', ticket.id, ended.assignments.at(-1)!.id, 'merged', ended.ended!.at)
   expect(host.runtime.store.replyStatus(mainResultId)).toBeUndefined()
+})
+
+it.each(['blocked', 'failed'] as const)('delivers %s with human_action once as a result and suppresses a separate repeated question', async state => {
+  const { ticket, sessionId, trigger } = await host.acceptedTicket(feishu('101', '@bot verify this'))
+  await host.runTool(sessionId, 'orchestrator_report', { state, summary: 'Provider unavailable; checks passed.', human_action: 'Retry later?' })
+  await host.runtime.idle()
+  expect(host.relays(host.runtime.masterId).at(-1)).toMatchObject({ kind: 'worker_report', state,
+    summary: 'Provider unavailable; checks passed.', ticket: { attention: { question: 'Retry later?' } } })
+  const reply = { purpose: 'result' as const, ticketId: ticket.id, question: 'Retry later?', text: 'Provider unavailable; checks passed. Retry later?' }
+  const first = host.runtime.engine.reply(reply)
+  await host.runtime.sendReplies()
+  expect(host.runtime.store.receipts.get(first.id)).toMatchObject({ purpose: 'result', status: 'sent', channel: trigger.channel })
+  expect(host.runtime.engine.reply({ ...reply, text: 'Same report, different words.' })).toMatchObject({ id: first.id, reused: true })
+  expect(host.runtime.engine.reply({ purpose: 'attention', ticketId: ticket.id, question: 'Retry later?', text: 'Retry later?' }))
+    .toMatchObject({ id: first.id, reused: true, status: 'sent' })
+  // The question remains actionable, while a later status report must not ask it again.
+  await host.runTool(sessionId, 'orchestrator_report', { state, summary: 'Still unavailable.', human_action: 'Retry later?' })
+  expect(host.runtime.engine.reply({ purpose: 'attention', ticketId: ticket.id, question: 'Retry later?', text: 'Retry later?' }))
+    .toMatchObject({ id: first.id, reused: true, status: 'sent' })
+})
+
+it('withdraws an unsent progress question when the final result carries that same question', async () => {
+  const { ticket } = await host.acceptedTicket(feishu('102', '@bot inspect this'))
+  host.runtime.engine.report(ticket.id, { state: 'progress', summary: 'Need input.', question: 'Retry later?' })
+  const attention = host.runtime.engine.reply({ purpose: 'attention', ticketId: ticket.id, question: 'Retry later?', text: 'Retry later?' })
+  host.runtime.engine.report(ticket.id, { state: 'blocked', summary: 'Provider unavailable.', question: 'Retry later?' })
+  const result = host.runtime.engine.reply({ purpose: 'result', ticketId: ticket.id, question: 'Retry later?', text: 'Provider unavailable. Retry later?' })
+  expect(host.runtime.store.replyStatus(attention.id)).toBeUndefined()
+  await host.runtime.sendReplies()
+  expect(host.runtime.store.replyStatus(result.id)).toBe('sent')
+  expect(host.runtime.engine.reply({ purpose: 'attention', ticketId: ticket.id, question: 'Retry later?', text: 'Retry later?' }).id).toBe(result.id)
 })
