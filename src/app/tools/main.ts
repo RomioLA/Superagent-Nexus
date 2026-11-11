@@ -46,7 +46,7 @@ function routed(host: MainToolsHost, result: { decision?: DecisionKind; reason: 
 const fromDecision = (decision: Decision) => ({ decision: decision.kind, reason: reasonText(decision.reason), ticketId: decision.ticketId })
 /** The Harness and model an owner explicitly requires; the model supplies it, so no keyword parsing guesses it. */
 const HarnessSpecSchema = z.object({
-  harness: z.enum(['dsh', 'agy', 'codex']).describe('Execution backend.'),
+  harness: z.enum(['dsh', 'agy', 'codex']).describe('Worker execution backend requested by the owner; AGY requires agy, not dsh. Omit enclosing harness for default DSH.'),
   model: z.enum(['3.8f', '4a']).optional().describe('AGY default: 3.8f. 4a needs explicit authorization.'),
   forbid4a: z.boolean().optional().describe('Never upgrade to 4a.'),
   allowFallback: z.boolean().optional().describe('Only explicit authorization permits fallback.'),
@@ -77,7 +77,7 @@ const RouteItemSchema = z.object({
   reason: z.string().nullish().describe('ignore and stop: why, at most 500 characters; an ignore needs it.'),
   project_id: z.string().nullish().describe('accept: registered project id; ask if ambiguous.'),
   tasks: z.array(TaskSpecSchema).max(6).nullish().describe('accept: independent subrequests, each a native Ticket; omit for one.'),
-  harness: HarnessSpecSchema.nullish().describe('accept: required execution Harness; inherited by tasks.'),
+  harness: HarnessSpecSchema.nullish().describe('accept: explicit Worker backend/model, not merely a note; inherited by tasks. Omit for default DSH.'),
 }).strict()
 type RouteItem = z.infer<typeof RouteItemSchema>
 type Kind = RouteItem['kind']
@@ -286,7 +286,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
         trigger_id: z.string().optional().describe('The original human question, for an answer only.'),
         ticket_id: z.string().optional(),
         purpose: z.enum(['answer', 'result', 'attention']),
-        human_action: z.string().trim().min(1).optional().describe('Required for attention: the ticket\'s current attention question.'),
+        human_action: z.string().trim().min(1).optional().describe('Current attention question: required for attention; include with result when combining its human action.'),
         text: z.string().min(1).max(20000),
       }).strict(),
       execute: async args => {

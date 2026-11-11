@@ -83,3 +83,28 @@ it('a required Harness must actually succeed, cannot silently fall back or use 4
   expect(codex).not.toHaveBeenCalled()
   await host.runTool(worker, 'orchestrator_report', { state: 'ready', summary: 'Verified Harness call completed' })
 })
+
+it('retains explicit AGY 3.8F constraints from semantic routing through Worker execution', async () => {
+  const source = feishu('91', '必须用 orchestrator_agy，AGY 3.8F reasoning=high；禁止4A和其他执行器。')
+  host.runtime.receive(source); await host.runtime.idle()
+  const harness = { harness: 'agy', model: '3.8f', forbid4a: true, allowFallback: false }
+  await route([{ kind: 'accept', trigger_id: source.id, title: 'Verify AGY', worktree_name: 'verify-agy', acknowledgement: '开始验收AGY。', harness }])
+  await host.runtime.idle()
+  const ticket = host.runtime.store.tickets.list()[0]!, worker = 'worker-' + ticket.id
+  expect(ticket.execution?.harness).toEqual(harness)
+  expect(ticket.execution?.assignment).toContain('AGY native CLI via orchestrator_agy')
+  expect(ticket.execution?.assignment).not.toContain('DSH-native tools; do not delegate')
+  await expect(host.runTool(worker, 'orchestrator_codex', { task: 'Verify this', mode: 'read-only' })).rejects.toThrow('requires agy')
+  await expect(host.runTool(worker, 'orchestrator_agy', { task: 'Verify this', model: '4a', reasoning: 'high', mode: 'read-only' })).rejects.toThrow('4a requires explicit authorization')
+  await host.runTool(worker, 'orchestrator_agy', { task: 'Verify this', model: '3.8f', reasoning: 'high', mode: 'read-only' })
+  expect(agy).toHaveBeenCalledWith(expect.objectContaining({ model: '3.8f', reasoning: 'high' }), expect.any(AbortSignal))
+  expect(host.runtime.store.tickets.get(ticket.id)?.execution?.harnessRun).toMatchObject({ harness: 'agy', model: '3.8f' })
+})
+
+it('keeps ordinary tasks on the default native DSH path when no Harness was requested', async () => {
+  const { ticket, sessionId } = await host.acceptedTicket(feishu('92', '请只读检查项目配置。'))
+  expect(ticket.execution?.harness).toBeUndefined()
+  await host.runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'Inspected with native tools.' })
+  expect(agy).not.toHaveBeenCalled(); expect(codex).not.toHaveBeenCalled()
+  expect(host.runtime.store.tickets.get(ticket.id)?.ended?.outcome).toBe('completed')
+})

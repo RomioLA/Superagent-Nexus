@@ -27,8 +27,9 @@ export class Replies extends EnginePart {
   /**
    * Queue a message for the Channel its purpose names: an acknowledgement or an answer goes where that person's message was
    * written, attention where the message that raised the question was (or to the ticket's starting conversation), and a
-   * result to the conversation where the ticket started (`result` is allowed only for a ticket in `ready`, `completed`,
-   * `merged`, or `dropped`). Each message is queued at most once (idempotent). An acknowledgement, even one already queued,
+   * result to the conversation where the ticket started (ready, explicit failed/blocked, or an ended ticket), including
+   * its current human question when supplied. An open question never suppresses a deliverable result.
+   * Each message is queued at most once (idempotent). An acknowledgement, even one already queued,
    * records that the ticket's worker took the message up.
    * @throws UserError when the ticket or trigger is unknown or the purpose's rule refuses it, such as a result of a ticket
    * that is not ready, completed, merged, or dropped.
@@ -72,11 +73,17 @@ export class Replies extends EnginePart {
       const reported = !!ticket && liveTicket(ticket) && (state === 'ready'
         || (ticket.mandate.strength === 'explicit' && (state === 'failed' || state === 'blocked')))
       const ready = outcome === 'merged' || outcome === 'completed' || outcome === 'dropped' || outcome === 'stopped' || reported
-      if (!ticket || !ready || (ticket.attention && !ticket.ended)) throw new UserError('notReady')
+      if (!ticket || !ready) throw new UserError('notReady')
     }
     const attention = request.purpose === 'attention' ? ticket?.attention : undefined
     // Attention replies must match the ticket's currently open question text.
     if (request.purpose === 'attention' && (!attention || attention.question !== request.question)) throw new UserError('notAttention')
+    // A consolidated result already queued this question through the same durable Outbox; do not ask it separately.
+    const covered = attention?.resultReplyId
+    const coveredStatus = covered && this.options.outbox.status(covered)
+    if (covered && coveredStatus) return { id: covered, status: coveredStatus, reused: true }
+    if (request.purpose === 'result' && request.question && ticket?.attention?.question !== request.question)
+      throw new UserError('notAttention')
     if (request.purpose === 'answer' && !trigger?.human) throw new UserError('notQuestion')
     const id = request.purpose === 'result' && ticket
       ? key('result', ticket.id, latestAssignment(ticket)?.id ?? '', ticket.ended?.outcome ?? latestAssignment(ticket)?.report?.state ?? '',
@@ -90,6 +97,12 @@ export class Replies extends EnginePart {
     if (!channel) throw new UserError('noChannel')
     this.options.outbox.send({ id, channel, text: request.text, kind: 'reply', ...ticket ? { ticketId: ticket.id } : {},
       ...request.purpose === 'result' ? { purpose: 'result' as const } : {} })
+    if (request.purpose === 'result' && ticket?.attention && request.question === ticket.attention.question) {
+      // Keep the actionable question, but point its delivery at the result instead of creating a second notification.
+      this.withdrawAttention(ticket.attention.id)
+      ticket.attention.resultReplyId = id
+      this.repo.tickets.save(ticket)
+    }
     if (request.purpose === 'answer' && ticket && trigger && ticket.answers?.includes(trigger.id)) {
       ticket.answers = ticket.answers.filter(item => item !== trigger.id)
       this.repo.tickets.save(ticket)

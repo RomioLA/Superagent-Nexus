@@ -184,3 +184,29 @@ describe('Source registry', () => {
     expect(run.mock.calls[2]![1].join(' ')).toContain('open_thread_id=omt_topic')
   })
 })
+
+it('retries a partial Feishu result with the same topic and main-chat idempotency keys', async () => {
+  const sources = new SourceRegistry(() => SettingsSchema.parse({}))
+  sources.register(feishuKind)
+  const commands = new Commands(() => testDeployment(), {}, new AbortController().signal)
+  const delivered = new Map<string, string[]>()
+  let failNotice = true
+  vi.spyOn(commands, 'run').mockImplementation(async (_command, args) => {
+    if (args.includes('+messages-mget')) return JSON.stringify({ ok: true, data: { messages: [
+      { message_id: 'om_result', chat_id: 'oc_dm', message_app_link: 'https://applink.feishu.cn/client/thread/open?open_thread_id=omt_result' },
+    ] } })
+    const id = args[args.indexOf('--idempotency-key') + 1]!
+    if (args.includes('+messages-send') && failNotice) { failNotice = false; throw new Error('Temporary notice failure') }
+    delivered.set(id, [...args])
+    return '{"ok":true,"data":{}}'
+  })
+  const result: OutboundMessage = { id: 'result-with-attention', channel: feishuChannel('oc_dm', 'om_result', true),
+    ticketId: '1234567890abcdef', kind: 'reply', purpose: 'result', text: 'Blocked. Retry later?' }
+  await expect(sources.send(result, commands)).rejects.toThrow('Temporary notice failure')
+  expect(delivered.size).toBe(1)
+  expect(await sources.send(result, commands)).toBe('sent')
+  expect(await sources.send(result, commands)).toBe('sent')
+  expect(delivered.size).toBe(2)
+  expect(delivered.get(result.id)).toEqual(expect.arrayContaining(['+messages-reply', '--message-id', 'om_result', '--reply-in-thread']))
+  expect([...delivered.values()].find(args => args.includes('+messages-send'))?.join(' ')).toContain('open_thread_id=omt_result')
+})

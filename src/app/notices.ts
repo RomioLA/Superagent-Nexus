@@ -114,11 +114,14 @@ export function resultRelay(ticket: Ticket, state: string, text: string, replyTo
 }
 /**
  * Converts a worker report recorded on `ticket` into a main-Session relay: a question for a person produces a
- * `worker_attention` relay, and a result, blocker, end, or answer to a question produces a `worker_report` relay, while
+ * `worker_attention` relay during progress; a result, blocker, end, or answer produces a `worker_report` relay including
+ * the ticket's pending attention, while
  * routine `progress` reports without `answers` stay internal.
  * @returns The steering `Relay`, or `undefined` when the report is not relayed to the main Session.
  */
 export function reportRelay(ticket: Ticket, report: Pick<WorkerReport, 'state' | 'summary' | 'question' | 'answers'>): Relay | undefined {
+  // A terminal turn's result must survive an accompanying human question. The ticket card retains that question.
+  if (report.state !== 'progress') return resultRelay(ticket, report.state, report.summary, report.answers)
   const asked = report.question ? ticket.attention : undefined
   if (asked) {
     return { id: `attention:${ticket.id}:${asked.id}`,

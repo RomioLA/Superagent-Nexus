@@ -934,7 +934,7 @@ describe('the Executor\'s parts', () => {
       mandate: { strength: 'explicit' }, origin: { triggerId: 'tr1' } } as unknown as Ticket
     expect(reportRelay(ticket, { state: 'progress', summary: 'halfway' })).toBeUndefined()
     expect(reportRelay(ticket, { state: 'blocked', summary: 'need input', question: 'Which color?' }))
-      .toMatchObject({ id: 'attention:t1:a1', text: expect.stringContaining('"kind":"worker_attention"') })
+      .toMatchObject({ id: expect.stringMatching(/^report:/), text: expect.stringContaining('"kind":"worker_report"') })
     const ready = reportRelay({ ...ticket, attention: undefined } as unknown as Ticket, { state: 'ready', summary: 'Done',
       answers: 'tr9' })!
     expect(ready.id).toMatch(/^report:/)
