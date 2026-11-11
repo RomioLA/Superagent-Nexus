@@ -28,15 +28,6 @@ export interface SourceHost {
 /** Display label, URL, and facts (`null` removes a fact) that a Source publishes on a Thread. */
 export interface ThreadDescription { label?: string; url?: string; facts?: Record<string, ThreadFact | null> }
 /** Application capabilities exposed to a Source kind for reading state, ingesting triggers, managing threads/tickets, and reporting health. */
-/** An explicit work request accepted through the existing Engine, not a second task queue. */
-export interface NativeTaskRequest {
-  title: string
-  scope: string
-  name: string
-  note: string
-  acknowledgement?: string
-}
-export interface NativeTaskAcceptance { received: ReceiveResult; ticketId?: string }
 export interface SourceContext {
   readonly deployment: Deployment
   readonly commands: Commands
@@ -49,12 +40,6 @@ export interface SourceContext {
   config<C extends Record<string, unknown>>(kind: string): C | undefined
   /** Ingests a trigger into the Engine and schedules the next evaluation pass; callers should await completion before advancing read cursors. */
   receive(trigger: Trigger): ReceiveResult | Promise<ReceiveResult>
-  /** Persist and admit one owner's explicit task through native Ticket/Executor infrastructure. */
-  acceptTask(trigger: Trigger, request: NativeTaskRequest): NativeTaskAcceptance
-  /** Stop one native Ticket on explicit instruction from its original sender. */
-  stopTask(ticketId: string, reason: string): Ticket
-  /** Retry a native Ticket that is blocked or failed, keeping its original workspace. */
-  retryTask(ticketId: string): Ticket
   atomic<T>(work: () => T): T
   /** Source-scoped KV records (such as read cursors); setting `undefined` removes an entry. */
   state: { get<V>(key: Key<V>): V | undefined; set<V>(key: Key<V>, value: V | undefined): void; keys<V>(family: Family<V, never>): Key<V>[] }
@@ -69,7 +54,6 @@ export interface SourceContext {
     get(id: string): Ticket | undefined
     /** Open tickets, newest first. */
     open(): Ticket[]
-    list(): Ticket[]
     /** Binds an open ticket to follow a Source Thread (`own` when opened by the ticket) so the Thread's close, not a ready report, ends the ticket. */
     bindThread(id: string, thread: ThreadRef, own: boolean): void
     /** Reports that a followed Thread closed at `at`; each open ticket following it ends once no `own` Thread remains open and no resumed work is still running. */

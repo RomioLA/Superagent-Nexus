@@ -1,83 +1,67 @@
 import { afterAll, describe, expect, it, vi } from 'vitest'
-import { existsSync } from 'node:fs'
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import type { NativeTaskRequest, SourceContext } from '../src/sources/host.ts'
 import type { Trigger } from '../src/core/index.ts'
-const { home } = vi.hoisted(() => ({ home: '/tmp/sa-native-flow-' + process.pid + '-' + Date.now() }))
-vi.mock('node:os', async importOriginal => ({
-  ...(await importOriginal<typeof import('node:os')>()), homedir: () => home,
-}))
-import { handleFeishuChat } from '../src/sources/feishu-chat-router.ts'
-const actor = 'ou_test'
-const chatId = 'oc_test'
-const id = 'om_test'
-const msg = (text: string, messageId = id): Trigger => ({
-  id: '0123456789abcdef0123456789abcdef',
-  actor: { id: actor, source: 'feishu' },
-  human: true, text, source: 'feishu', at: new Date().toISOString(),
-  threads: [{ source: 'feishu', id: chatId + ':' + messageId }],
-  meta: { direct: true, chatId, messageId },
-}) as Trigger
+import type { SourceContext } from '../src/sources/host.ts'
+const { home } = vi.hoisted(() => ({ home: `/tmp/feishu-native-intake-${process.pid}-${Date.now()}` }))
+vi.mock('node:os', async importOriginal => ({ ...(await importOriginal<typeof import('node:os')>()), homedir: () => home }))
+import { receiveFeishu } from '../src/sources/feishu-loops.ts'
+
+const actor = 'ou_owner'
+const chatId = 'oc_chat'
+const makeTrigger = (text: string, id: string): Trigger => ({ id: id.padEnd(32, '0').slice(0, 32), actor: { id: actor, source: 'feishu' },
+  human: true, text, source: 'feishu', at: new Date().toISOString(), threads: [{ source: 'feishu', id: `${chatId}:${id}` }],
+  meta: { direct: true, chatId, messageId: id } }) as Trigger
 afterAll(async () => { await rm(home, { recursive: true, force: true }) })
-describe('Feishu → native DSH Ticket', () => {
-  it('records only chat dedup and calls native acceptTask exactly once for natural instructions', async () => {
+
+describe('Feishu native ingress', () => {
+  it('sends natural requests, long chat, cancel, query, continuation, and repeated project commands to native receive unchanged', async () => {
     const cfgDir = join(home, '.config/superagent')
     await mkdir(cfgDir, { recursive: true })
-    await writeFile(join(cfgDir, 'chat-router.json'), JSON.stringify({
-      enabled: true, allowedUser: actor,
-      projects: [{ id: 'test', name: 'Super-agent 测试仓库', aliases: ['测试仓库'],
-        status: 'test', repository: 'Saworker/superagent-integration-test' },
-        { id: 'other', name: '第二项目', aliases: ['第二项目'], status: 'test',
-          repository: 'Saworker/second-repo', directory: '/tmp/second-repo' }],
-    }))
-    const acceptTask = vi.fn((_trigger: Trigger, _request: NativeTaskRequest) => ({ received: 'stored', ticketId: 'f'.repeat(32) }))
-    const receive = vi.fn((_trigger: Trigger) => 'stored' as const)
-    const lark = vi.fn()
-    const ctx = {
-      deployment: { repository: 'Saworker/superagent-integration-test' },
-      acceptTask, receive,
-      commands: { lark },
+    await writeFile(join(cfgDir, 'chat-router.json'), JSON.stringify({ enabled: true, allowedUser: actor,
+      projects: [{ id: 'alpha', name: 'Alpha', aliases: ['阿尔法'], status: 'test', repository: 'org/alpha' }] }))
+    const received: Trigger[] = []
+    const state = new Map<string, unknown>()
+    const ctx = { deployment: { feishu: { brand: 'feishu' } },
+      receive: (item: Trigger) => { received.push(item); return 'stored' },
+      state: { get: (key: string) => state.get(key), set: (key: string, value: unknown) => state.set(key, value) },
+      triggers: { get: () => undefined },
+      threads: { describe: vi.fn() },
     } as unknown as SourceContext
-    const first = await handleFeishuChat(ctx, msg('在 README 末尾添加一段英文 Testing 说明'))
-    expect(first).toBe(true)
-    expect(acceptTask).toHaveBeenCalledTimes(1)
-    expect(acceptTask.mock.calls[0]![1]).toMatchObject({ name: 'feishu-0123456789' })
-    expect(lark).not.toHaveBeenCalled()
-    // Follow-ups in a native Ticket thread must pass through the DSH Source/Engine.
-    const followup = { ...msg('已经做完了吗？', 'om_followup'), meta: {
-      direct: true, chatId, messageId: 'om_followup', rootId: id,
-    } } as Trigger
-    expect(await handleFeishuChat(ctx, followup)).toBe(false)
-    expect(acceptTask).toHaveBeenCalledTimes(1)
-    // A new top-level message that refers to an old task must reach DSH's
-    // original cross-thread Ticket lookup/attach flow; not the new-Ticket ingress.
-    const historical = await handleFeishuChat(ctx, msg('查看灰姑娘刚刚那个 PR #8 的状态', 'om_history'))
-    expect(historical).toBe(true)
-    const historicalWrite = await handleFeishuChat(ctx, msg('修改上次那个任务的说明', 'om_history_edit'))
-    expect(historicalWrite).toBe(true)
-    expect(receive).toHaveBeenCalledTimes(2)
-    expect(receive.mock.calls[0]![0].meta).toMatchObject({ projectRepository: 'Saworker/superagent-integration-test' })
-    expect(acceptTask).toHaveBeenCalledTimes(1)
-    expect(lark).not.toHaveBeenCalled()
-    const next = await handleFeishuChat(ctx, msg('在 README 末尾添加一段英文 Testing 说明'))
-    expect(next).toBe(true)
-    expect(acceptTask).toHaveBeenCalledTimes(1)
-    const state = JSON.parse(await readFile(join(cfgDir, 'chat-router-state.json'), 'utf8'))
-    expect(state.handled).toEqual([id, 'om_history', 'om_history_edit'])
-    const projectTask = await handleFeishuChat(ctx, msg('在第二项目的 README 中增加说明', 'om_second'))
-    expect(projectTask).toBe(true)
-    expect(acceptTask).toHaveBeenCalledTimes(2)
-    const second = acceptTask.mock.calls[1]!
-    expect(second[0].meta).toMatchObject({ projectRepository: 'Saworker/second-repo', projectRoot: '/tmp/second-repo' })
-    expect(second[1].note).toContain('omit pr_number')
-    const crossThread = await handleFeishuChat(ctx, msg('第二项目上次那个 PR 怎么样了？', 'om_second_followup'))
-    expect(crossThread).toBe(true)
-    expect(acceptTask).toHaveBeenCalledTimes(2)
-    expect(receive).toHaveBeenCalledTimes(3)
-    expect(receive.mock.calls[2]![0].meta).toMatchObject({
-      projectRepository: 'Saworker/second-repo', projectRoot: '/tmp/second-repo',
-    })
-    expect(existsSync(join(cfgDir, 'task-router-state.json'))).toBe(false)
+    const messages = [
+      '请在 README 末尾补充英文 Testing 说明',
+      '长消息'.repeat(4000),
+      '取消刚才的改动',
+      '刚才的任务现在怎么样？',
+      '继续上次那个任务',
+      '/project 阿尔法',
+      '/project 阿尔法',
+      '查看阿尔法上次 PR 状态',
+    ]
+    for (const [index, text] of messages.entries()) await receiveFeishu(ctx, makeTrigger(text, `om_${index}`))
+    expect(received).toHaveLength(messages.length)
+    expect(received.map(item => item.text)).toEqual(messages)
+    expect(received[1]!.text).toHaveLength(messages[1]!.length)
+    expect(received[5]!.meta.projectSelection).toBe('alpha')
+    expect(received[6]!.meta.projectSelection).toBe('alpha')
+    expect(received[7]!.meta.projectId).toBe('alpha')
+    expect(ctx.threads.describe).toHaveBeenCalledTimes(messages.length)
+    expect('acceptTask' in ctx).toBe(false)
+    expect('stopTask' in ctx).toBe(false)
+    expect('retryTask' in ctx).toBe(false)
+  })
+  it('still sends a message to native receive when project configuration cannot be parsed', async () => {
+    const cfgDir = join(home, '.config/superagent')
+    await mkdir(cfgDir, { recursive: true })
+    await writeFile(join(cfgDir, 'chat-router.json'), '{broken')
+    const receive = vi.fn()
+    const ctx = { deployment: { feishu: { brand: 'feishu' } }, receive,
+      state: { get: () => undefined, set: vi.fn() }, triggers: { get: () => undefined }, threads: { describe: vi.fn() },
+    } as unknown as SourceContext
+    const message = makeTrigger('继续上次任务', 'om_badconfig')
+    await receiveFeishu(ctx, message)
+    expect(receive).toHaveBeenCalledTimes(1)
+    expect(receive.mock.calls[0]![0]).toMatchObject({ text: message.text,
+      meta: { projectRequired: true, projects: [], projectConfigError: 'invalid' } })
   })
 })

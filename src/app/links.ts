@@ -63,7 +63,8 @@ export async function candidateCard(host: LinkHost, candidate: Candidate) {
   // Format the primary trigger like a worker input (including the message it replies to) and summarize earlier batch triggers as cards.
   const others = candidate.triggers.filter(trigger => trigger.id !== primary.id)
   return { ...triggerMessage(primary, await sourceLink(host, primary), undefined, repliedTo(host, primary)), strength: candidate.strength,
-    mode: settings.eval.mode, ...others.length ? { batch: others.map(trigger => triggerCard(trigger)) } : {},
+    mode: settings.eval.mode,
+    ...(primary.meta.projectRequired ? { projects: primary.meta.projects, selected_project: primary.meta.projectId ?? null, project_selection: primary.meta.projectSelection, project_config_error: primary.meta.projectConfigError } : {}), ...others.length ? { batch: others.map(trigger => triggerCard(trigger)) } : {},
     ...handedBack.length ? { handed_back: handedBack } : {}, ...relatedTickets(candidate.tickets),
     ...(delivered.length ? { delivered_to: delivered } : {}), ...(referenced.length ? { referenced_tickets: referenced.map(ticketCard) } : {}),
     next_action: candidate.strength === 'explicit' ? 'Route it with orchestrator_route as dispatch says: accept, attach, stop or ignore.'

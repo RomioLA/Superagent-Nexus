@@ -5,7 +5,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { mkdir, rmdir, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { key, latestAssignment, latestReport, liveTicket, runningAssignment, threadKey, waitsForPerson } from '../core/index.ts'
-import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Executor, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
+import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Executor, HarnessSpec, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
   from '../core/index.ts'
 import type { Machine } from '../deployment.ts'
 import { runAsWorker, verifyDirectory } from '../infra/environment.ts'
@@ -93,12 +93,30 @@ export function mandateInstructions(mandate: Pick<Mandate, 'strength'>): string 
     + 'internal to one module within the accepted rule scope. If it requires public-interface or behavior changes, new interaction, product '
     + 'decisions or clarification, stop and report dropped; do not expand scope.' : ''
 }
+/** One sentence per requirement the owner set on the executing Harness, so the worker cannot silently substitute or upgrade. */
+export function harnessInstructions(harness: HarnessSpec): string {
+  const line = harness.harness === 'dsh'
+    ? 'Harness required by the owner: DSH-native tools; do not delegate this work to AGY or Codex.'
+    : harness.harness === 'agy'
+      ? 'Harness required by the owner: the AGY native CLI via orchestrator_agy'
+        + (harness.model ? ` (model=${harness.model})` : '') + '; do not substitute Codex or DSH-native coding, and never report another Harness\'s work as AGY\'s.'
+      : 'Harness required by the owner: Codex via orchestrator_codex; do not substitute AGY or DSH-native coding.'
+  const parts = [line]
+  if (harness.forbid4a) parts.push('Do not use model=4a for any reason; if the required model is unavailable, report blocked rather than upgrading to 4a.')
+  if (harness.allowFallback === false) parts.push('Do not fall back to a different Harness on failure; report the failure instead.')
+  else if (harness.allowFallback === true) parts.push('A documented fallback is allowed if the preferred Harness is unavailable.')
+  parts.push('State the Harness and model actually used in the final report.')
+  return parts.join(' ')
+}
 /** Builds a newly accepted ticket's Execution metadata: its worktree name, workspace directory, and assignment text. */
 export function ticketExecution(ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>, settings: Settings,
   stateDir: string): Execution {
   const name = ticketWorktreeName(outcome.name ?? '', ticket.id)
   const source = ticket.origin.triggerId
-  const note = outcome.note ? `\nRouting note (not the source request): ${outcome.note}` : ''
+  const harness = outcome.harness ? `\nHarness: ${harnessInstructions(outcome.harness)}` : ''
+  const local = outcome.project?.localOnly ? '\nDelivery: local work only; do not commit, push, merge, deploy or create a PR. AGY and Codex execution remain allowed.' : ''
+  const scoped = outcome.scope !== outcome.title ? `\nAuthorized scope: ${outcome.scope}. The original source retains authority.` : ''
+  const note = scoped + local + (outcome.note ? `\nRouting note (not the source request): ${outcome.note}` : '') + harness
   const ruleIds = ticket.mandate.basis.rules
   const rules = settings.policy.rules.filter(rule => ruleIds?.includes(rule.id))
     .map(rule => `\n- ${rule.name} (${rule.id}): ${rule.instruction}`).join('')
@@ -107,7 +125,7 @@ export function ticketExecution(ticket: Ticket, outcome: Extract<AssessmentOutco
   const assignment = ticket.mandate.strength === 'inferred' && ruleIds
     ? `Proactively accepted under ${ruleIds.join(', ')}. Scope: ${outcome.scope}.${precedence}${note}`
     : note.trim()
-  return { name, directory: join(executionRoot(settings, stateDir), name), assignment }
+  return { name, directory: join(executionRoot(settings, stateDir), name), assignment, ...(outcome.harness ? { harness: outcome.harness } : {}), ...(outcome.project ? { project: outcome.project } : {}) }
 }
 /** Character limits for inline assignment and trigger text in worker messages; longer text is read via its resource. */
 const ASSIGNMENT_CHARS = 1500, TRIGGER_CHARS = 600

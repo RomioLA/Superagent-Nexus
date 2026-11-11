@@ -1,10 +1,11 @@
 /** Feishu outbound channel: posts threaded bot replies and constructs chat deep links. */
-import type { OutboundMessage } from '../core/index.ts'
+import { key, type OutboundMessage } from '../core/index.ts'
 import { CliError } from '../infra/commands.ts'
 import { checkedImText } from '../infra/text.ts'
 import type { SourceContext } from './host.ts'
 import type { ChannelLink, ChannelLinks } from './kind.ts'
 import { feishuTriggerId } from './feishu-trigger.ts'
+import { readFeishuLink } from './feishu-read.ts'
 
 /** Feishu or Lark AppLink that opens a chat; used when the message's own link was not delivered with the event. */
 export const feishuChatLink = (brand: 'feishu' | 'lark', chatId: string): string =>
@@ -15,16 +16,33 @@ export const feishuChatLink = (brand: 'feishu' | 'lark', chatId: string): string
  */
 const gone = (error: unknown): boolean => error instanceof CliError && error.code !== undefined && (error.code === 230011
   || /withdrawn/i.test(error.message) || (Math.floor(error.code / 100) === 2300 && /not found/i.test(error.message)))
-/** Replies in the topic of the target message; Feishu keeps at most one reply per idempotency key (the outgoing message's `message.id`). */
+/** Acknowledgements appear in the main chat; replies remain in the topic. Final results also get a short P2P chat notice. */
 export async function sendFeishu(host: Pick<SourceContext, 'commands'>, message: OutboundMessage): Promise<'sent' | 'gone'> {
   const messageId = message.channel.address.messageId
   if (!messageId) throw new Error('Missing Feishu reply target')
   const text = checkedImText(message.text)
-  const reply = ['im', '+messages-reply', '--message-id', messageId, '--markdown', text, '--reply-in-thread', '--idempotency-key', message.id]
+  // Acknowledgements should be visible in the main chat; keep results and follow-ups in their original topic.
+  const reply = ['im', '+messages-reply', '--message-id', messageId, '--markdown', text,
+    ...(message.kind === 'acknowledgement' ? [] : ['--reply-in-thread']), '--idempotency-key', message.id]
   try { await host.commands.lark(reply) }
   catch (error) {
     if (gone(error)) return 'gone'
     throw error
+  }
+  // Topic replies need not notify someone who has not subscribed to the topic.
+  // Keep the full result there; send only a short main-chat notice for direct-message results.
+  const chatId = message.channel.address.chatId
+  if (message.kind === 'reply' && message.purpose === 'result' && message.ticketId
+    && message.channel.address.direct === 'true' && chatId) {
+    let link = feishuChatLink('feishu', chatId)
+    let label = '原聊天'
+    try {
+      link = await readFeishuLink(host.commands, { triggerId: feishuTriggerId(messageId), chatId, messageId })
+      label = '原话题'
+    } catch { /* A chat link still lets the owner find the original result. */ }
+    await host.commands.lark(['im', '+messages-send', '--chat-id', chatId,
+      '--markdown', `工单结果已更新（${message.ticketId.slice(0, 8)}）：[查看${label}](${link})`,
+      '--idempotency-key', key('feishu-result-main', message.id)])
   }
   return 'sent'
 }

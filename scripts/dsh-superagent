@@ -173,8 +173,17 @@ def start(args):
         log = ARTIFACTS / f'dsh-superagent-{args.profile}-{stamp}-{os.getpid()}.log'
         log.touch()
         prune_logs(args.profile)
+        # Load the two existing Magpie credentials inside the tmux shell, not into tmux command arguments.
+        # This works for both a new tmux server and an existing server with a stale environment.
+        key_dir = Path.home() / '.config' / 'superagent'
+        keys = [('MAGPIE_ROUTER_KEY', key_dir / 'magpie-router-key'),
+                ('MAGPIE_WORKER_KEY', key_dir / 'magpie-worker-key')]
+        for name, path in keys:
+            if not path.is_file() or not path.stat().st_size:
+                raise RuntimeError(f'{name} credential file is missing or empty: {path}')
+        exports = '; '.join(f'export {name}="$(cat {shlex.quote(str(path))})"' for name, path in keys)
         # `exec` replaces the shell so the pane PID printed by tmux is the DSH service process itself.
-        command = ('umask 077; exec ' + shlex.join([dsh, '--profile', args.profile, '--no-open'])
+        command = ('umask 077; ' + exports + '; exec ' + shlex.join([dsh, '--profile', args.profile, '--no-open'])
                    + ' >> ' + shlex.quote(str(log)) + ' 2>&1')
         # Reuse an existing tmux session without disturbing other windows.
         target = ['new-window', '-t', '=' + session + ':'] if exists else ['new-session', '-s', session]

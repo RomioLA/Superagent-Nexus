@@ -3,7 +3,7 @@ import type { EngineForSources, ReceiveResult, Trigger } from '../core/index.ts'
 import type { Deployment } from '../deployment.ts'
 import type { Commands } from '../infra/commands.ts'
 import type { SetupProblem } from '../setup.ts'
-import type { NativeTaskAcceptance, NativeTaskRequest, SourceContext } from '../sources/host.ts'
+import type { SourceContext } from '../sources/host.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
 import type { Outbox } from './outbox.ts'
 import type { Store } from './store.ts'
@@ -24,9 +24,6 @@ export interface SourceContextDeps {
   readonly feishuProblem?: SetupProblem | undefined
   /** Hands a Trigger to the Engine and schedules the pass that assesses it. */
   receive(trigger: Trigger): ReceiveResult | Promise<ReceiveResult>
-  acceptTask(trigger: Trigger, request: NativeTaskRequest): NativeTaskAcceptance
-  stopTask(ticketId: string, reason: string): import('../core/index.ts').Ticket
-  retryTask(ticketId: string): import('../core/index.ts').Ticket
 }
 
 /**
@@ -47,9 +44,6 @@ export function sourceContextOf(deps: SourceContextDeps, kind: { kind: string; h
       return instance?.enabled ? instance.config : undefined
     },
     receive: trigger => deps.receive(trigger),
-    acceptTask: (trigger, request) => deps.acceptTask(trigger, request),
-    stopTask: (ticketId, reason) => deps.stopTask(ticketId, reason),
-    retryTask: ticketId => deps.retryTask(ticketId),
     atomic: work => store.atomic(work),
     state: {
       get: name => store.get(name),
@@ -65,7 +59,6 @@ export function sourceContextOf(deps: SourceContextDeps, kind: { kind: string; h
     tickets: {
       get: id => store.tickets.get(id),
       open: () => store.tickets.open(),
-      list: () => store.tickets.list(),
       bindThread: (id, thread, own) => { deps.engine.bindThread(id, thread, own) },
       threadClosed: (thread, outcome, at) => { deps.engine.threadClosed(thread, outcome, at) },
     },

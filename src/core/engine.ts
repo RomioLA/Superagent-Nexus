@@ -2,7 +2,7 @@
 import { UserError } from './errors.ts'
 import { isoTime, liveTicket } from './model.ts'
 import type { ChannelRef, Decision, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
-import type { Candidate, Repositories } from './ports.ts'
+import type { AcceptTasksOutcome, Candidate, Repositories } from './ports.ts'
 import type { EngineOptions } from './part.ts'
 import { Assignments, type WorkerReport } from './assignments.ts'
 import { Evals, type Outcome } from './evals.ts'
@@ -98,6 +98,15 @@ export class Engine {
    * mode or without enabled matching rules.
    */
   decide(triggerId: string, outcome: Outcome): Decision { return this.repo.atomic(() => this.evals.decide(triggerId, outcome)) }
+  /**
+   * Accept one explicit message as several independent native Tickets, each retaining the original Trigger on the same Thread. The main
+   * Session supplies the tasks its model recognized, so recognition stays model-driven; the Ticket/Assignment/Worker lifecycle
+   * is the ordinary one. The message itself starts no Ticket.
+   * @throws UserError when the Trigger is unknown, not an explicit admissible request, a worker still decides it, or an Eval holds a batch rather than that message alone.
+   */
+  acceptTasks(triggerId: string, outcome: AcceptTasksOutcome): { ticketIds: string[] } {
+    return this.repo.atomic(() => this.evals.acceptTasks(triggerId, outcome))
+  }
   /**
    * Attach a Trigger to a ticket that the message points at: the ticket follows the Trigger's Threads and receives it as an
    * Input with the routing note, and the Eval that holds the Trigger ends, since the ticket has it now; the other Triggers of
@@ -260,7 +269,7 @@ export class Engine {
 /** What Sources ask and tell the Engine. */
 export type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'threadClosed'>
 /** What the main Session asks of the Engine. */
-export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'attach' | 'reply' | 'requestStatus' | 'note'>
+export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'acceptTasks' | 'attach' | 'reply' | 'requestStatus' | 'note'>
 /** What people ask of the Engine, through the panel or the main Session. */
 export type EngineForPeople = Pick<Engine, 'stopTicket' | 'retryTicket' | 'reevaluate' | 'unsubscribe' | 'dismiss'>
 /** What Settings tells the Engine. */

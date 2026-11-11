@@ -9,7 +9,7 @@ describe('Codex is a native Executor tool, not an independent job scheduler', ()
     const args = tool.schema.parse({ task: 'Update the README document' })
     expect(args).toMatchObject({ mode: 'write' })
     expect(() => tool.schema.parse({ task: 'x', directory: '/private' })).toThrow()
-    expect(tool.description).toContain('THIS ticket worktree')
+    expect(tool.description).toContain('THIS Ticket worktree')
   })
   it('does not invent token metrics', () => {
     expect(reportedCodexTokens('tokens used\n15,001\n')).toBe(15001)

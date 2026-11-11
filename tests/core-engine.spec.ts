@@ -1047,6 +1047,7 @@ describe('replies', () => {
     h.engine.report(ticketId, { state: 'ready', summary: 'Done' })
     expect(h.engine.reply({ purpose: 'result', ticketId, text: 'Done' })).toMatchObject({ status: 'pending' })
     expect(h.outbox.at(-1)!.channel).toEqual(trigger('1').channel)
+    expect(h.outbox.at(-1)!.purpose).toBe('result')
   })
 })
 describe('ticket commands', () => {
@@ -1288,14 +1289,15 @@ describe('gaps', () => {
     expect(h.engine.reply({ purpose: 'result', ticketId, text: 'Done' })).toMatchObject({ reused: false })
     expect(h.engine.reply({ purpose: 'result', ticketId, text: 'Done' })).toMatchObject({ reused: true })
     expect(h.outbox).toHaveLength(sent + 1)
-    // A ticket whose PR closed unmerged, or that a person stopped, has no result to send.
+    // An unmerged close has no completed result; a human stop now permits its actual closing receipt.
     const closed = accepted(h, '5', 't5').ticketId!
     h.engine.bindThread(closed, { source: 'gh', id: 'pr-1' }, true)
     h.engine.threadClosed({ source: 'gh', id: 'pr-1' }, 'closed', '2026-09-23T00:01:00Z')
     expect(() => h.engine.reply({ purpose: 'result', ticketId: closed, text: 'x' })).toThrow(new UserError('notReady'))
     const stopped = accepted(h, '6', 't6').ticketId!
     h.engine.stopTicket(stopped)
-    expect(() => h.engine.reply({ purpose: 'result', ticketId: stopped, text: 'x' })).toThrow(new UserError('notReady'))
+    expect(h.engine.reply({ purpose: 'result', ticketId: stopped, text: 'Stopped, existing work kept.' }).reused).toBe(false)
+    expect(h.engine.reply({ purpose: 'result', ticketId: stopped, text: 'Stopped.' }).reused).toBe(true)
   })
   it('keeps an Eval\'s deadline on a repeated delivery, refuses to queue a held Trigger again, and puts expired Triggers first', () => {
     const h = harness()

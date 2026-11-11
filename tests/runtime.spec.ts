@@ -47,6 +47,7 @@ let sections: Map<string, Section>
 type Guard = (execution?: { name: string; arguments: unknown }) => string | undefined
 let guards: Map<string, Guard>
 let restricts: Map<string, unknown[]>
+let officialExternalSubagents = false
 type HttpHandler = (req: unknown, res: unknown) => Promise<void>
 let http: HttpHandler
 async function api(method: string, path: string): Promise<{ status: number; body: unknown }> {
@@ -135,6 +136,7 @@ async function acceptedTicket(trigger = feishu('1', '@bot 修一下回归')) {
   return { trigger, ticket, sessionId: `worker-${ticket.id}` }
 }
 beforeEach(async () => {
+  officialExternalSubagents = false
   directory = mkdtempSync(join(tmpdir(), 'orchestrator-runtime-'))
   vi.spyOn(Commands.prototype, 'gh').mockImplementation(async args => args[1] === 'user' ? { login: 'agent-bot' } : args[1]?.includes('/pulls/') ? { state: 'open', user: { login: 'agent-bot' }, html_url: 'https://github.com/acme/widgets/pull/' + args[1].split('/').at(-1), head: { ref: `agent/${String(runtime.store.tickets.list()[0]?.execution?.name)}`, sha: 'head-1', repo: { full_name: 'acme/widgets' } } } : { default_branch: 'master', permissions: { push: true } })
   vi.spyOn(Commands.prototype, 'lark').mockResolvedValue({ users: [{ member_id: MEMBER, name: 'Alice' }], has_more: false })
@@ -165,7 +167,8 @@ beforeEach(async () => {
       const agentCtx = new Context()
       const preset = {}
       const inherited = ['bash', 'read', 'read_image', 'skill', 'job_output', 'job_list', 'job_kill', 'grep', 'web_search',
-        'ask_user_question', 'plugin_manager', 'schedule_create', 'create_goal', 'session_create', 'session_send_message', 'feishu_doc_edit']
+        'ask_user_question', 'plugin_manager', 'schedule_create', 'create_goal', 'session_create', 'session_send_message', 'feishu_doc_edit',
+        ...(officialExternalSubagents ? ['subagent_codex', 'subagent_claude_code'] : [])]
       const sessionTools = new Map<string, RegisteredTool>()
       tools.set(sessionId, sessionTools)
       agentCtx.reflect.provide('tools', { register: (tool: RegisteredTool) => { sessionTools.set(tool.name,
@@ -1553,6 +1556,20 @@ it('reads the main Session\'s preset from a registry with or without presetForSe
   main = await guard({ select: vi.fn(), presetForSession: () => { throw new Error('no projection') } })
   expect(main(route)).toBeUndefined()
   expect(main(watch)).toMatch(/^This shell waits up to 60 seconds by default/)
+})
+
+it('exposes only installed official Codex and Claude Code delegation tools to ticket workers', async () => {
+  officialExternalSubagents = true
+  const { ticket, sessionId } = await acceptedTicket()
+  const worker = (restricts.get(sessionId)?.[0] as { allow: string[] }).allow
+  const router = (restricts.get(runtime.masterId)?.[0] as { allow: string[] }).allow
+  expect(worker).toContain('subagent_codex')
+  expect(worker).toContain('subagent_claude_code')
+  expect(worker).not.toContain('plugin_manager')
+  expect(router).not.toContain('subagent_codex')
+  expect(router).not.toContain('subagent_claude_code')
+  runtime.engine.stopTicket(ticket.id)
+  expect(guards.get(sessionId)!()).toBe('Ticket ended; new work needs a new authorized ticket')
 })
 
 it('refuses an ended ticket\'s worker its tools, and restricts the main Session to the tools it may use', async () => {

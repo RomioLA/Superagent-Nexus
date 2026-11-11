@@ -68,22 +68,28 @@ export class Replies extends EnginePart {
       : trigger ? this.repo.tickets.list().find(item => this.reaches(item, trigger)) : undefined
     if (request.purpose === 'result') {
       const outcome = ticket && ticketOutcome(ticket)
-      const reported = !!ticket && liveTicket(ticket) && latestAssignment(ticket)?.report?.state === 'ready'
-      const ready = outcome === 'merged' || outcome === 'completed' || outcome === 'dropped' || reported
-      if (!ticket || !ready) throw new UserError('notReady')
+      const state = ticket && latestAssignment(ticket)?.report?.state
+      const reported = !!ticket && liveTicket(ticket) && (state === 'ready'
+        || (ticket.mandate.strength === 'explicit' && (state === 'failed' || state === 'blocked')))
+      const ready = outcome === 'merged' || outcome === 'completed' || outcome === 'dropped' || outcome === 'stopped' || reported
+      if (!ticket || !ready || (ticket.attention && !ticket.ended)) throw new UserError('notReady')
     }
     const attention = request.purpose === 'attention' ? ticket?.attention : undefined
     // Attention replies must match the ticket's currently open question text.
     if (request.purpose === 'attention' && (!attention || attention.question !== request.question)) throw new UserError('notAttention')
     if (request.purpose === 'answer' && !trigger?.human) throw new UserError('notQuestion')
-    const id = attention ? key('attention-reply', attention.id) : key('reply', trigger?.id ?? ticket?.id ?? '', request.text)
+    const id = request.purpose === 'result' && ticket
+      ? key('result', ticket.id, latestAssignment(ticket)?.id ?? '', ticket.ended?.outcome ?? latestAssignment(ticket)?.report?.state ?? '',
+        ticket.ended?.at ?? latestAssignment(ticket)?.report?.at ?? ticket.updatedAt)
+      : attention ? key('attention-reply', attention.id) : key('reply', trigger?.id ?? ticket?.id ?? '', request.text)
     const existing = this.options.outbox.status(id)
     const ready = !ticket || !trigger || ticket.answers?.includes(trigger.id)
     if (request.purpose === 'answer' && !ready && !existing) throw new UserError('noAnswer')
     const asker = attention?.triggerId ? this.repo.triggers.get(attention.triggerId) : undefined
     const channel = request.purpose === 'answer' ? trigger!.channel : asker?.channel ?? (ticket ? this.sourceChannel(ticket) : undefined)
     if (!channel) throw new UserError('noChannel')
-    this.options.outbox.send({ id, channel, text: request.text, kind: 'reply', ...ticket ? { ticketId: ticket.id } : {} })
+    this.options.outbox.send({ id, channel, text: request.text, kind: 'reply', ...ticket ? { ticketId: ticket.id } : {},
+      ...request.purpose === 'result' ? { purpose: 'result' as const } : {} })
     if (request.purpose === 'answer' && ticket && trigger && ticket.answers?.includes(trigger.id)) {
       ticket.answers = ticket.answers.filter(item => item !== trigger.id)
       this.repo.tickets.save(ticket)

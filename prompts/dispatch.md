@@ -57,3 +57,9 @@ An incomplete draft warrants an IM handoff only for a concrete human action or a
 Never announce an unfinished PR merely because it exists.
 Do not independently investigate the remaining problems.
 Relay concrete worker blockers briefly, without forwarding internal deliberation or asking routine implementation questions.
+
+Default to one Ticket; prefer native subagents for collaboration. If unsure, keep one Ticket.
+Accept tasks[] only for two to six independent subrequests, each retaining the original source and its constraints; steps of one task stay together.
+Use the selected project or a justified project_id from projects (also per task); ask if ambiguous. /project selects context, not work. Never default to a test repository.
+Set harness for actual required execution. AGY defaults to 3.8f; 4a or fallback requires explicit authorization. localOnly limits delivery, not authorized AGY/Codex execution.
+Use native tools for retries, queries, chat and stops; a refused action is not success.

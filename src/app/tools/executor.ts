@@ -1,6 +1,6 @@
 /** Executor Session tools for reading ticket context, acknowledging requests, managing threads, handing back out-of-scope triggers, and reporting status. */
 import { z } from 'zod'
-import { liveTicket, type EngineForExecutor, type Ticket } from '../../core/index.ts'
+import { latestAssignment, liveTicket, type EngineForExecutor, type Ticket } from '../../core/index.ts'
 import { IM_WORDS } from '../../infra/text.ts'
 import { claimPull, readPull } from '../../sources/github-pull.ts'
 import type { SourceContext } from '../../sources/host.ts'
@@ -10,6 +10,7 @@ import { reportRelay, threadFollowedNotice } from '../notices.ts'
 import type { Sessions } from '../sessions.ts'
 import { AcknowledgementSchema, readTool, tool, type Tool } from './tool.ts'
 import { ticketCodexTool } from './codex.ts'
+import { ticketAgyTool } from './agy.ts'
 
 export interface ExecutorToolsHost {
   readonly engine: Pick<EngineForExecutor, 'report' | 'reply' | 'markUnrelated' | 'handback' | 'followForContext'>
@@ -23,8 +24,30 @@ export interface ExecutorToolsHost {
 
 export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
   const ticketId = ticket.id
+  const delegate = (name: 'agy' | 'codex', selected: Tool): Tool => ({ ...selected, execute: async (raw, signal) => {
+    const current = host.store.tickets.get(ticketId)
+    if (!current || !liveTicket(current)) throw new Error('Ticket ended')
+    const required = current.execution?.harness
+    if (required && required.harness !== name && required.allowFallback !== true) throw new Error('This Ticket requires ' + required.harness)
+    const args = raw as { model?: string }
+    if (name === 'agy' && args.model === '4a' && (required?.model !== '4a' || required.forbid4a))
+      throw new Error('AGY 4a requires explicit authorization; no automatic upgrade from 3.8f')
+    if (name === 'agy' && required?.harness === 'agy' && args.model !== (required.model ?? '3.8f'))
+      throw new Error('Use the authorized AGY model ' + (required.model ?? '3.8f'))
+    const result = await selected.execute(raw, signal)
+    host.store.atomic(() => {
+      const latest = host.store.tickets.get(ticketId)
+      if (latest && liveTicket(latest) && latest.execution) {
+        latest.execution.harnessRun = { assignmentId: latestAssignment(current)!.id, harness: name,
+          ...(args.model ? { model: args.model } : {}) }
+        host.store.tickets.save(latest)
+      }
+    })
+    return result
+  } })
   return [
-    ticketCodexTool(ticket),
+    delegate('codex', ticketCodexTool(ticket)),
+    delegate('agy', ticketAgyTool(ticket)),
     readTool('Read one page of a resource of this ticket that the resource parameter lists. Follow next_offset, and next_resource where a page names one.',
       true, (resource, offset, limit, signal) => readResource(host.resources, resource, offset, limit, ticketId, signal)),
     tool({
@@ -89,7 +112,13 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
         if (!current || !liveTicket(current)) throw new Error('Ticket ended (PR was closed or work finished); do not resume it')
         // The native GitHub watcher is bound to its configured primary repository.
         // A PR number from a different project may refer to an unrelated PR in that repository.
-        const originRepo = host.github.triggers.get(current.origin.triggerId)?.meta.projectRepository
+        const originRepo = current.execution?.project?.repository ?? host.github.triggers.get(current.origin.triggerId)?.meta.projectRepository
+        if (args.pr_number != null && current.execution?.project?.localOnly) throw new Error('Local-only Ticket cannot claim a PR')
+        const required = current.execution?.harness
+        const run = current.execution?.harnessRun
+        if (args.state === 'ready' && required && required.harness !== 'dsh'
+          && (!run || run.assignmentId !== latestAssignment(current)?.id || (run.harness !== required.harness && required.allowFallback !== true)))
+          throw new Error('No successful execution of the required Harness for this assignment; report blocked or failed')
         if (args.pr_number != null && typeof originRepo === 'string'
           && originRepo.toLowerCase() !== host.github.deployment.repository.toLowerCase())
           throw new Error('This ticket targets another repository: omit pr_number and include the full PR URL in summary')

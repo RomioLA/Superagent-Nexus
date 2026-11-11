@@ -149,6 +149,12 @@ export class Runtime extends Service implements SourceHost {
           if (ended && setup.configured()) {
             const request = store.triggers.get(ended.origin.triggerId)?.text ?? ''
             for (const message of pullEndNotices(ended, request, setup.deployment.repository)) outbox.send(message)
+            if (ended.ended?.by === 'human' && ended.ended.outcome === 'stopped' && store.triggers.get(ended.origin.triggerId)?.channel?.source === 'feishu') {
+              const text = /\p{Script=Han}/u.test(request)
+                ? `工单 ${ended.id.slice(0, 8)} 已停止，任务已结束；已有改动保留，不会自动恢复。`
+                : `Ticket ${ended.id.slice(0, 8)} stopped. Existing work is kept; it will not resume automatically.`
+              engine.reply({ purpose: 'result', ticketId: ended.id, text })
+            }
           }
         } })
       // Update the `evals` health entry on every pass if an evaluation failed as unavailable within the last hour.
@@ -159,26 +165,7 @@ export class Runtime extends Service implements SourceHost {
       this.sourceDeps = { store, engine, outbox, commands, sources, get ready() { return runtime.ready },
         get deployment() { return setup.deployment }, configured: () => setup.configured(),
         get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem },
-        receive: trigger => passes.receive(trigger),
-        acceptTask: (trigger, request) => {
-          if (!setup.configured() || store.settings().paused || runtime.closing()) throw new Error('Orchestrator not accepting new tasks')
-          // Atomic intake+decision ensures the request cannot become a stray native Eval on failure.
-          runtime.quiet++
-          try {
-            const accepted = store.atomic(() => {
-              const received = engine.receive(trigger)
-              if (received !== 'stored') return { received }
-              const outcome = engine.decide(trigger.id, { kind: 'accept', ...request, reason: 'Explicit owner request via Feishu' })
-              if (outcome.kind !== 'accept' || !outcome.ticketId) throw new Error('Native Ticket was not accepted')
-              return { received, ticketId: outcome.ticketId }
-            })
-            passes.request()
-            return accepted
-          } finally { runtime.quiet-- }
-        },
-        stopTask: (ticketId, reason) => engine.stopTicket(ticketId, reason),
-        retryTask: ticketId => engine.retryTicket(ticketId),
-      }
+        receive: trigger => passes.receive(trigger) }
       this.toolHost = { context: ctx, engine, store, prompts, sessions, settings: this.settings, assessor, resources,
         get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(),

@@ -3,7 +3,7 @@ import { key } from './ids.ts'
 import { UserError } from './errors.ts'
 import { liveTicket, threadKey } from './model.ts'
 import type { Decision, DecisionKind, Evaluation, Mandate, MandateBasis, Strength, Thread, Trigger } from './model.ts'
-import type { AssessmentOutcome, Candidate, Policy } from './ports.ts'
+import type { AcceptTasksOutcome, AssessmentOutcome, Candidate, Policy } from './ports.ts'
 import { said, type Reason } from './reasons.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
 import type { Tickets } from './tickets.ts'
@@ -153,6 +153,50 @@ export class Evals extends EnginePart {
       throw new UserError('notExplicit')
     }
     return this.decideEval(thread, evaluation, outcome)
+  }
+  /** Accept several scopes of one source message using ordinary Tickets and the original authority and text. */
+  acceptTasks(triggerId: string, outcome: AcceptTasksOutcome): { ticketIds: string[] } {
+    const trigger = this.repo.triggers.get(triggerId)
+    if (!trigger) throw new UserError('unknownTrigger')
+    // The native Decision is the receipt, including after restart or a different model split on replay.
+    const previous = this.repo.decisions.byThread(threadKey(trigger.threads[0]!))
+      .find(decision => decision.triggerIds.includes(triggerId) && Array.isArray(decision.audit?.splitTickets))
+    const split = previous?.audit?.splitTickets
+    if (Array.isArray(split) && split.every(id => typeof id === 'string')) return { ticketIds: split }
+    if (this.accepted(threadKey(trigger.threads[0]!)).has(triggerId)) throw new UserError('notSplit')
+    if (outcome.tasks.length < 2 || outcome.tasks.length > 6) throw new UserError('notSplit')
+    const held = this.holding(triggerId)
+    if (held?.evaluating && held.evaluating.triggerIds.length !== 1) throw new UserError('notSplit')
+    this.leftToWorkers(trigger)
+    const thread = held ?? this.thread(trigger.threads[0]!)
+    const policy = this.policy()
+    const gate = policy.gate(trigger, thread, this.ticketsOnThread(thread))
+    if (!gate.admissible) throw new UserError('notAdmissible', { reason: gate.reason })
+    if (gate.strength !== 'explicit') throw new UserError('notExplicit')
+    if (held?.evaluating && held.evaluating.policyVersion !== policy.version) throw new UserError('notSplit')
+    const at = this.now()
+    const ticketIds = outcome.tasks.map((task, index) => {
+      const evaluation: Evaluation = { id: key('eval', thread.key, 'split', triggerId, String(index)), threadKey: thread.key,
+        triggerIds: [triggerId], primary: triggerId, strength: gate.strength, actor: trigger.actor, basis: gate.basis,
+        policyVersion: policy.version, startedAt: at, deadline: at }
+      const decision = this.accept(thread, evaluation, { kind: 'accept', title: task.title,
+        scope: task.scope ?? task.title, reason: outcome.reason,
+        ...(task.acknowledgement ? { acknowledgement: task.acknowledgement } : {}),
+        ...(task.name ? { name: task.name } : {}), ...(task.note ? { note: task.note } : {}),
+        ...(task.harness ?? outcome.harness ? { harness: (task.harness ?? outcome.harness)! } : {}),
+        ...(task.project ? { project: task.project } : {}),
+        ...(outcome.audit ? { audit: outcome.audit } : {}) })
+      return decision.ticketId!
+    })
+    const evaluation = held?.evaluating ?? { id: key('eval', thread.key, 'split-receipt', triggerId), threadKey: thread.key,
+      triggerIds: [triggerId], primary: triggerId, strength: gate.strength, actor: trigger.actor, basis: gate.basis,
+      policyVersion: policy.version, startedAt: at, deadline: at }
+    const current = this.repo.threads.get(thread.key)!
+    this.finish(current, evaluation, { kind: 'ignore', reason: [{ code: 'splitInto', values: { tickets: ticketIds.join(',') } }],
+      audit: { ...outcome.audit, splitTickets: ticketIds } })
+    current.pending = current.pending.filter(id => id !== triggerId)
+    this.repo.threads.save(current)
+    return { ticketIds }
   }
   /**
    * Queue a stored Trigger for a fresh Eval on its primary Thread and emit `trigger.requeued`; returns false while an Eval holds it.

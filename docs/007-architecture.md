@@ -342,6 +342,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/tools/tool.ts` | The `Tool` type, `readTool`, the `orchestrator_read` of both roles, and `AcknowledgementSchema` |
 | `src/app/tools/main.ts` | The main Session's tools |
 | `src/app/tools/executor.ts` | An Executor Session's tools |
+| `src/app/tools/agy.ts` | The Ticket-scoped native AGY tool, model and mode arguments, process handling, result parsing, and failure reporting; DSH retains Ticket and Git delivery ownership |
+| `src/app/tools/cli-isolation.ts` | Per-Ticket CLI state and private AGY permission config, with existing credentials reused through symlinks; AGY command access is separately constrained by its native sandbox |
 | `src/app/tools/codex.ts` | DSH ticket-scoped Linux Codex tool; DSH manages workers, worktrees, recovery and PR |
 | `src/app/http.ts` | The `/orchestrator/api` routes: the same-origin check, request limits and one status per kind of failure |
 | `src/app/api.ts` | `Api`, every route with its parameters, query, body and response, and the filters of the lists; it imports only types, so the panel bundles it |
@@ -371,8 +373,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/sources/feishu.ts` | The Feishu kind and plugin entry, exported as `./feishu-watch` |
 | `src/sources/feishu-trigger.ts` | Feishu messages as Triggers, by one rule for live events, history pages and topic pages |
 | `src/sources/feishu-loops.ts` | The Feishu loops: the event consumer, history recovery, chat names and polling of subscribed topics |
-| `src/sources/feishu-chat-router.ts` | Single-owner Feishu dialogue and direct natural-language request admission into native Engine/Ticket; no second task queue or forced slash commands |
-| `src/sources/feishu-task-router.ts` | Pure natural-language intent parsing, cheap README reads, legacy V0.3 result readback; native Engine owns all new Tickets |
+| `src/sources/feishu-projects.ts` | Optional project configuration and exact `/project` selection metadata for native routing; ordinary message text never selects a project |
 | `src/sources/feishu-channel.ts` | The Feishu Channel: topic replies, `sent` or `gone` |
 | `src/sources/feishu-read.ts` | The `feishu/` reads of a Trigger's message, its root, parent and topic, and `feishuThreadContext`, which gives them to assessments with their images |
 | `src/sources/admission-context.ts` | The bounded window an assessment starts from: the first pages of a Trigger's Thread, read through its kind, and the messages around the Trigger |
@@ -413,12 +414,16 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/sources.spec.ts` | The Feishu and GitHub Sources on a `SourceContext`: translation, polls and read positions, the pull request rules, health |
 | `tests/commands.spec.ts` | CLI calls as the deployment's accounts, the Channels' answers, and repository-scoped GitHub calls |
 | `tests/feishu-read.spec.ts`, `tests/github-read.spec.ts` | Feishu and GitHub reads |
-| `tests/feishu-chat-router.spec.ts` | Feishu chat text normalization, intent classification and project alias/status handling |
-| `tests/feishu-task-router.spec.ts` | Explicit read-only request parsing, prohibited writes and disabled-project routing protection |
+| `tests/feishu-projects.spec.ts` | Explicit project selection, retained selection, broken configuration handling and replayed command protection |
+| `tests/feishu-task-route-smoke.spec.ts` | Natural requests, long messages, chat, cancellation, queries, continuations and repeated project selection all enter native receive without a side-channel task API |
 | `tests/codex-ticket.spec.ts` | Codex Worker tool schema, worktree target and CLI token reporting |
+| `tests/agy-ticket.spec.ts` | Ticket-scoped AGY arguments, model mapping, process result parsing and failure reporting |
+| `tests/cli-isolation.spec.ts` | Per-Ticket CLI state directories and credential symlinks for AGY and Codex |
+| `tests/cli-security.spec.ts` | CLI state path symlink checks, credential-target validation and concurrent credential-link setup |
 | `tests/project-environment.spec.ts` | Per-Ticket GitHub repository and worktree root environment routing, including default fallback |
 | `tests/feishu-native-engine.spec.ts` | Native Engine two-Ticket admission, duplicate suppression, independent worktrees, retry and cancellation |
-| `tests/feishu-task-route-smoke.spec.ts` | Single-owner Feishu intake uses native acceptTask once per message; new JSON task ledger is absent |
+| `tests/native-routing-integration.spec.ts` | Native `orchestrator_route` project selection and split-task routing integration |
+| `tests/notification-integration.spec.ts` | Runtime result receipts and notification deduplication |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |
 | `tests/background.spec.ts` | Waiting for a worker's shell jobs and subagents: an end that woke it, and a host that stops |
@@ -628,6 +633,14 @@ Point `DSH_HOME` at a temporary directory and create a new profile there. Copy t
 
 ### Feishu-selected project worktrees (incremental multi-repository support)
 
-The single-owner Feishu chat configuration can select an enabled project's GitHub owner/repo and absolute local Git root. A new request carries those values in its original Trigger metadata, so native Ticket, Assignment, WorkerSlots, retry, and Outbox remain the sole lifecycle. The Executor's existing prepare command reads DSH_SUPERAGENT_PROJECT_ROOT and DSH_SUPERAGENT_GITHUB_REPOSITORY from that Ticket's environment and prepares the correct repository worktree. Legacy and GitHub-origin Tickets keep the primary repository fallback. Disabled projects cannot receive tasks.
+Every Feishu message enters the native Source receive path and Intake. Intake queues messages on unowned Threads for Eval and routes messages on Ticket-owned Threads under the native follow-up rules. There is no keyword classifier, direct `acceptTask` path, or parallel task ledger. Natural-language requests, questions, cancellations and continuations remain original Triggers for those native rules. A configured single-owner direct chat can select a project with an exact `/project <id, name, or alias>` command; ordinary mentions and quoted history do not change the chat selection. A malformed existing project configuration marks the Trigger as requiring project resolution with an empty project list, so native routing cannot silently fall back to the default repository; the missing optional configuration keeps normal deployments' native default behavior.
+
+The native router can route an accepted request or each explicitly split task to a registered project's GitHub owner/repo and absolute local Git root. The chosen values flow through the Trigger metadata and the native `orchestrator_route` `project_id` fields into each Ticket's `Execution.project`; the Executor prepares that Ticket's repository worktree. A split creates no derived Triggers: all Tickets share the complete original message, while each receives its own Mandate scope. `Decision.audit.splitTickets` records the split Ticket IDs for native deduplication. Legacy and GitHub-origin Tickets keep the primary repository fallback. Disabled projects cannot receive tasks.
 
 The existing GitHub Source still observes the primary configured repository. For a different project, its Worker reports the full PR URL in its completion summary and omits pr_number; this deliberately does not claim the unrelated primary-repository PR number. Automatic PR merge/close tracking for non-primary repositories is not yet provided. Do not describe this stage as full cross-repository GitHub lifecycle support.
+
+### Ticket-scoped AGY and CLI state
+
+AGY runs as a tool in the existing native Ticket Executor. DSH owns the Ticket, worktree, Git delivery and human reporting. Write runs use `accept-edits`, `--sandbox`, and `--add-dir` for the exact Ticket workspace; no permission-bypass flag is used. Each Ticket gets its own AGY config and narrow command grants for Node and Git inspection plus project test entrypoints. Only the existing OAuth token is symlinked from the shared AGY home; the shared config and permissions are not changed. The Node executable and, when needed, the DSH runtime dependency directory are mounted read-only.
+
+Live AGY 3.8F validation confirmed a file edit, Node and Git commands, and the project's Vitest tests in the native command sandbox. A sibling sentinel could not be read or overwritten, and neither the shared nor Ticket OAuth token path was readable by the sandboxed test process. The permission list contains no general command or wildcard grant. Other external dependency directories are not granted automatically.

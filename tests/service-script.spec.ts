@@ -27,6 +27,9 @@ const started = (...lines: string[]) => writeFileSync(join(root, 'ps-started.txt
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'service script '))
   mkdirSync(join(root, 'scripts')); mkdirSync(join(root, 'bin'))
+  mkdirSync(join(root, '.config', 'superagent'), { recursive: true })
+  writeFileSync(join(root, '.config', 'superagent', 'magpie-router-key'), 'fixture-router-value')
+  writeFileSync(join(root, '.config', 'superagent', 'magpie-worker-key'), 'fixture-worker-value')
   copyFileSync(join(import.meta.dirname, '..', 'scripts', 'dsh-superagent'), join(root, 'scripts', 'dsh-superagent'))
   processes()
   program('ps', `list='${root}/ps.txt'; [ -f '${root}/launched' ] && [ -f '${root}/ps-started.txt' ] && list='${root}/ps-started.txt'
@@ -49,7 +52,7 @@ afterEach(() => {
 })
 function run(...args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise(resolve => execFile('python3', [join(root, 'scripts', 'dsh-superagent'), ...args],
-    { env: { ...process.env, PATH: `${join(root, 'bin')}:${process.env.PATH}`, DSH_SUPERAGENT_PROFILE: '', DSH_SUPERAGENT_URL: '' },
+    { env: { ...process.env, HOME: root, PATH: `${join(root, 'bin')}:${process.env.PATH}`, DSH_SUPERAGENT_PROFILE: '', DSH_SUPERAGENT_URL: '' },
       timeout: 20_000 },
     (error, stdout, stderr) => resolve({ code: typeof error?.code === 'number' ? error.code : 0, stdout, stderr })))
 }
@@ -97,7 +100,15 @@ it('records the service PID at start, and still refuses a second instance the sc
   const checkout = realpathSync(root)
   expect(tmux).toEqual(expect.arrayContaining(['-P', '-F', '#{pane_pid}', '-c', checkout]))
   const log = new RegExp(`>> '${checkout}/\\.artifacts/dsh-superagent-superagent-\\d{8}-\\d{6}-\\d+\\.log' 2>&1$`)
-  expect(tmux.find(word => word.startsWith('umask 077; exec '))).toMatch(log)
+  const command = tmux.find(word => word.startsWith('umask 077; '))!
+  expect(command).toMatch(log)
+  expect(command).toContain('; exec ')
+  // Credentials are loaded inside the tmux shell; its arguments contain paths, never secret values.
+  for (const [name, file] of [['MAGPIE_ROUTER_KEY', 'magpie-router-key'], ['MAGPIE_WORKER_KEY', 'magpie-worker-key']]) {
+    expect(command).toContain(`export ${name}="$(cat '${join(checkout, '.config', 'superagent', file!)}')"`)
+  }
+  expect(command).not.toContain('fixture-router-value')
+  expect(command).not.toContain('fixture-worker-value')
   const second = sleeper()
   started(service(pid), `${second} node node /opt/dsh --profile superagent`)
   const again = await run('start', '--url', url, '--timeout', '10')

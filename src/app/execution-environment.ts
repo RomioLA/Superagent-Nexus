@@ -41,8 +41,10 @@ export function environmentOf(input: { deployment: Deployment; sources: SourceRe
 /** Combines a ticket's fixed directory, name, and origin trigger with the deployment's current settings. */
 export function ticketEnvironment(input: { deployment: Deployment; sources: SourceRegistry; settings: Settings; ticket: Ticket; trigger?: Trigger }) {
   const { ticket, trigger, ...rest } = input
+  const project = ticket.execution?.project
+  const source = project ? { ...trigger!, source: trigger?.source ?? 'feishu', meta: { ...trigger?.meta, projectRoot: project.root, projectRepository: project.repository } } : trigger
   const values = { id: ticket.id, name: ticket.execution?.name ?? '', directory: ticket.execution?.directory ?? '' }
-  return environmentOf({ ...rest, ticket: values, ...trigger ? { trigger } : {} })
+  return environmentOf({ ...rest, ticket: values, ...source ? { trigger: source } : {} })
 }
 export function environmentLines(variables: Variable[]): string {
   return variables.map(variable => `- ${variable.key} = ${JSON.stringify(variable.value)}: ${variable.description.en}.`).join('\n')

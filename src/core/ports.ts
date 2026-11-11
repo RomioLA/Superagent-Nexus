@@ -37,12 +37,43 @@ export interface Candidate {
   tickets: Ticket[]
 }
 
+/** Execution target selected only from the deployment's project mapping. */
+export interface ProjectTarget { repository: string; root?: string; localOnly?: boolean }
+/** The executing Harness a person explicitly requires; the model chooses it, so no keyword parsing stands in for its judgement. */
+export type HarnessName = 'dsh' | 'agy' | 'codex'
+export interface HarnessSpec {
+  harness: HarnessName
+  /** The AGY model the owner allows, when they named one; omitted leaves the Harness default. */
+  model?: '3.8f' | '4a'
+  /** The owner forbade model=4a, so a 3.8f capacity failure must be reported, never upgraded. */
+  forbid4a?: boolean
+  /** Whether an unavailable Harness may fall back to another authorized one; omitted means no silent substitution. */
+  allowFallback?: boolean
+}
+/** One independent task of a message the model recognized as several, each accepted as its own native Ticket. */
+export interface TaskSpec {
+  title: string
+  /** The task text the worker receives; defaults to `title`. */
+  scope?: string
+  name?: string
+  acknowledgement?: string
+  note?: string
+  harness?: HarnessSpec
+  project?: ProjectTarget
+}
+/** How the main Session accepts one explicit message as several independent native Tickets, each retaining the original Trigger. */
+export interface AcceptTasksOutcome {
+  tasks: TaskSpec[]
+  reason: string | Reason
+  harness?: HarnessSpec
+  audit?: Record<string, unknown>
+}
 export type AssessmentOutcome =
   | { kind: 'ignore'; reason: string | Reason; audit?: Record<string, unknown> }
   | { kind: 'unavailable'; reason: string | Reason; audit?: Record<string, unknown> }
   /** An accept: `rules` the assessment matched, `name` the ticket's requested short name, and `note` a routing note for its worker. */
   | { kind: 'accept'; title: string; scope: string; reason: string | Reason; acknowledgement?: string; rules?: string[]; audit?: Record<string, unknown>;
-    name?: string; note?: string }
+    name?: string; note?: string; harness?: HarnessSpec; project?: ProjectTarget }
   | { kind: 'stop'; ticketId: string; reason: string | Reason; audit?: Record<string, unknown> }
 
 /** Semantic judgement. `request` queues the assessment, idempotently per `evalId`; the outcome returns through `Engine.decide`. */
@@ -69,7 +100,7 @@ export interface Executor {
 }
 
 /** A message for a Channel; `ticketId` names the Ticket it is for, when there is one. */
-export interface OutboundMessage { id: string; channel: ChannelRef; text: string; kind: 'acknowledgement' | 'reply' | 'notice'; ticketId?: string }
+export interface OutboundMessage { id: string; channel: ChannelRef; text: string; kind: 'acknowledgement' | 'reply' | 'notice'; ticketId?: string; purpose?: 'result' }
 /** A queued message waits (`pending`), went out (`sent`), or was dropped because its conversation can never receive it (`dropped`). */
 export type ReplyStatus = 'pending' | 'sent' | 'dropped'
 /** The messages queued for Channels; the Engine queues them inside its commands, and a sender delivers them later. */

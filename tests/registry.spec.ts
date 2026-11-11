@@ -158,5 +158,29 @@ describe('Source registry', () => {
     const reply: OutboundMessage = { id: 'reply-1', channel, text: 'Done', kind: 'reply' }
     expect(await sources.send(reply, commands)).toBe('sent')
     expect(run.mock.calls[0]![1]).toEqual(expect.arrayContaining(['+messages-reply', '--message-id', 'om_dm']))
+    expect(run).toHaveBeenCalledTimes(1)
+  })
+  it('keeps the final result in its topic and notifies the originating direct chat', async () => {
+    const sources = new SourceRegistry(() => SettingsSchema.parse({}))
+    sources.register(feishuKind)
+    const commands = new Commands(() => testDeployment(), {}, new AbortController().signal)
+    const link = 'https://applink.feishu.cn/client/thread/open?open_chat_id=oc_dm&open_thread_id=omt_topic'
+    const run = vi.spyOn(commands, 'run')
+      .mockResolvedValueOnce('{"ok":true,"data":{}}')
+      .mockResolvedValueOnce(JSON.stringify({ ok: true, data: { messages: [
+        { message_id: 'om_dm', chat_id: 'oc_dm', message_app_link: link },
+      ] } }))
+      .mockResolvedValueOnce('{"ok":true,"data":{}}')
+    const result: OutboundMessage = {
+      id: 'result-1', channel: feishuChannel('oc_dm', 'om_dm', true),
+      ticketId: '1234567890abcdef', kind: 'reply', purpose: 'result', text: 'Completed locally.',
+    }
+    expect(await sources.send(result, commands)).toBe('sent')
+    expect(run).toHaveBeenCalledTimes(3)
+    expect(run.mock.calls[0]![1]).toEqual(expect.arrayContaining(['+messages-reply', '--reply-in-thread']))
+    expect(run.mock.calls[1]![1]).toContain('+messages-mget')
+    expect(run.mock.calls[2]![1]).toEqual(expect.arrayContaining(['+messages-send', '--chat-id', 'oc_dm']))
+    expect(run.mock.calls[2]![1]).not.toContain('--reply-in-thread')
+    expect(run.mock.calls[2]![1].join(' ')).toContain('open_thread_id=omt_topic')
   })
 })
