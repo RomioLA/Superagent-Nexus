@@ -343,7 +343,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/tools/main.ts` | The main Session's tools |
 | `src/app/tools/executor.ts` | An Executor Session's tools |
 | `src/app/tools/agy.ts` | The Ticket-scoped native AGY tool, model and mode arguments, process handling, result parsing, and failure reporting; DSH retains Ticket and Git delivery ownership |
-| `src/app/tools/cli-isolation.ts` | Per-Ticket CLI state and private AGY permission config, with existing credentials reused through symlinks; AGY command access is separately constrained by its native sandbox |
+| `src/app/tools/grok.ts` | Ticket-scoped official Grok Build headless CLI, native JSON result and model-usage evidence, isolated authentication, cancellation, timeout and strict tool permissions; DSH retains Ticket and delivery ownership |
+| `src/app/tools/cli-isolation.ts` | Per-Ticket CLI state and private AGY permission config; existing AGY/Codex credentials are reused through symlinks, while Grok gets a private home and no shared credential |
 | `src/app/tools/codex.ts` | DSH ticket-scoped Linux Codex tool; DSH manages workers, worktrees, recovery and PR |
 | `src/app/http.ts` | The `/orchestrator/api` routes: the same-origin check, request limits and one status per kind of failure |
 | `src/app/api.ts` | `Api`, every route with its parameters, query, body and response, and the filters of the lists; it imports only types, so the panel bundles it |
@@ -418,7 +419,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/feishu-task-route-smoke.spec.ts` | Natural requests, long messages, chat, cancellation, queries, continuations and repeated project selection all enter native receive without a side-channel task API |
 | `tests/codex-ticket.spec.ts` | Codex Worker tool schema, worktree target and CLI token reporting |
 | `tests/agy-ticket.spec.ts` | Ticket-scoped AGY arguments, model mapping, process result parsing and failure reporting |
-| `tests/cli-isolation.spec.ts` | Per-Ticket CLI state directories and credential symlinks for AGY and Codex |
+| `tests/grok-ticket.spec.ts` | Grok Build headless arguments, permission profile, model-usage evidence and fail-closed result parsing |
+| `tests/cli-isolation.spec.ts` | Per-Ticket CLI state directories, AGY/Codex credential symlinks and a private Grok home |
 | `tests/cli-security.spec.ts` | CLI state path symlink checks, credential-target validation and concurrent credential-link setup |
 | `tests/project-environment.spec.ts` | Per-Ticket GitHub repository and worktree root environment routing, including default fallback |
 | `tests/feishu-native-engine.spec.ts` | Native Engine two-Ticket admission, duplicate suppression, independent worktrees, retry and cancellation |

@@ -316,7 +316,23 @@ export interface Ticket {
  * Thread closed; the ticket then ends unless its work has not finished (see `Tickets.unfinished`).
  */
 export interface Follow { thread: string; own: boolean; closed?: { at: string; outcome: 'merged' | 'closed' } }
-export interface Execution { name: string; directory: string; assignment: string; harness?: import('./ports.ts').HarnessSpec; project?: import('./ports.ts').ProjectTarget; harnessRun?: { assignmentId: string; harness: 'agy' | 'codex'; model?: string } }
+export interface Execution {
+  name: string
+  directory: string
+  assignment: string
+  harness?: import('./ports.ts').HarnessSpec
+  project?: import('./ports.ts').ProjectTarget
+  harnessRun?: {
+    assignmentId: string
+    harness: 'agy' | 'codex' | 'grok'
+    model?: string
+    version?: string
+    models?: string[]
+    sessionId?: string
+    requestId?: string
+    usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number; modelCalls?: number; costUSD?: number }
+  }
+}
 
 /** Whether a ticket is open: it has not ended. */
 export const liveTicket = (ticket: Pick<Ticket, 'ended'>): boolean => !ticket.ended

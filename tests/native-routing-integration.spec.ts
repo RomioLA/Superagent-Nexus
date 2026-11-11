@@ -1,6 +1,6 @@
 /** Native route tool integration: transaction, project target, execution receipt and WorkerSlots. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
-const { agy, codex } = vi.hoisted(() => ({ agy: vi.fn(), codex: vi.fn() }))
+const { agy, codex, grok } = vi.hoisted(() => ({ agy: vi.fn(), codex: vi.fn(), grok: vi.fn() }))
 vi.mock('../src/app/tools/agy.ts', async original => {
   const module = await original<typeof import('../src/app/tools/agy.ts')>()
   return { ...module, ticketAgyTool: (ticket: Parameters<typeof module.ticketAgyTool>[0]) => ({ ...module.ticketAgyTool(ticket), execute: agy }) }
@@ -8,6 +8,10 @@ vi.mock('../src/app/tools/agy.ts', async original => {
 vi.mock('../src/app/tools/codex.ts', async original => {
   const module = await original<typeof import('../src/app/tools/codex.ts')>()
   return { ...module, ticketCodexTool: (ticket: Parameters<typeof module.ticketCodexTool>[0]) => ({ ...module.ticketCodexTool(ticket), execute: codex }) }
+})
+vi.mock('../src/app/tools/grok.ts', async original => {
+  const module = await original<typeof import('../src/app/tools/grok.ts')>()
+  return { ...module, ticketGrokTool: (ticket: Parameters<typeof module.ticketGrokTool>[0]) => ({ ...module.ticketGrokTool(ticket), execute: grok }) }
 })
 import { feishu, startRuntime, type Host } from './fixtures/host.ts'
 import { key, latestAssignment } from '../src/core/index.ts'
@@ -17,6 +21,11 @@ let host: Host
 beforeEach(async () => {
   host = await startRuntime(); agy.mockReset().mockResolvedValue({ status: 'finished', harness: 'antigravity', requested_model: 'gemini-3.8-flash-medium' })
   codex.mockReset().mockResolvedValue({ status: 'finished', summary: 'done' })
+  grok.mockReset().mockResolvedValue({
+    status: 'finished', summary: 'done', requested_model: 'grok-4.7-build-fast', models: ['grok-4.7-build-fast'],
+    cli_version: 'grok 1.0.80', session_id: 'session-123', request_id: 'request-456',
+    usage: { inputTokens: 120, outputTokens: 32, totalTokens: 152, modelCalls: 1, costUSD: 0.0008 },
+  })
 })
 afterEach(async () => { await host.stop() })
 const route = (decisions: unknown[]) => host.runTool(host.runtime.masterId, 'orchestrator_route', { decisions })
@@ -61,7 +70,7 @@ it('requires project clarification and resolves each task from the configured ma
   await route([{ kind: 'accept', trigger_id: source.id, tasks: tasks.slice(0, 2).map((task, i) => ({ ...task, project_id: i ? 'two' : 'one' })) }])
   await host.runtime.idle()
   const ticket = host.runtime.store.tickets.list().find(t => t.execution?.project?.repository === 'acme/widgets')!
-  expect(ticket.execution?.assignment).toContain('AGY and Codex execution remain allowed')
+  expect(ticket.execution?.assignment).toContain('AGY, Codex and Grok execution remain allowed')
   expect(ticket.execution?.harness?.harness).toBe('agy')
   expect(ticket.execution?.project?.root).toBe('/tmp/project-one')
   const variables = ticketEnvironment({ deployment: host.runtime.deployment, settings: host.runtime.store.settings(), sources: host.runtime.sources, ticket, trigger: source })
@@ -82,6 +91,39 @@ it('a required Harness must actually succeed, cannot silently fall back or use 4
   expect(host.runtime.store.tickets.get(ticket.id)?.execution?.harnessRun).toMatchObject({ harness: 'agy', model: '3.8f', assignmentId: latestAssignment(ticket)!.id })
   expect(codex).not.toHaveBeenCalled()
   await host.runTool(worker, 'orchestrator_report', { state: 'ready', summary: 'Verified Harness call completed' })
+})
+
+it('requires the Grok adapter for a Grok Ticket and records its run evidence without fallback', async () => {
+  const source = feishu('55', 'Use Grok Build only for this change')
+  host.runtime.receive(source); await host.runtime.idle()
+  await route([{
+    kind: 'accept', trigger_id: source.id, title: 'Grok change', worktree_name: 'grok-change',
+    acknowledgement: 'On it', harness: { harness: 'grok' },
+  }])
+  await host.runtime.idle()
+  const ticket = host.runtime.store.tickets.list()[0]!, worker = 'worker-' + ticket.id
+  await expect(host.runTool(worker, 'orchestrator_report', { state: 'ready', summary: 'Claimed Grok without a run' }))
+    .rejects.toThrow('No successful execution')
+  await expect(host.runTool(worker, 'orchestrator_codex', { task: 'Do the change', mode: 'write' })).rejects.toThrow('requires grok')
+  await expect(host.runTool(worker, 'orchestrator_agy', { task: 'Do the change', model: '3.8f' })).rejects.toThrow('requires grok')
+
+  grok.mockRejectedValueOnce(new Error('Grok authentication failed'))
+  await expect(host.runTool(worker, 'orchestrator_grok', { task: 'Do the change', mode: 'write' }))
+    .rejects.toThrow('Grok authentication failed')
+  expect(host.runtime.store.tickets.get(ticket.id)?.execution?.harnessRun).toBeUndefined()
+  await expect(host.runTool(worker, 'orchestrator_report', { state: 'ready', summary: 'Grok failed' }))
+    .rejects.toThrow('No successful execution')
+
+  await host.runTool(worker, 'orchestrator_grok', { task: 'Do the change', mode: 'write' })
+  expect(host.runtime.store.tickets.get(ticket.id)?.execution?.harnessRun).toMatchObject({
+    harness: 'grok', model: 'grok-4.7-build-fast', version: 'grok 1.0.80',
+    models: ['grok-4.7-build-fast'], sessionId: 'session-123', requestId: 'request-456',
+    usage: { inputTokens: 120, outputTokens: 32, totalTokens: 152, modelCalls: 1, costUSD: 0.0008 },
+    assignmentId: latestAssignment(ticket)!.id,
+  })
+  expect(agy).not.toHaveBeenCalled()
+  expect(codex).not.toHaveBeenCalled()
+  await host.runTool(worker, 'orchestrator_report', { state: 'ready', summary: 'Adapter reported a completed Grok run' })
 })
 
 it('retains explicit AGY 3.8F constraints from semantic routing through Worker execution', async () => {

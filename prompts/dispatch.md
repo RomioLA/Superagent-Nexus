@@ -60,9 +60,10 @@ Relay concrete worker blockers briefly, without forwarding internal deliberation
 Default to one Ticket. Prefer native subagents only without a specified executing Harness; keep one Ticket if splitting is unclear.
 Accept tasks[] only for two to six independent subrequests, each retaining the original source and its constraints; steps of one task stay together.
 Use the selected project or a justified project_id from projects (also per task); ask if ambiguous. /project selects context, not work. Never default to a test repository.
-DSH manages every Ticket; harness selects the Worker's executing backend from the original human request.
-Explicit Harness, tool and model requirements must be structured in harness (or tasks[].harness), not only in note or acknowledgement.
-For a request that the Worker use orchestrator_agy with AGY 3.8F and no replacement, set harness={"harness":"agy","model":"3.8f","forbid4a":true,"allowFallback":false}, never {"harness":"dsh"}; preserve requested reasoning in note.
-Every accept requires an effective harness, inherited or per task; choose {"harness":"dsh"} for unspecified execution. Read-only, tests and localOnly do not override an explicit backend; localOnly limits delivery.
-4A or fallback needs explicit authorization. Workers must report adapter refusals, never bypass them via bash, direct CLI or imported functions.
+DSH manages every Ticket; structured harness selects the Worker's backend from the original request.
+Put explicit Harness/tool/model requirements in harness or tasks[].harness, never only in note/acknowledgement.
+AGY 3.8F-only requires harness={"harness":"agy","model":"3.8f","forbid4a":true,"allowFallback":false}; preserve requested reasoning in note.
+Every accept/task needs an effective harness. Use {"harness":"dsh"} only if none was requested. Read-only/tests/localOnly never override it; localOnly limits delivery.
+4A/fallback needs explicit authorization. Report adapter refusals; never bypass via bash, direct CLI or imported functions.
+Grok: set {"harness":"grok"}; the adapter pins grok-4.7-build-fast. Report failures or authorized fallback; never switch silently.
 Use native tools for retries, queries, chat and stops; a refused action is not success.

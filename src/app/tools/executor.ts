@@ -11,6 +11,7 @@ import type { Sessions } from '../sessions.ts'
 import { AcknowledgementSchema, readTool, tool, type Tool } from './tool.ts'
 import { ticketCodexTool } from './codex.ts'
 import { ticketAgyTool } from './agy.ts'
+import { GROK_BUILD_MODEL, ticketGrokTool } from './grok.ts'
 
 export interface ExecutorToolsHost {
   readonly engine: Pick<EngineForExecutor, 'report' | 'reply' | 'markUnrelated' | 'handback' | 'followForContext'>
@@ -24,7 +25,7 @@ export interface ExecutorToolsHost {
 
 export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
   const ticketId = ticket.id
-  const delegate = (name: 'agy' | 'codex', selected: Tool): Tool => ({ ...selected, execute: async (raw, signal) => {
+  const delegate = (name: 'agy' | 'codex' | 'grok', selected: Tool): Tool => ({ ...selected, execute: async (raw, signal) => {
     const current = host.store.tickets.get(ticketId)
     if (!current || !liveTicket(current)) throw new Error('Ticket ended')
     const required = current.execution?.harness
@@ -35,11 +36,21 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
     if (name === 'agy' && required?.harness === 'agy' && args.model !== (required.model ?? '3.8f'))
       throw new Error('Use the authorized AGY model ' + (required.model ?? '3.8f'))
     const result = await selected.execute(raw, signal)
+    const grok = name === 'grok' && result && typeof result === 'object'
+      ? result as { cli_version?: unknown; models?: unknown; session_id?: unknown; request_id?: unknown; usage?: unknown }
+      : undefined
     host.store.atomic(() => {
       const latest = host.store.tickets.get(ticketId)
       if (latest && liveTicket(latest) && latest.execution) {
         latest.execution.harnessRun = { assignmentId: latestAssignment(current)!.id, harness: name,
-          ...(args.model ? { model: args.model } : {}) }
+          ...(name === 'grok' ? { model: GROK_BUILD_MODEL } : args.model ? { model: args.model } : {}),
+          ...(typeof grok?.cli_version === 'string' ? { version: grok.cli_version } : {}),
+          ...(Array.isArray(grok?.models) && grok.models.every(item => typeof item === 'string') ? { models: grok.models } : {}),
+          ...(typeof grok?.session_id === 'string' ? { sessionId: grok.session_id } : {}),
+          ...(typeof grok?.request_id === 'string' ? { requestId: grok.request_id } : {}),
+          ...(grok?.usage && typeof grok.usage === 'object' ? { usage: grok.usage as {
+            inputTokens?: number; outputTokens?: number; totalTokens?: number; modelCalls?: number; costUSD?: number
+          } } : {}) }
         host.store.tickets.save(latest)
       }
     })
@@ -48,6 +59,7 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
   return [
     delegate('codex', ticketCodexTool(ticket)),
     delegate('agy', ticketAgyTool(ticket)),
+    delegate('grok', ticketGrokTool(ticket)),
     readTool('Read one page of a resource of this ticket that the resource parameter lists. Follow next_offset, and next_resource where a page names one.',
       true, (resource, offset, limit, signal) => readResource(host.resources, resource, offset, limit, ticketId, signal)),
     tool({

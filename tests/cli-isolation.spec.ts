@@ -2,7 +2,7 @@ import { lstat, mkdir, mkdtemp, readFile, readlink, rm, stat, symlink, writeFile
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { cliStateDir, prepareAgyHome, prepareCodexHome, reuseCredential } from '../src/app/tools/cli-isolation.ts'
+import { cliStateDir, prepareAgyHome, prepareCodexHome, prepareGrokHome, prepareGrokSandboxProfile, reuseCredential } from '../src/app/tools/cli-isolation.ts'
 
 let dir: string
 beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'cli-isolation-')) })
@@ -98,5 +98,27 @@ describe('per-Ticket CLI isolation', () => {
     expect(await readlink(join(home, 'auth.json'))).toBe(join(shared, 'auth.json'))
     expect(await readlink(join(home, 'config.toml'))).toBe(join(shared, 'config.toml'))
     expect(await readFile(join(shared, 'auth.json'), 'utf8')).toBe('{"a":1}')
+  })
+
+  it('creates a private Grok home without linking shared credentials', async () => {
+    const grokHome = await prepareGrokHome(join(dir, 'root'))
+    expect(grokHome).toBe(join(dir, 'root', 'grok-user-home', '.grok'))
+    expect((await lstat(grokHome)).isSymbolicLink()).toBe(false)
+    await expect(lstat(join(grokHome, 'auth.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('creates a ticket-private workspace sandbox profile and fails closed on unknown settings', async () => {
+    const grokHome = await prepareGrokHome(join(dir, 'root'))
+    const profile = join(grokHome, 'sandbox.toml')
+    await prepareGrokSandboxProfile(grokHome)
+    const config = await readFile(profile, 'utf8')
+    expect(config).toContain('extends = "workspace"')
+    expect(config).toContain('restrict_network = true')
+    expect(config).toContain('"**/.env*"')
+    expect((await stat(profile)).mode & 0o777).toBe(0o600)
+    await prepareGrokSandboxProfile(grokHome)
+
+    await writeFile(profile, '[profiles.custom]\nextends = "off"\n')
+    await expect(prepareGrokSandboxProfile(grokHome)).rejects.toThrow('unexpected settings')
   })
 })
