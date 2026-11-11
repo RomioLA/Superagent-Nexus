@@ -148,7 +148,7 @@ it('routes several triggers in one call, in order, and answers a refused or fail
     { kind: 'ignore', trigger_id: thanks.id, reason: 'Thanks only.' },
     // A stop without its ticket is refused, alone.
     { kind: 'stop', trigger_id: request.id },
-    { kind: 'accept', trigger_id: request.id, title: 'Other', worktree_name: 'fix-other', acknowledgement: '收到。' },
+    { kind: 'accept', harness: { harness: 'dsh' }, trigger_id: request.id, title: 'Other', worktree_name: 'fix-other', acknowledgement: '收到。' },
     { kind: 'attach', trigger_id: other.id, ticket_id: 'no-such-ticket' },
     { kind: 'attach', trigger_id: more.id, ticket_id: ticket.id },
   ] }) as { results: Record<string, unknown>[] }
@@ -168,7 +168,7 @@ it('refuses alone an item that lacks a field its kind needs or breaks a field\'s
   for (const trigger of triggers) h.runtime.receive(trigger)
   await h.runtime.idle()
   const [a, b, c, d, e] = triggers.map(trigger => trigger.id) as [string, string, string, string, string]
-  const accept = { kind: 'accept', title: 'Fix', acknowledgement: '收到。' }
+  const accept = { kind: 'accept', title: 'Fix', acknowledgement: '收到。', harness: { harness: 'dsh' } }
   const { results } = await h.runTool(h.runtime.masterId, 'orchestrator_route', { decisions: [
     { ...accept, trigger_id: a },
     { ...accept, trigger_id: b, worktree_name: 'one-two-three-four-five' },
@@ -193,7 +193,7 @@ it('decides a candidate\'s batch with its card\'s trigger: a second accept keeps
   h.runtime.receive(first); h.runtime.receive(second)
   await h.runtime.settings.pause(false, 'panel')
   await h.runtime.pump(); await h.runtime.idle()
-  const accept = { kind: 'accept', worktree_name: 'retitle', acknowledgement: '收到。' }
+  const accept = { kind: 'accept', worktree_name: 'retitle', acknowledgement: '收到。', harness: { harness: 'dsh' } }
   const { results } = await h.runTool(h.runtime.masterId, 'orchestrator_route', { decisions: [
     { ...accept, trigger_id: first.id, title: 'Retitle' },
     { ...accept, trigger_id: second.id, title: 'Another title' },
@@ -237,7 +237,7 @@ it('ignores a proactive candidate from its card beside other decisions, marked s
   const { results } = await h.runTool(h.runtime.masterId, 'orchestrator_route', { decisions: [
     { kind: 'ignore', trigger_id: chat.id, reason: 'Lunch chat.' },
     { kind: 'ignore', trigger_id: thanks.id, reason: 'Thanks only.' },
-    { kind: 'accept', trigger_id: proposal.id, title: 'Shorter title', worktree_name: 'short-title', acknowledgement: '收到。' },
+    { kind: 'accept', harness: { harness: 'dsh' }, trigger_id: proposal.id, title: 'Shorter title', worktree_name: 'short-title', acknowledgement: '收到。' },
   ] }) as { results: Record<string, unknown>[] }
   expect(results).toEqual([
     { trigger_id: chat.id, kind: 'ignore', decision: 'ignore', reason: 'Ignored from its card, without a rule assessment; Lunch chat.' },

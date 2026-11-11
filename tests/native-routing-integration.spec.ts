@@ -55,7 +55,7 @@ it('requires project clarification and resolves each task from the configured ma
     { id: 'two', name: 'Two', aliases: [], status: 'test', repository: 'acme/other', directory: '/tmp/project-two' },
   ] } }
   host.runtime.receive(source); await host.runtime.idle()
-  const unresolved = await route([{ kind: 'accept', trigger_id: source.id, title: 'change', worktree_name: 'change', acknowledgement: 'On it' }])
+  const unresolved = await route([{ kind: 'accept', trigger_id: source.id, title: 'change', worktree_name: 'change', acknowledgement: 'On it', harness: { harness: 'dsh' } }])
   expect((unresolved.results as { refused: string }[])[0]!.refused).toContain('Choose an enabled configured project')
   expect(host.runtime.store.tickets.list()).toHaveLength(0)
   await route([{ kind: 'accept', trigger_id: source.id, tasks: tasks.slice(0, 2).map((task, i) => ({ ...task, project_id: i ? 'two' : 'one' })) }])
@@ -103,8 +103,29 @@ it('retains explicit AGY 3.8F constraints from semantic routing through Worker e
 
 it('keeps ordinary tasks on the default native DSH path when no Harness was requested', async () => {
   const { ticket, sessionId } = await host.acceptedTicket(feishu('92', '请只读检查项目配置。'))
-  expect(ticket.execution?.harness).toBeUndefined()
+  expect(ticket.execution?.harness).toEqual({ harness: 'dsh' })
   await host.runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'Inspected with native tools.' })
   expect(agy).not.toHaveBeenCalled(); expect(codex).not.toHaveBeenCalled()
   expect(host.runtime.store.tickets.get(ticket.id)?.ended?.outcome).toBe('completed')
+})
+
+it('refuses an accept that puts an explicit Harness only in its note instead of structured constraints', async () => {
+  const source = feishu('93', 'Use AGY 3.8F only, no fallback.')
+  host.runtime.receive(source); await host.runtime.idle()
+  const decision = { kind: 'accept', trigger_id: source.id, title: 'AGY check', worktree_name: 'agy-check', acknowledgement: 'On it',
+    note: '必须经 orchestrator_agy 3.8f/high/read-only，禁4A与替代。' }
+  const refused = await route([decision])
+  expect((refused.results as { refused: string }[])[0]!.refused).toContain('accept needs structured harness')
+  expect(host.runtime.store.tickets.list()).toHaveLength(0)
+  await route([{ ...decision, harness: { harness: 'agy', model: '3.8f', forbid4a: true, allowFallback: false } }])
+  await host.runtime.idle()
+  expect(host.runtime.store.tickets.list()[0]?.execution?.harness).toEqual({ harness: 'agy', model: '3.8f', forbid4a: true, allowFallback: false })
+})
+
+it('requires an effective Harness for every split item before creating any Ticket', async () => {
+  const source = feishu('94', 'Two independent checks.')
+  host.runtime.receive(source); await host.runtime.idle()
+  const result = await route([{ kind: 'accept', trigger_id: source.id, tasks: [tasks[0], { title: 'Other', worktree_name: 'other-check' }] }])
+  expect((result.results as { refused: string }[])[0]!.refused).toContain('accept needs structured harness')
+  expect(host.runtime.store.tickets.list()).toHaveLength(0)
 })

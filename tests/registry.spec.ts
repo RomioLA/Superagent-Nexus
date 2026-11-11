@@ -210,3 +210,20 @@ it('retries a partial Feishu result with the same topic and main-chat idempotenc
   expect(delivered.get(result.id)).toEqual(expect.arrayContaining(['+messages-reply', '--message-id', 'om_result', '--reply-in-thread']))
   expect([...delivered.values()].find(args => args.includes('+messages-send'))?.join(' ')).toContain('open_thread_id=omt_result')
 })
+
+it('retries a transient source-link lookup without posting another topic result or main notice', async () => {
+  const sources = new SourceRegistry(() => SettingsSchema.parse({})); sources.register(feishuKind)
+  const commands = new Commands(() => testDeployment(), {}, new AbortController().signal)
+  const link = 'https://applink.feishu.cn/client/thread/open?open_thread_id=omt_retry'
+  const run = vi.spyOn(commands, 'run').mockResolvedValueOnce('{"ok":true,"data":{}}')
+    .mockRejectedValueOnce(new Error('Transient lookup failure'))
+    .mockResolvedValueOnce(JSON.stringify({ ok: true, data: { messages: [{ message_id: 'om_retry', chat_id: 'oc_dm', message_app_link: link }] } }))
+    .mockResolvedValueOnce('{"ok":true,"data":{}}')
+  expect(await sources.send({ id: 'result-retry', ticketId: 'ticket-retry', channel: feishuChannel('oc_dm', 'om_retry', true),
+    kind: 'reply', purpose: 'result', text: 'Blocked; accept the result?' }, commands)).toBe('sent')
+  const calls = run.mock.calls.map(([, args]) => args)
+  expect(calls.filter(args => args.includes('+messages-reply'))).toHaveLength(1)
+  expect(calls.filter(args => args.includes('+messages-mget'))).toHaveLength(2)
+  expect(calls.filter(args => args.includes('+messages-send'))).toHaveLength(1)
+  expect(calls.at(-1)?.join(' ')).toContain(link)
+})
