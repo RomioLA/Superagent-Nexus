@@ -6,7 +6,7 @@ import { realpath, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { isAbsolute, join, relative, sep } from 'node:path'
 import { z } from 'zod'
-import type { Ticket } from '../../core/index.ts'
+import type { HarnessUsage, Ticket } from '../../core/index.ts'
 import { cliStateDir, ensureCliDir, prepareAgyHome } from './cli-isolation.ts'
 import type { Tool } from './tool.ts'
 
@@ -112,7 +112,35 @@ function tail(text: string): string {
   return clean ? ' stderr: ' + clean.slice(-600) : ''
 }
 
-export function parseAgyOutput(output: string, stderr = ''): { summary: string; duration_seconds?: number } {
+/** A non-negative finite count the CLI reported, or undefined; never a placeholder or a derived estimate. */
+function count(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
+}
+
+/**
+ * The token counts AGY actually reports for a run, from its `usage` object or, when absent, the same fields on the envelope.
+ * Only counts AGY named are kept: a reported `0` stays `0`, no total is derived and no cost is estimated.
+ */
+function agyUsage(data: Record<string, unknown>): HarnessUsage | undefined {
+  const nested = record(data.usage)
+  const pick = (key: string): number | undefined => count(nested?.[key]) ?? count(data[key])
+  const inputTokens = pick('input_tokens'), outputTokens = pick('output_tokens'), totalTokens = pick('total_tokens')
+  const cacheReadTokens = pick('cache_read_tokens'), modelCalls = pick('model_calls')
+  const usage: HarnessUsage = {
+    ...(inputTokens === undefined ? {} : { inputTokens }),
+    ...(outputTokens === undefined ? {} : { outputTokens }),
+    ...(totalTokens === undefined ? {} : { totalTokens }),
+    ...(cacheReadTokens === undefined ? {} : { cacheReadTokens }),
+    ...(modelCalls === undefined ? {} : { modelCalls }),
+  }
+  return Object.keys(usage).length ? usage : undefined
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined
+}
+
+export function parseAgyOutput(output: string, stderr = ''): { summary: string; duration_seconds?: number; turns?: number; usage?: HarnessUsage } {
   let result: unknown
   try { result = JSON.parse(output) } catch {
     throw new Error('AGY did not return valid JSON; inspect the Ticket workspace and partial changes before retrying.' + tail(stderr))
@@ -130,7 +158,10 @@ export function parseAgyOutput(output: string, stderr = ''): { summary: string; 
   }
   const seconds = typeof data.duration_seconds === 'number' && Number.isFinite(data.duration_seconds)
     ? data.duration_seconds : undefined
-  return { summary: summary.slice(0, 5500), ...(seconds === undefined ? {} : { duration_seconds: seconds }) }
+  const turns = typeof data.num_turns === 'number' && Number.isInteger(data.num_turns) && data.num_turns >= 0 ? data.num_turns : undefined
+  const usage = agyUsage(data)
+  return { summary: summary.slice(0, 5500), ...(seconds === undefined ? {} : { duration_seconds: seconds }),
+    ...(turns === undefined ? {} : { turns }), ...(usage === undefined ? {} : { usage }) }
 }
 
 function processFailure(exitCode: number | null, signal: NodeJS.Signals | null, output: string, stderr: string): string {

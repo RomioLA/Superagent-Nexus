@@ -1,6 +1,6 @@
 /** Executor Session tools for reading ticket context, acknowledging requests, managing threads, handing back out-of-scope triggers, and reporting status. */
 import { z } from 'zod'
-import { latestAssignment, liveTicket, type EngineForExecutor, type Ticket } from '../../core/index.ts'
+import { latestAssignment, liveTicket, type EngineForExecutor, type HarnessRun, type HarnessUsage, type Ticket } from '../../core/index.ts'
 import { IM_WORDS } from '../../infra/text.ts'
 import { claimPull, readPull } from '../../sources/github-pull.ts'
 import type { SourceContext } from '../../sources/host.ts'
@@ -23,8 +23,64 @@ export interface ExecutorToolsHost {
   sendReplies(): Promise<void>
 }
 
+/** A failed Harness call's reason, bounded and stripped of credentials before it is stored as evidence. */
+function harnessError(error: unknown): string {
+  const text = error instanceof Error ? error.message : String(error)
+  const safe = text.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
+    .replace(/\b(?:xai-|sk-)[A-Za-z0-9._-]{12,}\b/gi, '[redacted credential]')
+    .replace(/[\r\n\t ]+/g, ' ').trim()
+  return safe.slice(0, 400) || 'Harness call failed'
+}
+
+const optionalText = (value: unknown): string | undefined => typeof value === 'string' ? value : undefined
+const optionalNumber = (value: unknown): number | undefined => typeof value === 'number' && Number.isFinite(value) ? value : undefined
+const optionalCount = (value: unknown): number | undefined =>
+  typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : undefined
+
 export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
   const ticketId = ticket.id
+  /**
+   * Records one actual Harness call as evidence under the Ticket's current Assignment, appending to `harnessRuns` so no
+   * earlier call is replaced. Only a finished call updates the latest-successful `harnessRun`; failures and unverified
+   * writes are retained in the history without erasing an earlier verification.
+   */
+  const recordHarnessRun = (name: 'agy' | 'codex' | 'grok', args: { model?: string; mode?: 'read-only' | 'write' },
+    result: unknown, status: 'finished' | 'failed' | 'unverified', failure?: unknown) => {
+    const data = result && typeof result === 'object' ? result as Record<string, unknown> : undefined
+    const usage = data && typeof data.usage === 'object' && data.usage ? data.usage as HarnessUsage : undefined
+    const models = data && Array.isArray(data.models) && data.models.every(item => typeof item === 'string') ? data.models as string[] : undefined
+    const rawEvidence = data?.write_evidence as { changedFiles?: unknown; completedEditCalls?: unknown } | undefined
+    const changedFiles = optionalCount(rawEvidence?.changedFiles)
+    const completedEditCalls = optionalCount(rawEvidence?.completedEditCalls)
+    const writeEvidence = changedFiles !== undefined && changedFiles > 0 && completedEditCalls !== undefined
+      ? { changedFiles, completedEditCalls } : undefined
+    const codexTokens = name === 'codex' ? optionalCount(data?.tokens) : undefined
+    const fields: Omit<HarnessRun, 'assignmentId'> = {
+      harness: name, status, at: new Date().toISOString(),
+      ...(name === 'grok' ? { model: GROK_BUILD_MODEL } : args.model ? { model: args.model } : {}),
+      ...(name === 'grok' ? { mode: args.mode ?? 'write' } : args.mode ? { mode: args.mode } : {}),
+      ...(writeEvidence ? { writeEvidence } : {}),
+      ...(optionalText(data?.cli_version) ? { version: optionalText(data?.cli_version) } : {}),
+      ...(models ? { models } : {}),
+      ...(models && models.length === 1 ? { servedModel: models[0]! } : {}),
+      ...(optionalText(data?.session_id) ? { sessionId: optionalText(data?.session_id) } : {}),
+      ...(optionalText(data?.request_id) ? { requestId: optionalText(data?.request_id) } : {}),
+      ...(usage ? { usage } : codexTokens ? { usage: { totalTokens: codexTokens } } : {}),
+      ...(optionalNumber(data?.duration_seconds) !== undefined ? { durationSeconds: optionalNumber(data?.duration_seconds) } : {}),
+      ...(optionalCount(data?.turns) !== undefined ? { turns: optionalCount(data?.turns) } : {}),
+      ...(status === 'failed' ? { error: harnessError(failure) } : {}),
+    }
+    host.store.atomic(() => {
+      const latest = host.store.tickets.get(ticketId)
+      if (!latest || !liveTicket(latest) || !latest.execution) return
+      const assignmentId = latestAssignment(latest)!.id
+      // A stored single `harnessRun` from an earlier version becomes the first history entry instead of being lost.
+      const runs = latest.execution.harnessRuns ?? (latest.execution.harnessRun ? [latest.execution.harnessRun] : [])
+      latest.execution.harnessRuns = [...runs, { ...fields, assignmentId }]
+      if (status === 'finished') latest.execution.harnessRun = { ...fields, assignmentId }
+      host.store.tickets.save(latest)
+    })
+  }
   const delegate = (name: 'agy' | 'codex' | 'grok', selected: Tool): Tool => ({ ...selected, execute: async (raw, signal) => {
     const current = host.store.tickets.get(ticketId)
     if (!current || !liveTicket(current)) throw new Error('Ticket ended')
@@ -35,31 +91,16 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
       throw new Error('AGY 4a requires explicit authorization; no automatic upgrade from 3.8f')
     if (name === 'agy' && required?.harness === 'agy' && args.model !== (required.model ?? '3.8f'))
       throw new Error('Use the authorized AGY model ' + (required.model ?? '3.8f'))
-    const result = await selected.execute(raw, signal)
-    const grok = name === 'grok' && result && typeof result === 'object'
-      ? result as { cli_version?: unknown; models?: unknown; session_id?: unknown; request_id?: unknown; usage?: unknown; status?: unknown; write_evidence?: { changedFiles: number; completedEditCalls: number } }
-      : undefined
-    // An unverified write is not a successful Harness execution. Preserve any earlier native receipt.
-    if (grok?.status === 'unverified') return result
-    host.store.atomic(() => {
-      const latest = host.store.tickets.get(ticketId)
-      if (latest && liveTicket(latest) && latest.execution) {
-        latest.execution.harnessRun = { assignmentId: latestAssignment(current)!.id, harness: name,
-          ...(name === 'grok' ? { model: GROK_BUILD_MODEL } : args.model ? { model: args.model } : {}),
-          ...(name === 'grok' ? { mode: args.mode ?? 'write' } : {}),
-          ...(grok?.write_evidence && Number.isInteger(grok.write_evidence.changedFiles) && grok.write_evidence.changedFiles > 0
-            && Number.isInteger(grok.write_evidence.completedEditCalls) && grok.write_evidence.completedEditCalls >= 0
-            ? { writeEvidence: grok.write_evidence } : {}),
-          ...(typeof grok?.cli_version === 'string' ? { version: grok.cli_version } : {}),
-          ...(Array.isArray(grok?.models) && grok.models.every(item => typeof item === 'string') ? { models: grok.models } : {}),
-          ...(typeof grok?.session_id === 'string' ? { sessionId: grok.session_id } : {}),
-          ...(typeof grok?.request_id === 'string' ? { requestId: grok.request_id } : {}),
-          ...(grok?.usage && typeof grok.usage === 'object' ? { usage: grok.usage as {
-            inputTokens?: number; outputTokens?: number; totalTokens?: number; modelCalls?: number; costUSD?: number
-          } } : {}) }
-        host.store.tickets.save(latest)
-      }
-    })
+    let result: unknown
+    try {
+      result = await selected.execute(raw, signal)
+    } catch (error) {
+      recordHarnessRun(name, args, undefined, 'failed', error)
+      throw error
+    }
+    // An unverified write is not a successful Harness execution; retain the attempt but keep any earlier native receipt.
+    const status = result && typeof result === 'object' && (result as { status?: unknown }).status === 'unverified' ? 'unverified' : 'finished'
+    recordHarnessRun(name, args, result, status)
     return result
   } })
   return [

@@ -316,24 +316,60 @@ export interface Ticket {
  * Thread closed; the ticket then ends unless its work has not finished (see `Tickets.unfinished`).
  */
 export interface Follow { thread: string; own: boolean; closed?: { at: string; outcome: 'merged' | 'closed' } }
+/**
+ * Trustworthy usage a Harness CLI reported for one run. Each field is written only when the CLI named it; a metric the CLI
+ * did not return stays absent (unknown) rather than being estimated. Cost is never inferred from tokens.
+ */
+export interface HarnessUsage {
+  inputTokens?: number
+  outputTokens?: number
+  totalTokens?: number
+  /** Prompt-cache reads the CLI reported, distinct from fresh input tokens. */
+  cacheReadTokens?: number
+  modelCalls?: number
+  costUSD?: number
+}
+/**
+ * One actual Harness CLI call made inside a Ticket's worker, as real execution evidence.
+ * It records the request (Harness and model alias) and only what the CLI verifiably returned: a served model, usage, and IDs.
+ * `assignmentId` ties it to the DSH worker Assignment that made the call, so the worker is the parent agent and the Harness is
+ * the executing member. A team result never splits into per-member success here; each record is one member's actual call.
+ */
+export interface HarnessRun {
+  assignmentId: string
+  harness: 'agy' | 'codex' | 'grok'
+  /** The model or alias the caller asked the Harness for; absent when the caller named none. */
+  model?: string
+  /** A model the CLI itself reported as served, only when it named exactly one; otherwise unknown. */
+  servedModel?: string
+  /** Every model the CLI reported using, when it named them. */
+  models?: string[]
+  version?: string
+  mode?: 'read-only' | 'write'
+  /** Outcome of this call: `finished`, `failed`, or an unverified write (`unverified`). */
+  status?: 'finished' | 'failed' | 'unverified'
+  /** A failed call's reason, bounded and credential-redacted. */
+  error?: string
+  durationSeconds?: number
+  /** Model turns the CLI reported. */
+  turns?: number
+  writeEvidence?: { changedFiles: number; completedEditCalls: number }
+  sessionId?: string
+  requestId?: string
+  usage?: HarnessUsage
+  /** When this record was written (ISO 8601). */
+  at?: string
+}
 export interface Execution {
   name: string
   directory: string
   assignment: string
   harness?: import('./ports.ts').HarnessSpec
   project?: import('./ports.ts').ProjectTarget
-  harnessRun?: {
-    assignmentId: string
-    harness: 'agy' | 'codex' | 'grok'
-    model?: string
-    version?: string
-    mode?: 'read-only' | 'write'
-    writeEvidence?: { changedFiles: number; completedEditCalls: number }
-    models?: string[]
-    sessionId?: string
-    requestId?: string
-    usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number; modelCalls?: number; costUSD?: number }
-  }
+  /** The latest successfully finished Harness call; kept for older readers and the ready-report gate. */
+  harnessRun?: HarnessRun
+  /** Every actual Harness call for this Ticket in order, newest last; a later call never replaces an earlier one. */
+  harnessRuns?: HarnessRun[]
 }
 
 /** Whether a ticket is open: it has not ended. */

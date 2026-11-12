@@ -144,6 +144,16 @@ describe('AGY uses the existing native Ticket Executor', () => {
     expect(parseAgyOutput(JSON.stringify({ status: 'SUCCESS', response: 'Done', duration_seconds: 7.5 })))
       .toEqual({ summary: 'Done', duration_seconds: 7.5 })
   })
+  it('retains AGY token, cache and turn counts only when the CLI reports them', () => {
+    expect(parseAgyOutput(JSON.stringify({ status: 'SUCCESS', response: 'Done', duration_seconds: 7.5, num_turns: 3,
+      usage: { input_tokens: 100, output_tokens: 20, total_tokens: 130, cache_read_tokens: 10 } })))
+      .toEqual({ summary: 'Done', duration_seconds: 7.5, turns: 3,
+        usage: { inputTokens: 100, outputTokens: 20, totalTokens: 130, cacheReadTokens: 10 } })
+  })
+  it('accepts top-level token fields, keeps a reported zero, and leaves a total or cost it did not receive unknown', () => {
+    expect(parseAgyOutput(JSON.stringify({ status: 'SUCCESS', response: 'Done', input_tokens: 5, cache_read_tokens: 0 })))
+      .toEqual({ summary: 'Done', usage: { inputTokens: 5, cacheReadTokens: 0 } })
+  })
   it('keeps native AGY failures visible to the DSH Executor', () => {
     const tool = ticketAgyTool({ id: 't', execution: { directory: '/tmp/t', name: 't', assignment: '' } } as Ticket)
     expect(tool.description).toContain('repeatedly retry model errors')

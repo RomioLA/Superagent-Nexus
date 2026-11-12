@@ -215,6 +215,9 @@ it('does not erase an earlier successful execution after an error or a no-op wri
   grok.mockResolvedValueOnce({ status: 'unverified', summary: 'No new changes', write_evidence: { changedFiles: 0, completedEditCalls: 0 } })
   await host.runTool(worker, 'orchestrator_grok', { task: 'Check the file', mode: 'write' })
   expect(host.runtime.store.tickets.get(ticket.id)?.execution?.harnessRun).toEqual(earlier)
+  // Every attempt is retained even though only the finished call drives the latest-successful receipt.
+  expect(host.runtime.store.tickets.get(ticket.id)?.execution?.harnessRuns?.map(run => run.status))
+    .toEqual(['finished', 'failed', 'unverified'])
   // The worker may inspect the actual target and finish through native reporting; no new write is required.
   await host.runTool(worker, 'orchestrator_report', { state: 'ready', summary: 'Earlier edit and current target state verified.' })
   expect(host.runtime.store.tickets.get(ticket.id)?.ended?.outcome).toBe('completed')
@@ -253,4 +256,47 @@ it('keeps the enforced fallback default when allowFallback is omitted, and block
   await expect(host.runTool(dshWorker, 'orchestrator_agy', { task: 'Do it', model: '3.8f' })).rejects.toThrow('requires dsh')
   await expect(host.runTool(dshWorker, 'orchestrator_codex', { task: 'Do it', mode: 'write' })).rejects.toThrow('requires dsh')
   await expect(host.runTool(dshWorker, 'orchestrator_grok', { task: 'Do it', mode: 'write' })).rejects.toThrow('requires dsh')
+})
+
+it('retains every heterogeneous Harness call for one Ticket instead of overwriting earlier evidence', async () => {
+  const source = feishu('155', 'Use AGY first, then a Codex review; fallback allowed')
+  host.runtime.receive(source); await host.runtime.idle()
+  await route([{ kind: 'accept', trigger_id: source.id, title: 'Evidence', worktree_name: 'evidence', acknowledgement: 'On it',
+    harness: { harness: 'agy', model: '3.8f', forbid4a: true, allowFallback: true } }]); await host.runtime.idle()
+  const ticket = host.runtime.store.tickets.list()[0]!, worker = 'worker-' + ticket.id
+  const assignmentId = latestAssignment(ticket)!.id
+  await host.runTool(worker, 'orchestrator_agy', { task: 'Do it', model: '3.8f' })
+  agy.mockRejectedValueOnce(new Error('failed: Bearer FAKE-TEST-TOKEN-000000 denied'))
+  await expect(host.runTool(worker, 'orchestrator_agy', { task: 'Retry', model: '3.8f' })).rejects.toThrow('denied')
+  await host.runTool(worker, 'orchestrator_codex', { task: 'Review', mode: 'read-only' })
+  const runs = host.runtime.store.tickets.get(ticket.id)!.execution!.harnessRuns!
+  expect(runs.map(run => [run.harness, run.status])).toEqual([['agy', 'finished'], ['agy', 'failed'], ['codex', 'finished']])
+  expect(runs.every(run => run.assignmentId === assignmentId)).toBe(true)
+  // The failed call keeps a bounded, credential-free reason; no cost or tokens are invented for it.
+  expect(runs[1]!.error).toBe('failed: Bearer [redacted] denied')
+  expect(runs[1]!.usage).toBeUndefined()
+  // Only the latest finished call drives the existing latest-receipt field.
+  expect(host.runtime.store.tickets.get(ticket.id)!.execution!.harnessRun).toMatchObject({ harness: 'codex', status: 'finished' })
+})
+
+it('keeps a stored single harnessRun as history and persists the full run list in the Ticket record', async () => {
+  const source = feishu('156', 'Use AGY for this change')
+  host.runtime.receive(source); await host.runtime.idle()
+  await route([{ kind: 'accept', trigger_id: source.id, title: 'Evidence', worktree_name: 'evidence-legacy', acknowledgement: 'On it',
+    harness: { harness: 'agy', model: '3.8f', forbid4a: true } }])
+  await host.runtime.idle()
+  const ticket = host.runtime.store.tickets.list()[0]!, worker = 'worker-' + ticket.id
+  await host.runTool(worker, 'orchestrator_agy', { task: 'Do it', model: '3.8f' })
+  const earlier = host.runtime.store.tickets.get(ticket.id)!.execution!.harnessRun
+  // Simulate an older Ticket that only stored the single latest receipt, then record a new call.
+  const legacy = host.runtime.store.tickets.get(ticket.id)!
+  legacy.execution!.harnessRuns = undefined
+  host.runtime.store.tickets.save(legacy)
+  await host.runTool(worker, 'orchestrator_agy', { task: 'Do it again', model: '3.8f' })
+  const runs = host.runtime.store.tickets.get(ticket.id)!.execution!.harnessRuns!
+  expect(runs).toHaveLength(2)
+  expect(runs[0]).toEqual(earlier)
+  // The list lives in the durable Ticket JSON, so it survives a restart that reopens the store.
+  const row = host.runtime.store.db.prepare('SELECT value FROM ticket WHERE id = ?').get(ticket.id) as { value: string }
+  expect((JSON.parse(row.value) as { execution: { harnessRuns: unknown[] } }).execution.harnessRuns).toHaveLength(2)
 })
