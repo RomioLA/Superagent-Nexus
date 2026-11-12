@@ -104,9 +104,6 @@ export function harnessInstructions(harness: HarnessSpec): string {
         ? 'Harness required by the owner: Codex via orchestrator_codex; do not substitute AGY, Grok or DSH-native coding.'
         : 'Harness required by the owner: Grok Build via orchestrator_grok using the grok-4.7-build-fast model; never report another Harness or model as Grok.'
   const parts = [line]
-  if (harness.harness === 'grok') parts.push(harness.readOnly
-    ? 'Inspection only: use read-only mode; do not claim file changes.'
-    : 'Ready requires verified Grok file writes; a read-only run cannot complete this Ticket.')
   if (harness.forbid4a) parts.push('Do not use model=4a for any reason; if the required model is unavailable, report blocked rather than upgrading to 4a.')
   if (harness.allowFallback === false) parts.push('Do not fall back to a different Harness on failure; report the failure instead.')
   else if (harness.allowFallback === true) parts.push('A documented fallback is allowed if the preferred Harness is unavailable.')

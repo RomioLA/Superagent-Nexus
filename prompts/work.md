@@ -37,4 +37,4 @@ Use blocked only when implementation actually cannot proceed and a human must ac
 When the work ends with nothing for a human to do (not reproduced, not a defect, a decision already tracked elsewhere, no request), report dropped: it closes the ticket without a message, and a person's later message on its threads resumes it.
 Call orchestrator_report with the state, changes, checks, risks and actual PR number when one exists; omit pr_number otherwise and never use a placeholder. A new PR uses this ticket branch and deployment account. ready means reviewed implementation with relevant checks passed.
 
-Grok: never repeat, raise the limit or switch Harness after a stopped run. Verify actual file changes before ready.
+For Grok, distinguish read-only inspection from file writes. Use actual target-file evidence to report writes; an unverified result is not proof. Inspect or retry through the existing tools as appropriate.

@@ -420,7 +420,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/feishu-task-route-smoke.spec.ts` | Natural requests, long messages, chat, cancellation, queries, continuations and repeated project selection all enter native receive without a side-channel task API |
 | `tests/codex-ticket.spec.ts` | Codex Worker tool schema, worktree target and CLI token reporting |
 | `tests/agy-ticket.spec.ts` | Ticket-scoped AGY arguments, model mapping, process result parsing and failure reporting |
-| `tests/grok-execution.spec.ts` | Mock Grok process limits, cancellation, explicit Assignment retry and file-write evidence |
+| `tests/grok-execution.spec.ts` | Mock Grok native limits, cancellation, ordinary retries and file-write evidence |
 | `tests/status-reply.spec.ts` | Busy Ticket status answers, source channel, language, permission gates and Outbox deduplication |
 | `tests/magpie.spec.ts` | Existing scoped Magpie routing telemetry |
 | `tests/grok-ticket.spec.ts` | Grok Build headless arguments, permission profile, model-usage evidence and fail-closed result parsing |

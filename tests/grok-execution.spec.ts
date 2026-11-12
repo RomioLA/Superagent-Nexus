@@ -62,40 +62,52 @@ const ticketTool = (control: Parameters<typeof ticketGrokTool>[1] = {}) => {
 const args = { task: 'Create the target file' }
 const modelRuns = () => vi.mocked(spawn).mock.calls.filter(([, argv]) => (argv as string[]).includes('-p'))
 
-describe('bounded Grok execution without real model calls', () => {
-  it.each([0, 1])('reports native max-turn exhaustion at exit %s, then refuses automatic repeats and limit escalation', async exit => {
+describe('native Grok execution without real model calls', () => {
+  it.each([0, 1])('reports the official limit at exit %s and allows a subsequent run in the same binding', async exit => {
     outcome = async argv => {
-      const limit = Number(argv[argv.indexOf('--max-turns') + 1])
-      expect(limit).toBe(12)
-      return { exit, events: [...Array.from({ length: limit }, (_, index) => ({ type: 'tool_call', toolCallId: String(index), toolName: 'read_file' })),
+      expect(argv[argv.indexOf('--max-turns') + 1]).toBe('3')
+      return { exit, events: [{ type: 'tool_call', toolCallId: 'read', toolName: 'read_file' },
         { type: 'max_turns_reached' }, { ...end, stopReason: 'max_turns_reached' }] }
     }
     const tool = ticketTool()
-    await expect(tool.execute(args, new AbortController().signal)).rejects.toThrow(/max_turns.*no automatic retry/)
-    await expect(tool.execute({ ...args, max_turns: 50, limit_reason: 'Try the failed task again' }, new AbortController().signal))
-      .rejects.toThrow('Grok is stopped for this Assignment')
-    expect(modelRuns()).toHaveLength(1)
+    await expect(tool.execute({ ...args, max_turns: 3 }, new AbortController().signal)).rejects.toThrow('max_turns')
+    outcome = async argv => {
+      expect(argv[argv.indexOf('--max-turns') + 1]).toBe('100')
+      await writeFile(join(workspace, 'target.txt'), 'recovered edit')
+      return { events: [...edit, { type: 'text', data: 'Edited the target.' }, end] }
+    }
+    await expect(tool.execute({ ...args, max_turns: 100 }, new AbortController().signal)).resolves.toMatchObject({ status: 'finished' })
+    expect(modelRuns()).toHaveLength(2)
   })
 
-  it('rejects a claimed write without file changes and never starts another run after failure', async () => {
+  it('does not accept a model claim as a write, and leaves ordinary retry available', async () => {
     const tool = ticketTool()
-    await expect(tool.execute(args, new AbortController().signal)).rejects.toThrow('0 changed files, 0 completed edit calls')
+    const unverified = await tool.execute(args, new AbortController().signal)
+    expect(unverified).toMatchObject({ status: 'unverified', write_evidence: { changedFiles: 0, completedEditCalls: 0 },
+      model_summary: 'Created target.txt.' })
+    expect((unverified as { summary: string }).summary).not.toContain('Created target.txt.')
     await expect(readFile(join(workspace, 'target.txt'))).rejects.toMatchObject({ code: 'ENOENT' })
-    await expect(tool.execute(args, new AbortController().signal)).rejects.toThrow('explicit Ticket retry')
-    expect(modelRuns()).toHaveLength(1)
+    outcome = async () => { await writeFile(join(workspace, 'target.txt'), 'actual'); return { events: [...edit, { type: 'text', data: 'Edited.' }, end] } }
+    await expect(tool.execute(args, new AbortController().signal)).resolves.toMatchObject({ status: 'finished' })
+    expect(modelRuns()).toHaveLength(2)
   })
 
-  it('rejects completed edit events when the workspace did not change', async () => {
+  it('does not accept completed edit events alone when the workspace did not change', async () => {
     outcome = async () => ({ events: [...edit, { type: 'text', data: 'Updated the file.' }, end] })
-    await expect(ticketTool().execute(args, new AbortController().signal)).rejects.toThrow('0 changed files, 1 completed edit calls')
+    await expect(ticketTool().execute(args, new AbortController().signal)).resolves.toMatchObject({
+      status: 'unverified', write_evidence: { changedFiles: 0, completedEditCalls: 1 },
+    })
   })
 
-  it('rejects concurrent workspace changes without a completed Grok edit', async () => {
-    outcome = async () => { await writeFile(join(workspace, 'target.txt'), 'external'); return { events: [{ type: 'text', data: 'Done' }, end] } }
-    await expect(ticketTool().execute(args, new AbortController().signal)).rejects.toThrow('1 changed files, 0 completed edit calls')
+  it('accepts a real workspace edit even when diagnostic tool events are missing', async () => {
+    outcome = async () => { await writeFile(join(workspace, 'target.txt'), 'actual'); return { events: [{ type: 'text', data: 'Edited.' }, end] } }
+    await expect(ticketTool().execute(args, new AbortController().signal)).resolves.toMatchObject({
+      status: 'finished', write_evidence: { changedFiles: 1, completedEditCalls: 0 },
+    })
+    expect(await readFile(join(workspace, 'target.txt'), 'utf8')).toBe('actual')
   })
 
-  it.each(['existing.txt', 'target.txt'])('accepts a simple %s edit once with tool and new workspace evidence', async file => {
+  it.each(['existing.txt', 'target.txt'])('accepts a simple %s edit with workspace evidence', async file => {
     outcome = async () => { await writeFile(join(workspace, file), 'actual edit'); return { events: [...edit, { type: 'text', data: 'Edited the file.' }, end] } }
     vi.stubEnv('XAI_API_KEY', 'synthetic-do-not-inherit')
     const result = await ticketTool().execute(args, new AbortController().signal)
@@ -113,37 +125,38 @@ describe('bounded Grok execution without real model calls', () => {
     expect(modelRuns()).toHaveLength(1)
   })
 
-  it('keeps a bounded larger initial run available only with a complexity reason', async () => {
-    expect(() => grokArgs.parse({ ...args, max_turns: 24 })).toThrow('requires limit_reason')
-    expect(() => grokArgs.parse({ ...args, max_turns: 51, limit_reason: 'Complex migration' })).toThrow()
+  it('uses the existing 50-turn default and accepts a larger official limit without a justification gate', async () => {
+    expect(grokArgs.parse({ ...args, max_turns: 100 })).toMatchObject({ max_turns: 100 })
+    expect(() => grokArgs.parse({ ...args, max_turns: 0 })).toThrow()
+    expect(() => grokArgs.parse({ ...args, max_turns: 1.5 })).toThrow()
     outcome = async argv => {
-      expect(argv[argv.indexOf('--max-turns') + 1]).toBe('24')
+      expect(argv[argv.indexOf('--max-turns') + 1]).toBe('50')
       return { json: { text: 'Inspected.', stopReason: 'end_turn', modelUsage } }
     }
-    await ticketTool().execute({ ...args, mode: 'read-only', max_turns: 24, limit_reason: 'Inspect a multi-module migration' }, new AbortController().signal)
+    await ticketTool().execute({ ...args, mode: 'read-only' }, new AbortController().signal)
     expect(modelRuns()).toHaveLength(1)
   })
 
-  it('allows an explicit new Assignment to run through the same persistent tool binding', async () => {
-    let assignment = 'first'
-    const tool = ticketTool({ assignmentId: () => assignment })
-    await expect(tool.execute(args, new AbortController().signal)).rejects.toThrow('write is unverified')
-    await expect(tool.execute(args, new AbortController().signal)).rejects.toThrow('Grok is stopped')
-    assignment = 'explicit-retry'
+  it('allows recovery from an ordinary CLI failure through the same tool binding', async () => {
+    const tool = ticketTool()
+    outcome = async () => ({ exit: 1, events: [{ type: 'error', message: 'temporary CLI failure' }] })
+    await expect(tool.execute(args, new AbortController().signal)).rejects.toThrow('Grok Build failed')
     outcome = async () => { await writeFile(join(workspace, 'target.txt'), 'actual'); return { events: [...edit, { type: 'text', data: 'Edited.' }, end] } }
     await expect(tool.execute(args, new AbortController().signal)).resolves.toMatchObject({ status: 'finished' })
     expect(modelRuns()).toHaveLength(2)
   })
 
-  it('still cancels the isolated process group and rejects the partial result', async () => {
+  it('still cancels the isolated process group without locking later calls', async () => {
     outcome = async () => ({ hold: true, events: [{ type: 'usage', signature: { input_tokens: 120 } }] })
-    const controller = new AbortController()
-    const run = ticketTool().execute(args, controller.signal)
+    const controller = new AbortController(), tool = ticketTool()
+    const run = tool.execute(args, controller.signal)
     const rejected = expect(run).rejects.toThrow('Grok cancelled')
     await taskStarted.promise
     controller.abort()
     await rejected
     expect(kill).toHaveBeenCalledWith(-2147483000, 'SIGTERM')
-    expect(modelRuns()).toHaveLength(1)
+    outcome = async () => ({ json: { text: 'Inspected.', stopReason: 'end_turn', modelUsage } })
+    await expect(tool.execute({ ...args, mode: 'read-only' }, new AbortController().signal)).resolves.toMatchObject({ status: 'finished' })
+    expect(modelRuns()).toHaveLength(2)
   })
 })

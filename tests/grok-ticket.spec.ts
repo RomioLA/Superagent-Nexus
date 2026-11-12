@@ -16,7 +16,7 @@ describe('Grok Build is a native Executor CLI tool', () => {
 
   it('uses official streaming JSON with ticket-scoped file tools and fail-closed permissions for writes', () => {
     const write = grokCliArgs(grokArgs.parse({ task: 'Change one source file' }), 'prompt', '/tickets/one')
-    expect(write.slice(write.indexOf('--max-turns'), write.indexOf('--max-turns') + 2)).toEqual(['--max-turns', '12'])
+    expect(write.slice(write.indexOf('--max-turns'), write.indexOf('--max-turns') + 2)).toEqual(['--max-turns', '50'])
     expect(write.slice(write.indexOf('--cwd'), write.indexOf('--cwd') + 2)).toEqual(['--cwd', '/tickets/one'])
     expect(write.slice(write.indexOf('--model'), write.indexOf('--model') + 2)).toEqual(['--model', 'grok-4.7-build-fast'])
     expect(write.slice(write.indexOf('--output-format'), write.indexOf('--output-format') + 2)).toEqual(['--output-format', 'streaming-json'])

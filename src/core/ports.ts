@@ -43,8 +43,6 @@ export interface ProjectTarget { repository: string; root?: string; localOnly?: 
 export type HarnessName = 'dsh' | 'agy' | 'codex' | 'grok'
 export interface HarnessSpec {
   harness: HarnessName
-  /** Grok only: the original task explicitly requests inspection without file changes. */
-  readOnly?: boolean
   /** The AGY model the owner allows, when they named one; omitted leaves the Harness default. */
   model?: '3.8f' | '4a'
   /** The owner forbade model=4a, so a 3.8f capacity failure must be reported, never upgraded. */

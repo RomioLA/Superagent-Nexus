@@ -1,130 +1,103 @@
-# Grok stop-loss and explicit Ticket status answers
+# Grok verification and native behavior review
 
-Date: 2026-11-12 (Asia/Hong_Kong). Starting checkout: clean
-`codex/magpie-cost-routing`, `0734f67af68e588edef76a727c0dd2297a05d04a`.
-Only this development checkout was changed; no production checkout/database access,
-deployment, restart, push, merge, or real Grok model run was performed.
+Date: 2026-11-12 (Asia/Hong_Kong).
+The follow-up review started from clean `codex/magpie-cost-routing`,
+`de7d9908fc766286c6ec896caf15817637b0a449`, and reviews the restrictions introduced
+by `deb200a` and `de7d990`. This document supersedes their earlier restrictive
+recommendations. Only the development checkout is changed; no production
+checkout/database changes, deployment, restart, push, merge or real Grok model
+experiment is involved.
 
-## Native capability decision
+## Sources and baseline
 
-Official DSH upstream was checked through GitHub; its current main is
+Official upstream main was rechecked through GitHub and is still
 [`8c32a9d`](https://github.com/deepseek-ai/dsh-superagent-prototype/tree/8c32a9dc5d72c033816c6a8110b37f40cf94fba4).
-Its objects are already available locally, so `git show 8c32a9d:<path>` was used
-for comparison. In particular, upstream `src/app/notices.ts`,
-`src/core/replies.ts`, `src/core/assignments.ts`, `src/core/tickets.ts`,
-`src/app/outbox.ts`, `src/executor/dsh.ts`, and the work/reply/dispatch prompts
-already provide Ticket execution, steering, reports, answer authorization,
-receipts, cancellation, retries and durable delivery. There is no upstream Grok
-adapter to enable instead of the customized adapter. DSH's per-request output
-`maxTokens` and provider budget retry observation do not cap an external CLI's
-spend; those settings and all AGY/Codex adapters remain unchanged.
+Its `src/core/assignments.ts`, `src/core/tickets.ts`, `src/core/replies.ts`,
+`src/app/notices.ts`, `src/app/outbox.ts` and `src/executor/dsh.ts` already own
+reports, recovery, follow-ups, replies, cancellation and delivery. The native
+report lifecycle supports inspection/no-change work; it does not require a new
+inspection authorization marker or a write on every successful turn. Upstream
+has no Grok adapter or external-CLI dollar budget to enable.
 
-The installed official CLI reports `grok 1.0.80 (b200360b6562)`.
-Only help/version were inspected, without starting model work. Its main,
-`agent`, and `agent headless` help expose `--max-turns`, but no dollar/token
-budget or stall limit. The official [headless documentation](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/14-headless-mode.md)
-and [tool-loop implementation](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-shell/src/session/acp_session_impl/turn.rs)
-confirm that this is an agent/tool-loop boundary, not a model-call, token or
-dollar cap. Documentation/source main may evolve independently of installed
-1.0.80. NDJSON `usage` events expose response usage; terminal `end` exposes
-aggregate usage/modelUsage/cost. No reliable real-time dollar limit was found.
-The existing isolated process-group SIGTERM/SIGKILL cancellation, 150-second
-read timeout and 480-second write timeout remain intact.
+Installed Grok remains 1.0.80; `grok --no-auto-update --help` was rechecked without
+model work. The official [headless documentation](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/14-headless-mode.md)
+provides `--max-turns`, JSON stop reasons, usage and resume/continue facilities.
+The limit counts agent/tool-loop turns, not model calls or dollars. There is no
+official requirement to justify a limit above 12 or to lock an Assignment after
+one error. CLI help does not prescribe a 50-turn default: **50 was already this
+custom adapter's configuration in `0734f67`**, not an upstream or CLI default.
 
-For status inquiries, upstream already fans follow-ups out to Workers and
-relays them to the main Session. However, the notice/dispatch instructions allow
-the main Session only to stop work. Native `answer` requires a Worker report
-with `reply_to_trigger_id`, which becomes `ticket.answers`. Routine progress
-is intentionally not relayed. `requestStatus` only queues a report request when
-the latest Worker report is `waiting`; it cannot answer for a busy Worker.
-A prompt-only change cannot pass the native `noAnswer` gate. This explains the
-structural gap without introducing another notification mechanism.
+## Item-by-item decision
 
-## Minimal changes
+| Earlier addition | Decision | Evidence/reason |
+| --- | --- | --- |
+| Default 12 turns | Withdraw; restore the adapter's existing 50 | No actual task validation establishes a universal 12-turn policy |
+| Adapter ceiling of 50 and `limit_reason` above 12 | Withdraw; allow positive `max_turns` directly, including values above 50 | Reuse the official parameter rather than add an execution approval policy |
+| Any failure locks the current Assignment | Delete lock and dynamic Assignment callback | DSH and CLI already own error recovery; an ordinary failure does not prove another call must be prohibited |
+| Prompt/error text forbids retry or increasing a stopped run's limit | Withdraw | No new retry governor; the existing Worker decides recovery with actual failure/partial-change evidence |
+| `harness.readOnly` acceptance flag, mode/fallback restrictions and mandatory reacceptance | Remove | No incident evidence showed a read-only bypass; requiring a new acceptance flag harms ordinary native inspection work |
+| Every Grok Ticket needs writes before `ready` | Remove special gate; retain the pre-existing successful-Harness gate | Inspection/no-change tasks may finish under native reporting; task correctness remains the Worker's review responsibility |
+| Delete an earlier successful Harness record before every new Grok call | Remove | A later failure/no-op does not establish that an earlier actual edit vanished; retain native execution history semantics |
+| Every write call must have both completed-edit events and workspace changes | Relax; actual workspace changes are the verification evidence, tool counts are diagnostic | Stream metadata can be incomplete; a real observed edit must not fail solely because its completion event was absent |
+| No-change write throws and requires explicit retry | Replace with `status: unverified` and truthful host summary | This prevents a model-only write claim from becoming a new success, without making inspection/no-op results an execution ban |
+| Recognize official `max_turns_reached` | Keep | A CLI limit stop is incomplete, as the original non-`end_turn` check already requires; it must not be called successful |
+| Per-run mode and write-evidence metadata | Keep descriptive only | They show observed facts, not another Ticket policy or state manager |
+| Human/source/context checks and deterministic Outbox key for status answers | Keep unchanged | Directly fixes the confirmed busy-Worker status-answer gap through native Reply/Ticket/Outbox |
 
-- Reuse official `--max-turns`: default 12; values 1–50 remain possible, with
-  `limit_reason` required above 12 for initial task complexity. Recognize the
-  native exhaustion event/stop reason as failure, not completion.
-- Refuse another Grok run after failure in the same Assignment. An explicit
-  native Ticket retry creates a new Assignment and can use the same persistent
-  Worker/tool binding. This guard is in memory and is not a durable budget.
-- For write-mode success, require a completed edit tool and newly observed file
-  metadata changes. Inventory comes from Git's tracked/untracked, non-ignored
-  files; only `lstat` metadata is inspected, not file contents or credentials.
-  Existing dirty files alone do not count. Missing evidence fails closed.
-  A later Grok attempt revokes older `harnessRun` ready authorization, so failure
-  cannot borrow a prior success from that Assignment. Persist the run mode and
-  write evidence in that same native record. A Grok write Ticket cannot report
-  `ready` with only a read-only run or missing evidence. Explicit inspection-only
-  tasks select `harness={"harness":"grok","readOnly":true}` at acceptance; writes
-  are refused for those tasks, including through an explicitly allowed fallback.
-  An allowed fallback must also run read-only to report inspection completion.
-  A successful read-only review can retain earlier
-  verified writes in the same Assignment; failure still clears ready evidence.
-- Extend existing `orchestrator_reply` with `purpose=answer, status_only=true`.
-  The host ignores model-written text and generates a source-language snapshot
-  from native `ticketStage`. A running state explicitly does not confirm
-  healthy execution or task success. Human, source-channel and non-context
-  Ticket reach checks remain mandatory. Technical answer authorization is
-  unchanged and is neither granted nor consumed by a status answer.
-- Reuse Outbox with `key('status', ticket.id, trigger.id)` for stable delivery
-  and retries. Update the existing notice and prompts to allow this precise
-  response while keeping ordinary progress internal. Retain the original
-  Prompt character budgets. Architecture inventory entries include the new
-  tests and two pre-existing Magpie omissions discovered by the docs check.
+## Write verification and normal recovery
 
-No scheduler, keyword router, notifier, queue, billing engine or alternate
-Ticket/state manager was added.
+For write-mode CLI completion, the existing Git inventory and file metadata
+snapshot record observed changes, independently of the model's completion text.
+A real observed change is accepted even without a diagnostic edit-completed
+message. If no change is observed, the tool returns `unverified`, the host's
+summary states that writing is not verified, and the original response is kept
+separately as `model_summary`. An unverified result does not create a new
+successful `harnessRun`, so a first model-only write claim cannot satisfy the
+existing `ready` execution check.
 
-## Verification
+The adapter does not retry automatically and does not prohibit a later call.
+CLI errors/limit stops/cancellation still report their actual failure; the same
+binding can be used again through the existing tools. A previous successful
+record is preserved after failure or unverified/no-op output. Read-only runs
+remain ordinary successful inspections and can report `ready` without another
+acceptance flag or file write. No new parser tries to infer task intent from
+keywords. Workers must review the actual target before claiming it was written;
+a successful inspection is not proof that it was edited.
 
-The targeted Vitest checks covered 19 files (regression run plus final focused rerun): Grok arguments and simulated CLI
-processes, status replies, follow-ups, P0 notification integration, native
-routing, AGY/Codex, CLI isolation/security, Outbox, core engine, runtime,
-Prompt surfaces, documentation, delivery, retry health and queue.
-Result: **374 passed, 2 skipped** (the existing opt-in AGY live smoke tests).
-`pnpm typecheck`, `pnpm build`, and `git diff --check` passed.
+File activity does not prove semantic correctness or a particular target's
+contents. Git-ignored/unlisted changes may be unverified and can be inspected
+through the normal read-only path; no extra reacceptance or Assignment retry is
+required. A preserved historical success is not a certification of the current
+file contents. Native Worker review and relevant checks still decide completion.
 
-New cases cover native limit exhaustion at both zero/nonzero exit, suppression
-of repeat calls/limit escalation after failure, claimed writes with no edits,
-completed tools without workspace changes, workspace changes without completed
-tools, new and already-dirty file edits, read-only completion, bounded higher
-limits, cancellation and explicit new-Assignment retry. Native ready checks also
-reject read-only-only completion of write tasks, allow explicit inspection-only
-completion, retain verified writes through a successful read-only review, and enforce
-inspection-only scope even through an explicitly authorized fallback.
-Status cases cover a
-busy Worker without an answer report, original Feishu message routing,
-changed-text/state deduplication, a fresh question receiving current state,
-pause/resume delivery, unchanged technical answer gating, context/nonhuman/
-unrelated rejection, and English queued/idle/delivery failure snapshots.
+## Retained controls and status reply scope
 
-## Evidence limits and deployment advice
+The pre-existing per-Ticket credential isolation, sandbox/tool permissions,
+protected paths, output capture limit, 150-second read timeout, 480-second write
+timeout, and process-group SIGTERM/SIGKILL cancellation are unchanged. JSON
+completion and real model-usage verification remain. The adapter does not invent
+a hard dollar budget or its own billing/retry system.
 
-The incident's 43 calls / 972350 tokens / $1.146632 with no target file, followed
-by 3 calls / 11543 tokens / $0.04638, are supplied incident facts. This checkout
-contains no original Ticket transcript, receipt/effect log or CLI termination
-record for `d164fd31ac9031a8d7323813e26d70a1`. We cannot independently attribute
-the exact loop to permissions, repeated reads, internal retries or another
-cause, nor conclude that Feishu transport suppressed an already queued reply.
-The confirmed code defects are the loose default, missing write evidence,
-and busy-Worker status-answer gate.
+Feishu status behavior is unchanged from the minimal fix: explicit status
+questions use existing `orchestrator_reply purpose=answer, status_only=true`;
+current text comes from native `ticketStage`, and delivery uses the original
+human trigger's channel and the existing durable Outbox with a deterministic
+Ticket/trigger key. Technical answers still use the Worker's
+`reply_to_trigger_id` authorization. Ordinary progress stays internal. A running
+snapshot does not certify health/success, and native pause/transport conditions
+still affect delivery.
 
-12 tool-loop turns do not imply 12 model calls or a hard dollar ceiling. Native
-CLI internals can retry; terminal usage may be absent after forced termination.
-Metadata evidence proves observed file activity, not correct content or that a
-specific requested target was implemented. Review actual target files/diffs
-before reporting ready. Ignored-only writes fail verification. A no-op write
-request must be reviewed or performed as read-only inspection rather than
-being claimed as a verified write. Existing inspection Tickets lacking the new
-explicit `readOnly` flag will need reacceptance with correct scope before they
-can complete through the inspection-only path; do not switch modes to bypass it.
+## Validation
 
-State answers require the main Session to process the existing follow-up;
-there is no independent SLA or classifier. Text is a snapshot at enqueue time.
-Pause, unavailable transport and earlier pending messages still delay delivery
-under native Outbox rules. Future deployment should first validate one ordinary
-write, one busy-Ticket status question and native receipt deduplication in a test
-environment, without replaying the expensive loop. Verify the production CLI
-version and that configured Prompt overrides do not retain the old stop-only
-rule. Deployment and any production changes require a separate operation.
+Focused simulated-CLI and native runtime tests cover same-binding retries after
+limits/errors/cancellation, positive higher official limits, honest unverified
+writes, real edits without completion events, read-only completion without a
+new flag, preserved earlier successful work, authorized native fallback,
+status answers and deduplication. No real model loop is run.
+
+Final verification: 19 related Vitest files passed, **373 tests passed and 2
+existing opt-in AGY live smoke tests were skipped**. The suite includes Grok
+arguments/process simulation, native routing, status replies, follow-ups, P0
+notification integration, AGY/Codex adapters, CLI isolation/security, Outbox,
+core engine/runtime, Prompt surfaces, documentation, delivery, retry health and
+queue. `pnpm typecheck`, `pnpm build`, and `git diff --check` passed.

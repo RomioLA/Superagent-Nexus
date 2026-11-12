@@ -173,83 +173,61 @@ it('requires an effective Harness for every split item before creating any Ticke
   expect(host.runtime.store.tickets.list()).toHaveLength(0)
 })
 
-it('revokes stale Grok ready evidence when a later run fails without a verified write', async () => {
+it('does not authorize ready from an unverified write and permits ordinary recovery', async () => {
   const source = feishu('150', 'Use Grok for this change')
   host.runtime.receive(source); await host.runtime.idle()
   await route([{ kind: 'accept', trigger_id: source.id, title: 'Grok change', worktree_name: 'grok-change',
-    acknowledgement: 'On it', harness: { harness: 'grok' } }])
-  await host.runtime.idle()
-  const ticket = host.runtime.store.tickets.list()[0]!, worker = 'worker-' + ticket.id
-  await host.runTool(worker, 'orchestrator_grok', { task: 'Make an initial edit', mode: 'write' })
-  expect(host.runtime.store.tickets.get(ticket.id)?.execution?.harnessRun).toBeDefined()
-  grok.mockRejectedValueOnce(new Error('Grok write is unverified'))
-  await expect(host.runTool(worker, 'orchestrator_grok', { task: 'Finish the requested file', mode: 'write' })).rejects.toThrow('write is unverified')
-  expect(host.runtime.store.tickets.get(ticket.id)?.execution?.harnessRun).toBeUndefined()
-  await expect(host.runTool(worker, 'orchestrator_report', { state: 'ready', summary: 'All done' })).rejects.toThrow('No successful execution')
-  await host.runTool(worker, 'orchestrator_report', { state: 'failed', summary: 'No verified write; review partial changes before explicit retry.' })
-  await host.runtime.idle()
-  expect(host.relays(host.runtime.masterId).at(-1)).toMatchObject({ kind: 'worker_report', state: 'failed' })
-  expect(agy).not.toHaveBeenCalled(); expect(codex).not.toHaveBeenCalled()
-})
-
-it('does not let read-only Grok success or missing write evidence complete a write Ticket', async () => {
-  const source = feishu('151', 'Use Grok to edit the file')
-  host.runtime.receive(source); await host.runtime.idle()
-  await route([{ kind: 'accept', trigger_id: source.id, title: 'Edit', worktree_name: 'grok-edit',
     acknowledgement: 'On it', harness: { harness: 'grok' } }]); await host.runtime.idle()
   const ticket = host.runtime.store.tickets.list()[0]!, worker = 'worker-' + ticket.id
-  grok.mockResolvedValue({ status: 'finished', summary: 'Claimed completion', models: ['grok-4.7-build-fast'] })
-  await host.runTool(worker, 'orchestrator_grok', { task: 'Inspect the file', mode: 'read-only' })
-  expect(host.runtime.store.tickets.get(ticket.id)?.execution?.harnessRun).toMatchObject({ mode: 'read-only' })
-  await expect(host.runTool(worker, 'orchestrator_report', { state: 'ready', summary: 'The file was written' })).rejects.toThrow('No verified Grok write')
-  await host.runTool(worker, 'orchestrator_grok', { task: 'Edit the file', mode: 'write' })
-  await expect(host.runTool(worker, 'orchestrator_report', { state: 'ready', summary: 'The file was written' })).rejects.toThrow('No verified Grok write')
+  grok.mockResolvedValueOnce({ status: 'unverified', summary: 'No observed write', write_evidence: { changedFiles: 0, completedEditCalls: 0 } })
+  await expect(host.runTool(worker, 'orchestrator_grok', { task: 'Write the file', mode: 'write' })).resolves.toMatchObject({ status: 'unverified' })
+  expect(host.runtime.store.tickets.get(ticket.id)?.execution?.harnessRun).toBeUndefined()
+  await expect(host.runTool(worker, 'orchestrator_report', { state: 'ready', summary: 'Claimed written' })).rejects.toThrow('No successful execution')
+  await host.runTool(worker, 'orchestrator_grok', { task: 'Write the file', mode: 'write' })
+  await host.runTool(worker, 'orchestrator_report', { state: 'ready', summary: 'File and checks verified.' })
+  expect(host.runtime.store.tickets.get(ticket.id)?.ended?.outcome).toBe('completed')
 })
 
-it('allows an explicitly accepted Grok inspection to complete without write evidence and refuses writing', async () => {
-  const source = feishu('152', 'Use Grok for read-only inspection, do not edit')
+it('allows native read-only completion without another acceptance flag or any file write', async () => {
+  const source = feishu('151', 'Use Grok for read-only inspection, do not edit')
   host.runtime.receive(source); await host.runtime.idle()
   await route([{ kind: 'accept', trigger_id: source.id, title: 'Inspect', worktree_name: 'grok-inspect',
-    acknowledgement: 'Inspecting', harness: { harness: 'grok', readOnly: true } }]); await host.runtime.idle()
+    acknowledgement: 'Inspecting', harness: { harness: 'grok' } }]); await host.runtime.idle()
   const ticket = host.runtime.store.tickets.list()[0]!, worker = 'worker-' + ticket.id
-  expect(ticket.execution?.harness?.readOnly).toBe(true)
-  expect(ticket.execution?.assignment).toContain('Inspection only')
-  await expect(host.runTool(worker, 'orchestrator_grok', { task: 'Edit the file', mode: 'write' })).rejects.toThrow('inspection-only')
   grok.mockResolvedValue({ status: 'finished', summary: 'Inspected', models: ['grok-4.7-build-fast'] })
   await host.runTool(worker, 'orchestrator_grok', { task: 'Inspect the file', mode: 'read-only' })
-  await host.runTool(worker, 'orchestrator_report', { state: 'ready', summary: 'Read-only inspection complete, no files changed.' })
+  expect(host.runtime.store.tickets.get(ticket.id)?.execution?.harnessRun).toMatchObject({ mode: 'read-only' })
+  await host.runTool(worker, 'orchestrator_report', { state: 'ready', summary: 'Inspection complete, no files changed.' })
   expect(host.runtime.store.tickets.get(ticket.id)?.ended?.outcome).toBe('completed')
 })
 
-it('retains verified writes through a later successful read-only review in the same Assignment', async () => {
-  const source = feishu('153', 'Use Grok to edit and review the file')
+it('does not erase an earlier successful execution after an error or a no-op write attempt', async () => {
+  const source = feishu('152', 'Use Grok to edit and check the file')
   host.runtime.receive(source); await host.runtime.idle()
-  await route([{ kind: 'accept', trigger_id: source.id, title: 'Edit and review', worktree_name: 'grok-review',
+  await route([{ kind: 'accept', trigger_id: source.id, title: 'Edit and check', worktree_name: 'grok-check',
     acknowledgement: 'On it', harness: { harness: 'grok' } }]); await host.runtime.idle()
   const ticket = host.runtime.store.tickets.list()[0]!, worker = 'worker-' + ticket.id
   await host.runTool(worker, 'orchestrator_grok', { task: 'Edit the file', mode: 'write' })
-  grok.mockResolvedValue({ status: 'finished', summary: 'Reviewed', models: ['grok-4.7-build-fast'] })
-  await host.runTool(worker, 'orchestrator_grok', { task: 'Review the file', mode: 'read-only' })
-  expect(host.runtime.store.tickets.get(ticket.id)?.execution?.harnessRun).toMatchObject({
-    mode: 'read-only', writeEvidence: { changedFiles: 1, completedEditCalls: 1 },
-  })
-  await host.runTool(worker, 'orchestrator_report', { state: 'ready', summary: 'Edit and review complete.' })
+  const earlier = host.runtime.store.tickets.get(ticket.id)?.execution?.harnessRun
+  grok.mockRejectedValueOnce(new Error('temporary CLI error'))
+  await expect(host.runTool(worker, 'orchestrator_grok', { task: 'Check the file', mode: 'write' })).rejects.toThrow('temporary CLI error')
+  expect(host.runtime.store.tickets.get(ticket.id)?.execution?.harnessRun).toEqual(earlier)
+  grok.mockResolvedValueOnce({ status: 'unverified', summary: 'No new changes', write_evidence: { changedFiles: 0, completedEditCalls: 0 } })
+  await host.runTool(worker, 'orchestrator_grok', { task: 'Check the file', mode: 'write' })
+  expect(host.runtime.store.tickets.get(ticket.id)?.execution?.harnessRun).toEqual(earlier)
+  // The worker may inspect the actual target and finish through native reporting; no new write is required.
+  await host.runTool(worker, 'orchestrator_report', { state: 'ready', summary: 'Earlier edit and current target state verified.' })
   expect(host.runtime.store.tickets.get(ticket.id)?.ended?.outcome).toBe('completed')
 })
 
-it('preserves inspection-only permissions through an explicitly authorized fallback', async () => {
-  const source = feishu('154', 'Use Grok for read-only inspection; Codex fallback is allowed, never edit')
+it('keeps ordinary read-only review and authorized fallback on the native path', async () => {
+  const source = feishu('153', 'Use Grok for inspection; read-only Codex fallback is allowed')
   host.runtime.receive(source); await host.runtime.idle()
-  await route([{ kind: 'accept', trigger_id: source.id, title: 'Inspect', worktree_name: 'grok-fallback-inspect',
-    acknowledgement: 'Inspecting', harness: { harness: 'grok', readOnly: true, allowFallback: true } }]); await host.runtime.idle()
+  await route([{ kind: 'accept', trigger_id: source.id, title: 'Inspect', worktree_name: 'grok-review',
+    acknowledgement: 'Inspecting', harness: { harness: 'grok', allowFallback: true } }]); await host.runtime.idle()
   const ticket = host.runtime.store.tickets.list()[0]!, worker = 'worker-' + ticket.id
-  for (const name of ['orchestrator_grok', 'orchestrator_codex', 'orchestrator_agy']) {
-    await expect(host.runTool(worker, name, { task: 'Edit the file', mode: 'write',
-      ...(name === 'orchestrator_agy' ? { model: '3.8f' } : {}) })).rejects.toThrow('inspection-only')
-  }
-  expect(grok).not.toHaveBeenCalled(); expect(codex).not.toHaveBeenCalled(); expect(agy).not.toHaveBeenCalled()
-  await host.runTool(worker, 'orchestrator_codex', { task: 'Inspect the file', mode: 'read-only' })
-  expect(host.runtime.store.tickets.get(ticket.id)?.execution?.harnessRun).toMatchObject({ harness: 'codex', mode: 'read-only' })
-  await host.runTool(worker, 'orchestrator_report', { state: 'ready', summary: 'Authorized fallback inspection complete, no file changes.' })
+  await host.runTool(worker, 'orchestrator_grok', { task: 'Inspect the file', mode: 'read-only' })
+  await host.runTool(worker, 'orchestrator_codex', { task: 'Review the file', mode: 'read-only' })
+  await host.runTool(worker, 'orchestrator_report', { state: 'ready', summary: 'Authorized inspection complete; no files changed.' })
   expect(host.runtime.store.tickets.get(ticket.id)?.ended?.outcome).toBe('completed')
 })
