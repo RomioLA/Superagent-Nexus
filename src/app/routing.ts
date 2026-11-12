@@ -84,6 +84,65 @@ const finite = (value: unknown): number | undefined =>
   typeof value === 'number' && Number.isFinite(value) ? value : undefined
 const text = (value: unknown): string | undefined => typeof value === 'string' && value.length ? value : undefined
 
+/** Separate Codex account availability for the Router; it never enters Magpie channel ranking or model scoring. */
+export interface CodexQuotaRoutingSignals {
+  source: 'codex'
+  status: 'available' | 'rate-limited' | 'unknown'
+  availability: Availability
+  checked_at?: string
+  limit_id?: string
+  ordinary_usage_allowed?: boolean
+  rate_limit_reached_type?: string
+  primary?: { availability: Availability; window_duration_mins?: number; used_percent?: number; remaining_percent?: number; resets_at?: string }
+  secondary?: { availability: Availability; window_duration_mins?: number; used_percent?: number; remaining_percent?: number; resets_at?: string }
+  error?: string
+  reason: string
+}
+
+/** Project only the independent Codex snapshot fields the App Server actually returned. */
+export function summarizeCodexQuotaSignals(snapshot: unknown): CodexQuotaRoutingSignals {
+  const data = isRecord(snapshot) ? snapshot : {}
+  const rawStatus = text(data.status)
+  const status = rawStatus === 'available' || rawStatus === 'rate-limited' ? rawStatus : 'unknown'
+  const availability: Availability = status === 'available' ? 'available' : status === 'rate-limited' ? 'rate-limited' : 'unknown'
+  const window = (value: unknown) => {
+    if (!isRecord(value)) return undefined
+    const used = finite(value.used_percent)
+    const remaining = finite(value.remaining_percent)
+    const rawAvailability = text(value.availability)
+    const state: Availability = rawAvailability === 'available' || rawAvailability === 'exhausted' || rawAvailability === 'rate-limited'
+      ? rawAvailability : used === undefined ? 'unknown' : used >= 100 ? 'exhausted' : 'available'
+    return {
+      availability: state,
+      ...(finite(value.window_duration_mins) !== undefined ? { window_duration_mins: finite(value.window_duration_mins) } : {}),
+      ...(used !== undefined ? { used_percent: used } : {}),
+      ...(remaining !== undefined ? { remaining_percent: remaining } : {}),
+      ...(text(value.resets_at) ? { resets_at: text(value.resets_at) } : {}),
+    }
+  }
+  const primary = window(data.primary)
+  const secondary = window(data.secondary)
+  const reached = text(data.rate_limit_reached_type)
+  const ordinaryUsageAllowed = typeof data.ordinary_usage_allowed === 'boolean' ? data.ordinary_usage_allowed : undefined
+  const error = text(data.error)
+  const reason = status === 'rate-limited'
+    ? reached ? `Codex rate limit reached: ${reached}`
+      : ordinaryUsageAllowed === false ? 'Codex reports ordinary usage is not allowed'
+        : 'A Codex quota window reports at least 100% used'
+    : status === 'available'
+      ? ordinaryUsageAllowed === true ? 'Codex reports ordinary usage is allowed' : 'Both reported Codex quota windows have remaining usage'
+      : error ? `Codex quota is unknown because the read failed (${error})` : 'Codex account availability is unknown'
+  return {
+    source: 'codex', status, availability,
+    ...(text(data.checked_at) ? { checked_at: text(data.checked_at) } : {}),
+    ...(text(data.limit_id) ? { limit_id: text(data.limit_id) } : {}),
+    ...(ordinaryUsageAllowed !== undefined ? { ordinary_usage_allowed: ordinaryUsageAllowed } : {}),
+    ...(reached ? { rate_limit_reached_type: reached } : {}),
+    ...(primary ? { primary } : {}), ...(secondary ? { secondary } : {}),
+    ...(error ? { error } : {}), reason,
+  }
+}
+
 /**
  * Derive a candidate's availability from quota windows a source reported (the shape Magpie's `windowView` produces).
  * Any exhausted window makes the candidate exhausted; otherwise a positive remaining makes it available; otherwise the

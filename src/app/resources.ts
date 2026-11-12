@@ -11,7 +11,7 @@ import { ASSIGNMENTS, INPUTS, assignmentLine, decisionCard, decisionDetails, inp
 import { threadTitle } from './views/records.ts'
 import { transcriptEntry } from './context.ts'
 import { builtInParts, defaultPrompts } from './prompts.ts'
-import { summarizeRoutingSignals } from './routing.ts'
+import { summarizeCodexQuotaSignals, summarizeRoutingSignals } from './routing.ts'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Commands } from '../infra/commands.ts'
 import type { PromptVersion, Prompts } from './prompts.ts'
@@ -49,7 +49,7 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'prompts/<revision>', holds: 'one prompt version by number, or current, the one the Session works under', executor: true },
   { name: 'prompts/defaults', holds: 'the built-in prompt configuration, and the built-in parts by the key an override names' },
   { name: 'prompt-preview/<id>', holds: 'a composed prompt that orchestrator_prompts_save previewed' },
-  { name: 'models', holds: 'DSH models/roles; Magpie quota and usage/cache; explainable resource-aware routing signals for observed channels; exact account matches only; cost and cache hit rate unknown' },
+  { name: 'models', holds: 'DSH models/roles; Magpie quota and usage/cache; Codex account quota windows and separate availability signals; explainable resource-aware routing signals for observed channels; cost and cache hit rate unknown' },
   { name: 'models/<provider>', holds: 'one provider\'s models' },
   { name: 'feishu/<trigger-id>/…', holds: 'a Feishu original, as the dsh-superagent-feishu skill describes', executor: true },
   { name: 'github/…', holds: 'a GitHub original, as the dsh-superagent-github skill describes', executor: true },
@@ -71,6 +71,8 @@ export interface ResourceHost {
   sourceLink(trigger: Trigger, signal?: AbortSignal): Promise<{ source_url?: string; source_url_read?: string }>
   /** Read-only, secret-redacted Magpie telemetry for the main Session's model resource. */
   readonly magpie?: () => Promise<unknown>
+  /** Read-only Codex account quota through the existing authenticated Codex App Server session. */
+  readonly codexQuota?: (signal?: AbortSignal) => Promise<unknown>
 }
 export interface MainResourceHost extends ResourceHost {
   readonly sessions: Pick<Sessions, 'status' | 'modelRetry'>
@@ -195,9 +197,10 @@ const ROUTES: readonly Route[] = [
     const host = main(read), catalog = await host.context.sessionController.modelCatalog(), settings = host.store.settings()
     const roles = { orchestrator: settings.eval.model, worker: settings.executor.model }
     const magpie = host.magpie ? await host.magpie() : { status: 'not-configured' }
+    const codexQuota = host.codexQuota ? await host.codexQuota(read.signal) : { status: 'unknown', error: 'reader-not-configured' }
     return { default: catalog.default, roles, failures: catalog.failures,
       providers: catalog.groups.map(group => ({ id: group.id, name: group.name, count: group.models.length, read: `models/${group.id}` })),
-      magpie, routing: summarizeRoutingSignals(magpie) }
+      magpie, codex_quota: codexQuota, routing: summarizeRoutingSignals(magpie), codex_routing: summarizeCodexQuotaSignals(codexQuota) }
   }],
   ['models/', async read => {
     const models = (await main(read).context.sessionController.modelCatalog()).groups.find(group => group.id === read.rest)?.models

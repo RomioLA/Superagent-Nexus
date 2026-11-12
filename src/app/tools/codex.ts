@@ -3,11 +3,10 @@
  */
 import { spawn } from 'node:child_process'
 import { mkdtemp, readFile, realpath, rm, stat } from 'node:fs/promises'
-import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { z } from 'zod'
 import type { Ticket } from '../../core/index.ts'
-import { cliStateDir, ensureCliDir, prepareCodexHome } from './cli-isolation.ts'
+import { cliStateDir, codexCliPath, ensureCliDir, prepareCodexHome } from './cli-isolation.ts'
 import type { Tool } from './tool.ts'
 
 const toolArgs = z.object({
@@ -16,7 +15,6 @@ const toolArgs = z.object({
   reasoning: z.enum(['low', 'medium', 'high']).optional(),
 }).strict()
 
-const cliPath = (): string => join(homedir(), 'opt/codex/node_modules/.bin/codex')
 const maxCapture = 16000
 
 export function reportedCodexTokens(log: string): number | undefined {
@@ -31,7 +29,7 @@ export async function runTicketCodex(directory: string, ticketId: string, task: 
   signal.throwIfAborted()
   const workspace = await realpath(directory)
   if (workspace !== directory || !(await stat(workspace)).isDirectory()) throw new Error('Ticket workspace unavailable')
-  const cli = cliPath()
+  const cli = codexCliPath()
   // This Ticket's temporary files, caches and result are separate from every other Ticket's, while the shared login is reused.
   const root = cliStateDir(directory, ticketId)
   const tmp = await ensureCliDir(join(root, 'tmp'))
