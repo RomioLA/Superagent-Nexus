@@ -30,11 +30,16 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
     if (!current || !liveTicket(current)) throw new Error('Ticket ended')
     const required = current.execution?.harness
     if (required && required.harness !== name && required.allowFallback !== true) throw new Error('This Ticket requires ' + required.harness)
-    const args = raw as { model?: string }
+    const args = raw as { model?: string; mode?: 'read-only' | 'write' }
+    if (required?.readOnly && args.mode !== 'read-only')
+      throw new Error('This Grok Ticket is inspection-only; use read-only mode')
     if (name === 'agy' && args.model === '4a' && (required?.model !== '4a' || required.forbid4a))
       throw new Error('AGY 4a requires explicit authorization; no automatic upgrade from 3.8f')
     if (name === 'agy' && required?.harness === 'agy' && args.model !== (required.model ?? '3.8f'))
       throw new Error('Use the authorized AGY model ' + (required.model ?? '3.8f'))
+    const prior = current.execution?.harnessRun
+    const priorWrite = name === 'grok' && args.mode === 'read-only' && prior?.harness === 'grok'
+      && prior.assignmentId === latestAssignment(current)?.id ? prior.writeEvidence : undefined
     // A later failed Grok run cannot borrow an earlier successful run's ready authorization.
     if (name === 'grok' && current.execution?.harnessRun) host.store.atomic(() => {
       delete current.execution!.harnessRun
@@ -42,13 +47,17 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
     })
     const result = await selected.execute(raw, signal)
     const grok = name === 'grok' && result && typeof result === 'object'
-      ? result as { cli_version?: unknown; models?: unknown; session_id?: unknown; request_id?: unknown; usage?: unknown }
+      ? result as { cli_version?: unknown; models?: unknown; session_id?: unknown; request_id?: unknown; usage?: unknown; write_evidence?: { changedFiles: number; completedEditCalls: number } }
       : undefined
     host.store.atomic(() => {
       const latest = host.store.tickets.get(ticketId)
       if (latest && liveTicket(latest) && latest.execution) {
         latest.execution.harnessRun = { assignmentId: latestAssignment(current)!.id, harness: name,
           ...(name === 'grok' ? { model: GROK_BUILD_MODEL } : args.model ? { model: args.model } : {}),
+          ...(name === 'grok' || required?.readOnly ? { mode: args.mode ?? 'write' } : {}),
+          ...(grok?.write_evidence && Number.isInteger(grok.write_evidence.changedFiles) && grok.write_evidence.changedFiles > 0
+            && Number.isInteger(grok.write_evidence.completedEditCalls) && grok.write_evidence.completedEditCalls > 0
+            ? { writeEvidence: grok.write_evidence } : priorWrite ? { writeEvidence: priorWrite } : {}),
           ...(typeof grok?.cli_version === 'string' ? { version: grok.cli_version } : {}),
           ...(Array.isArray(grok?.models) && grok.models.every(item => typeof item === 'string') ? { models: grok.models } : {}),
           ...(typeof grok?.session_id === 'string' ? { sessionId: grok.session_id } : {}),
@@ -139,6 +148,12 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
         if (args.state === 'ready' && required && required.harness !== 'dsh'
           && (!run || run.assignmentId !== latestAssignment(current)?.id || (run.harness !== required.harness && required.allowFallback !== true)))
           throw new Error('No successful execution of the required Harness for this assignment; report blocked or failed')
+        if (args.state === 'ready' && required?.readOnly && run?.mode !== 'read-only')
+          throw new Error('Inspection-only completion requires a read-only Harness run')
+        if (args.state === 'ready' && required?.harness === 'grok' && run?.harness === 'grok'
+          && !(required.readOnly && run.mode === 'read-only')
+          && (!run.writeEvidence?.changedFiles || !run.writeEvidence.completedEditCalls))
+          throw new Error('No verified Grok write for this Ticket; read-only completion requires an explicit inspection-only Harness at acceptance')
         if (args.pr_number != null && typeof originRepo === 'string'
           && originRepo.toLowerCase() !== host.github.deployment.repository.toLowerCase())
           throw new Error('This ticket targets another repository: omit pr_number and include the full PR URL in summary')

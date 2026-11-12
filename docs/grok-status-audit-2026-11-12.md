@@ -53,7 +53,14 @@ structural gap without introducing another notification mechanism.
   files; only `lstat` metadata is inspected, not file contents or credentials.
   Existing dirty files alone do not count. Missing evidence fails closed.
   A later Grok attempt revokes older `harnessRun` ready authorization, so failure
-  cannot borrow a prior success from that Assignment.
+  cannot borrow a prior success from that Assignment. Persist the run mode and
+  write evidence in that same native record. A Grok write Ticket cannot report
+  `ready` with only a read-only run or missing evidence. Explicit inspection-only
+  tasks select `harness={"harness":"grok","readOnly":true}` at acceptance; writes
+  are refused for those tasks, including through an explicitly allowed fallback.
+  An allowed fallback must also run read-only to report inspection completion.
+  A successful read-only review can retain earlier
+  verified writes in the same Assignment; failure still clears ready evidence.
 - Extend existing `orchestrator_reply` with `purpose=answer, status_only=true`.
   The host ignores model-written text and generates a source-language snapshot
   from native `ticketStage`. A running state explicitly does not confirm
@@ -71,18 +78,22 @@ Ticket/state manager was added.
 
 ## Verification
 
-The targeted Vitest run covered 19 files: Grok arguments and simulated CLI
+The targeted Vitest checks covered 19 files (regression run plus final focused rerun): Grok arguments and simulated CLI
 processes, status replies, follow-ups, P0 notification integration, native
 routing, AGY/Codex, CLI isolation/security, Outbox, core engine, runtime,
 Prompt surfaces, documentation, delivery, retry health and queue.
-Result: **370 passed, 2 skipped** (the existing opt-in AGY live smoke tests).
+Result: **374 passed, 2 skipped** (the existing opt-in AGY live smoke tests).
 `pnpm typecheck`, `pnpm build`, and `git diff --check` passed.
 
 New cases cover native limit exhaustion at both zero/nonzero exit, suppression
 of repeat calls/limit escalation after failure, claimed writes with no edits,
 completed tools without workspace changes, workspace changes without completed
 tools, new and already-dirty file edits, read-only completion, bounded higher
-limits, cancellation and explicit new-Assignment retry. Status cases cover a
+limits, cancellation and explicit new-Assignment retry. Native ready checks also
+reject read-only-only completion of write tasks, allow explicit inspection-only
+completion, retain verified writes through a successful read-only review, and enforce
+inspection-only scope even through an explicitly authorized fallback.
+Status cases cover a
 busy Worker without an answer report, original Feishu message routing,
 changed-text/state deduplication, a fresh question receiving current state,
 pause/resume delivery, unchanged technical answer gating, context/nonhuman/
@@ -105,7 +116,9 @@ Metadata evidence proves observed file activity, not correct content or that a
 specific requested target was implemented. Review actual target files/diffs
 before reporting ready. Ignored-only writes fail verification. A no-op write
 request must be reviewed or performed as read-only inspection rather than
-being claimed as a verified write.
+being claimed as a verified write. Existing inspection Tickets lacking the new
+explicit `readOnly` flag will need reacceptance with correct scope before they
+can complete through the inspection-only path; do not switch modes to bypass it.
 
 State answers require the main Session to process the existing follow-up;
 there is no independent SLA or classifier. Text is a snapshot at enqueue time.

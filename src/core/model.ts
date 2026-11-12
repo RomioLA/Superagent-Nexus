@@ -327,6 +327,8 @@ export interface Execution {
     harness: 'agy' | 'codex' | 'grok'
     model?: string
     version?: string
+    mode?: 'read-only' | 'write'
+    writeEvidence?: { changedFiles: number; completedEditCalls: number }
     models?: string[]
     sessionId?: string
     requestId?: string

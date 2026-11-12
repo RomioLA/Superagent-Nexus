@@ -48,9 +48,11 @@ const fromDecision = (decision: Decision) => ({ decision: decision.kind, reason:
 const HarnessSpecSchema = z.object({
   harness: z.enum(['dsh', 'agy', 'codex', 'grok']).describe('Owner’s Worker backend; AGY requires agy. Choose dsh when unspecified.'),
   model: z.enum(['3.8f', '4a']).optional().describe('AGY default: 3.8f. 4a needs explicit authorization.'),
+  readOnly: z.boolean().optional().describe('Grok: explicit inspection only.'),
   forbid4a: z.boolean().optional().describe('Never upgrade to 4a.'),
   allowFallback: z.boolean().optional().describe('Only explicit authorization permits fallback.'),
-}).strict().refine(spec => !(spec.model === '4a' && spec.forbid4a), '4a conflicts with forbid4a')
+}).strict().refine(spec => !spec.readOnly || spec.harness === 'grok', 'readOnly is Grok-only')
+  .refine(spec => !(spec.model === '4a' && spec.forbid4a), '4a conflicts with forbid4a')
   .refine(spec => spec.harness === 'agy' || spec.model === undefined, 'Only AGY accepts this model selection')
 const TaskSpecSchema = z.object({
   title: z.string().trim().min(1).max(200).describe('Original subrequest label.'),

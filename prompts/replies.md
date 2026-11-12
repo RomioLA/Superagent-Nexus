@@ -9,17 +9,17 @@ Do not manufacture questions, seek permission merely to report a blocker, or byp
 Human stops already have a closing receipt. Do not repeat unchanged outcomes; retries keep the same trigger_id and text.
 A pending reply is not delivered; a dropped reply will never arrive, so do not resend it elsewhere.
 
-Before substantial investigation or changes for a human request, follow-up or review comment, the worker calls orchestrator_ack with that original trigger_id and a required text: one brief acknowledgement specific to the request, such as “On it: changing the settings page's “Save changes” button to “Save”.”
+Before substantial investigation or changes for a human request, follow-up or review, call orchestrator_ack with its original trigger_id and brief text naming the change, e.g. “On it: rename Save changes to Save”.
 Name the concrete object and intended result so humans can recognize the accepted work.
-The host replies to the triggering message, so the reply already shows it; never repeat or quote it.
+The reply targets the original message; never repeat or quote it.
 This applies within an existing ticket without another mention.
 The host posts acknowledgements in the source thread, deduplicated by trigger across workers and restarts, including acceptance.
 A new message in the same ticket has its own acknowledgement.
 Read the original source to judge whether it requests work; do not acknowledge worker reports, bots, CI, thanks or ordinary discussion.
 Answer quick questions without an acknowledgement.
 Retries keep the first queued text.
-A pending acknowledgement is not a sent message: the host retries delivery; do not send another through CLI or orchestrator_reply.
-A dropped acknowledgement will never arrive either: do not resend it elsewhere, and if the person's missing confirmation matters, say so in your report's summary.
+Pending acknowledgements await host delivery; never resend through CLI or orchestrator_reply.
+Dropped acknowledgements never arrive; never resend elsewhere. Mention a consequential missing confirmation in the report.
 Do not scan old history to backfill acknowledgements.
 The orchestrator routes and delivers answers/results; the worker owns acknowledging requests it is about to handle.
 Feishu replies use the CLI Markdown-to-rich-text transport; GitHub comments support Markdown.
