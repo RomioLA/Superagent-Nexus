@@ -35,6 +35,11 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
       throw new Error('AGY 4a requires explicit authorization; no automatic upgrade from 3.8f')
     if (name === 'agy' && required?.harness === 'agy' && args.model !== (required.model ?? '3.8f'))
       throw new Error('Use the authorized AGY model ' + (required.model ?? '3.8f'))
+    // A later failed Grok run cannot borrow an earlier successful run's ready authorization.
+    if (name === 'grok' && current.execution?.harnessRun) host.store.atomic(() => {
+      delete current.execution!.harnessRun
+      host.store.tickets.save(current)
+    })
     const result = await selected.execute(raw, signal)
     const grok = name === 'grok' && result && typeof result === 'object'
       ? result as { cli_version?: unknown; models?: unknown; session_id?: unknown; request_id?: unknown; usage?: unknown }
@@ -59,7 +64,10 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
   return [
     delegate('codex', ticketCodexTool(ticket)),
     delegate('agy', ticketAgyTool(ticket)),
-    delegate('grok', ticketGrokTool(ticket)),
+    delegate('grok', ticketGrokTool(ticket, { assignmentId: () => {
+      const current = host.store.tickets.get(ticketId)
+      return current && latestAssignment(current)?.id
+    } })),
     readTool('Read one page of a resource of this ticket that the resource parameter lists. Follow next_offset, and next_resource where a page names one.',
       true, (resource, offset, limit, signal) => readResource(host.resources, resource, offset, limit, ticketId, signal)),
     tool({

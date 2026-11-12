@@ -75,9 +75,11 @@ export const threadFollowedNotice = (ticketId: string, thread: string, reason: s
 
 /** Steering relay payload for the main Session: `id` is the request ID that makes delivery idempotent, and `text` is the message body. */
 export interface Relay { id: string; text: string }
-/** What a follow-up asks of the main Session: nothing but a stop the person asks for, since its ticket's worker decides it. */
+/** Workers decide follow-ups; the main Session may answer explicit lifecycle questions or stop on request. */
 const FOLLOWUP_NOTE = 'Its ticket\'s worker has it and decides; act only if the person asks to stop the work '
-  + '(orchestrator_route kind stop with this trigger_id).'
+  + '(orchestrator_route kind stop with this trigger_id), or explicitly asks for current Ticket status: use orchestrator_reply '
+  + 'purpose answer, status_only true, this trigger_id and the relevant non-context ticket_id. The host generates current state; '
+  + 'do not wait for a worker report or claim execution is healthy/successful. Technical answers still require a worker report.'
 /**
  * Builds a steering relay for a human follow-up trigger that reached at least one live ticket (including an ended ticket
  * that resumed on the follow-up), with the trigger rendered as workers read it, the replied-to message, and the open
@@ -97,7 +99,7 @@ export function followupNotice(store: Store, sources: SourceRegistry, triggerId:
 }
 /**
  * A person's message that reached tickets, as the main Session hears of it: the message as their workers read it, and the
- * tickets it reached with their state. Their workers decide it; the main Session may only stop the work on it.
+ * tickets it reached with their state. Their workers decide it; the main Session may stop on request or answer explicit lifecycle questions.
  */
 export function followupRelay(message: { trigger_id: string },
   tickets: readonly { ticket_id: string; title: string; state: string; context?: boolean }[]): Relay {

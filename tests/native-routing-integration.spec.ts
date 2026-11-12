@@ -171,3 +171,22 @@ it('requires an effective Harness for every split item before creating any Ticke
   expect((result.results as { refused: string }[])[0]!.refused).toContain('accept needs structured harness')
   expect(host.runtime.store.tickets.list()).toHaveLength(0)
 })
+
+it('revokes stale Grok ready evidence when a later run fails without a verified write', async () => {
+  const source = feishu('150', 'Use Grok for this change')
+  host.runtime.receive(source); await host.runtime.idle()
+  await route([{ kind: 'accept', trigger_id: source.id, title: 'Grok change', worktree_name: 'grok-change',
+    acknowledgement: 'On it', harness: { harness: 'grok' } }])
+  await host.runtime.idle()
+  const ticket = host.runtime.store.tickets.list()[0]!, worker = 'worker-' + ticket.id
+  await host.runTool(worker, 'orchestrator_grok', { task: 'Make an initial edit', mode: 'write' })
+  expect(host.runtime.store.tickets.get(ticket.id)?.execution?.harnessRun).toBeDefined()
+  grok.mockRejectedValueOnce(new Error('Grok write is unverified'))
+  await expect(host.runTool(worker, 'orchestrator_grok', { task: 'Finish the requested file', mode: 'write' })).rejects.toThrow('write is unverified')
+  expect(host.runtime.store.tickets.get(ticket.id)?.execution?.harnessRun).toBeUndefined()
+  await expect(host.runTool(worker, 'orchestrator_report', { state: 'ready', summary: 'All done' })).rejects.toThrow('No successful execution')
+  await host.runTool(worker, 'orchestrator_report', { state: 'failed', summary: 'No verified write; review partial changes before explicit retry.' })
+  await host.runtime.idle()
+  expect(host.relays(host.runtime.masterId).at(-1)).toMatchObject({ kind: 'worker_report', state: 'failed' })
+  expect(agy).not.toHaveBeenCalled(); expect(codex).not.toHaveBeenCalled()
+})

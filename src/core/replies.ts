@@ -5,6 +5,7 @@ import { latestAssignment, liveTicket, ticketOutcome } from './model.ts'
 import type { ChannelRef, Ticket, Trigger } from './model.ts'
 import type { ReplyStatus } from './ports.ts'
 import { EnginePart } from './part.ts'
+import { ticketStage } from './stage.ts'
 
 /**
  * A message for a Channel, by purpose: an Executor's acknowledgement of a person's request it works on, the answer to a
@@ -13,7 +14,7 @@ import { EnginePart } from './part.ts'
  */
 export type ReplyRequest =
   | { purpose: 'acknowledgement'; ticketId: string; triggerId: string; text: string }
-  | { purpose: 'answer' | 'result' | 'attention'; ticketId?: string; triggerId?: string; question?: string; text: string }
+  | { purpose: 'answer' | 'result' | 'attention'; ticketId?: string; triggerId?: string; question?: string; text: string; statusOnly?: boolean }
 /** A queued message: its id, whether it went out, and whether an earlier request had queued it already. */
 export interface Reply { id: string; status: ReplyStatus; reused: boolean }
 
@@ -67,6 +68,7 @@ export class Replies extends EnginePart {
     if (request.triggerId && !trigger) throw new UserError('unknownTrigger')
     const ticket = request.ticketId ? this.require(request.ticketId)
       : trigger ? this.repo.tickets.list().find(item => this.reaches(item, trigger)) : undefined
+    if (request.statusOnly) return this.statusAnswer(request, ticket, trigger)
     if (request.purpose === 'result') {
       const outcome = ticket && ticketOutcome(ticket)
       const state = ticket && latestAssignment(ticket)?.report?.state
@@ -106,6 +108,39 @@ export class Replies extends EnginePart {
     if (request.purpose === 'answer' && ticket && trigger && ticket.answers?.includes(trigger.id)) {
       ticket.answers = ticket.answers.filter(item => item !== trigger.id)
       this.repo.tickets.save(ticket)
+    }
+    return { id, status: this.options.outbox.status(id) ?? 'pending', reused: existing !== undefined }
+  }
+  /** Answer only from persisted lifecycle state, without authorizing or consuming a worker's technical answer. */
+  private statusAnswer(request: Exclude<ReplyRequest, { purpose: 'acknowledgement' }>, ticket?: Ticket, trigger?: Trigger): Reply {
+    if (request.purpose !== 'answer' || !trigger?.human) throw new UserError('notQuestion')
+    if (!ticket || !this.reaches(ticket, trigger, false)) throw new UserError('notReached')
+    if (!trigger.channel) throw new UserError('noChannel')
+    const id = key('status', ticket.id, trigger.id)
+    const existing = this.options.outbox.status(id)
+    if (!existing) {
+      const stage = ticketStage(ticket)
+      const state = ticket.ended?.outcome ?? (stage.stage === 'person' ? `person/${stage.action}`
+        : stage.stage === 'working' && stage.action ? 'working/queued' : stage.stage)
+      const labels: Record<string, [string, string]> = {
+        working: ['仍在运行；尚不能确认执行正常或任务成功。', 'Still running; healthy execution or task success is not yet confirmed.'],
+        'working/queued': ['正在排队，尚未开始执行。', 'Queued; execution has not started.'],
+        idle: ['当前空闲，尚不能确认任务成功。', 'Currently idle; task success is not confirmed.'],
+        'person/delivery': ['消息未能送达执行器，需要处理投递问题。', 'Input delivery to the worker failed and needs attention.'],
+        'person/answer': ['正在等待人工回答。', 'Waiting for a human answer.'],
+        'person/review': ['已报告可供审核，正在等待人工审核。', 'Reported ready for human review.'],
+        'person/blocked': ['执行受阻，正在等待人工处理。', 'Blocked; waiting for human action.'],
+        'person/failed': ['已报告执行失败，正在等待人工处理。', 'Execution was reported failed; waiting for human action.'],
+        completed: ['任务已记录为完成。', 'The task is recorded as completed.'],
+        merged: ['关联的 PR 已合并。', 'The associated PR has merged.'],
+        closed: ['关联的工作已关闭。', 'The associated work is closed.'],
+        dropped: ['任务已结束，无需继续处理。', 'The task ended with no further work.'],
+        stopped: ['任务已停止。', 'The task was stopped.'],
+      }
+      const chinese = /\p{Script=Han}/u.test(trigger.text) && !/[\p{Script=Hiragana}\p{Script=Katakana}]/u.test(trigger.text)
+      const detail = labels[state] ?? ['当前状态未知。', 'Current state is unknown.']
+      this.options.outbox.send({ id, channel: trigger.channel, kind: 'reply', ticketId: ticket.id,
+        text: (chinese ? '当前记录状态：' : 'Recorded status: ') + detail[chinese ? 0 : 1] })
     }
     return { id, status: this.options.outbox.status(id) ?? 'pending', reused: existing !== undefined }
   }

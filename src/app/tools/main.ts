@@ -284,14 +284,16 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
     }),
     tool({
       name: 'orchestrator_reply',
-      description: `Send an answer to a human question, a ready result, or attention requiring human action, as the replies section says; the gate refuses anything else, such as progress. purpose=result needs a ready, failed or blocked report, or an ended ticket. Describe its actual state; stopped is not paused or completed. IM limit: ${IM_WORDS} words.`,
+      description: `Send an answer to a human question, a ready result, or attention requiring human action, as the replies section says; the gate refuses anything else, such as progress. purpose=result needs a ready, failed or blocked report, or an ended ticket. Describe its actual state; stopped is not paused or completed. For status questions use status_only; the host supplies text. IM limit: ${IM_WORDS} words.`,
       schema: z.object({
         trigger_id: z.string().optional().describe('The original human question, for an answer only.'),
         ticket_id: z.string().optional(),
         purpose: z.enum(['answer', 'result', 'attention']),
+        status_only: z.boolean().optional().describe('Ticket status only: requires answer, trigger_id, ticket_id; host replaces text.'),
         human_action: z.string().trim().min(1).optional().describe('Current attention question: required for attention; include with result when combining its human action.'),
         text: z.string().min(1).max(20000),
-      }).strict(),
+      }).strict().refine(args => !args.status_only || (args.purpose === 'answer' && !!args.trigger_id && !!args.ticket_id && !args.human_action),
+        'status_only requires purpose=answer, trigger_id and ticket_id without human_action'),
       execute: async args => {
         const ticket = args.ticket_id ? host.store.tickets.get(args.ticket_id) : undefined
         // PR merge/closure already has a native closing receipt; reuse it rather than relabel it as another result.
@@ -303,7 +305,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
           }
         }
         const reply = host.engine.reply({ purpose: args.purpose, text: args.text, ...(args.trigger_id ? { triggerId: args.trigger_id } : {}),
-          ...(args.ticket_id ? { ticketId: args.ticket_id } : {}), ...(args.human_action ? { question: args.human_action } : {}) })
+          ...(args.ticket_id ? { ticketId: args.ticket_id } : {}), ...(args.status_only ? { statusOnly: true } : {}), ...(args.human_action ? { question: args.human_action } : {}) })
         await host.sendReplies()
         return { status: host.store.replyStatus(reply.id) ?? reply.status }
       },

@@ -31,8 +31,10 @@ Use reasonable defaults, retrieve missing context and boundedly retry transient 
 Review changes and run relevant checks.
 A long command goes on as a background job: keep working, or end your turn, as the job's end wakes you with its result; do not poll it, and do not report ready while a job whose result you need runs. Jobs you leave running after a ready, blocked or failed report or a question, such as a server for a person to try, keep running until the assignment ends, without waking you.
 Use orchestrator_report progress for internal updates while the assignment continues; it does not pause work or notify the orchestrator.
-To answer an explicit human question, include reply_to_trigger_id with that original question trigger ID and the concise answer.
+For technical questions, report reply_to_trigger_id with the original trigger ID and answer; the orchestrator handles status-only questions.
 Never use reply_to_trigger_id to announce ordinary progress or a newly created unfinished PR.
 Use blocked only when implementation actually cannot proceed and a human must act, never merely because an unfinished PR exists.
 When the work ends with nothing for a human to do (not reproduced, not a defect, a decision already tracked elsewhere, no request), report dropped: it closes the ticket without a message, and a person's later message on its threads resumes it.
 Call orchestrator_report with the state, changes, checks, risks and actual PR number when one exists; omit pr_number otherwise and never use a placeholder. A new PR uses this ticket branch and deployment account. ready means reviewed implementation with relevant checks passed.
+
+Grok: never repeat, raise the limit or switch Harness after a stopped run. Verify actual file changes before ready.

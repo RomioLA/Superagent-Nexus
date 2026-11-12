@@ -332,6 +332,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/sessions.ts` | Sessions |
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
+| `src/app/magpie.ts` | Existing scoped Magpie routing telemetry |
 | `src/app/role-models.ts` | Resolves the Eval and Executor models, and seeds a new Session with its role's model |
 | `src/app/assessment.ts` | The MasterAssessor, the assessment schema and the window `orchestrator_eval` answers |
 | `src/app/execution-environment.ts` | The execution environment: its variables, a Ticket's values, the directory root and the lines of the prompt section, which `src/app/prompts.ts` fills into its template |
@@ -419,6 +420,9 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/feishu-task-route-smoke.spec.ts` | Natural requests, long messages, chat, cancellation, queries, continuations and repeated project selection all enter native receive without a side-channel task API |
 | `tests/codex-ticket.spec.ts` | Codex Worker tool schema, worktree target and CLI token reporting |
 | `tests/agy-ticket.spec.ts` | Ticket-scoped AGY arguments, model mapping, process result parsing and failure reporting |
+| `tests/grok-execution.spec.ts` | Mock Grok process limits, cancellation, explicit Assignment retry and file-write evidence |
+| `tests/status-reply.spec.ts` | Busy Ticket status answers, source channel, language, permission gates and Outbox deduplication |
+| `tests/magpie.spec.ts` | Existing scoped Magpie routing telemetry |
 | `tests/grok-ticket.spec.ts` | Grok Build headless arguments, permission profile, model-usage evidence and fail-closed result parsing |
 | `tests/cli-isolation.spec.ts` | Per-Ticket CLI state directories, AGY/Codex credential symlinks and a private Grok home |
 | `tests/cli-security.spec.ts` | CLI state path symlink checks, credential-target validation and concurrent credential-link setup |
@@ -601,7 +605,7 @@ These messages are steered into the main Session's turn:
 | Message | Content |
 | --- | --- |
 | Candidate | Batch Trigger cards, Thread, `related_tickets`, `tickets_total`, `delivered_to`, referenced Tickets from Issue/PR links, `handed_back` reasons and the next action |
-| `follow_up` | One message as its Executor sees it, `replies_to`, receiving Tickets, and the reminder that Executors decide it while the main Session may only stop work |
+| `follow_up` | One message as its Executor sees it, `replies_to`, receiving Tickets, and the reminder that Executors decide it while the main Session may stop on request or answer an explicit lifecycle/status question |
 | `worker_report` | Ticket card, originating Trigger, state and summary up to 600 characters; `chars` and a read pointer when truncated |
 | `worker_attention` | Ticket card carrying the question |
 

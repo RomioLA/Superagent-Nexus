@@ -23,7 +23,7 @@ A person's message on a Ticket's own Thread belongs to that Ticket's Executor to
 
 Ownership continues while the Ticket is live, even if a person removes its Subscription. It also covers an ended Ticket that was not stopped by a person and has the message waiting to resume it.
 
-The main Session receives a follow-up notice. While an Executor owns the message, the main Session may only stop work on the person's request; accept, attach, ignore and requeue are refused. A stop still passes through the gate with the follow-up strength described below.
+The main Session receives a follow-up notice. While an Executor owns the message, the main Session may stop work on the person's request or answer an explicit lifecycle/status question through the existing Reply/Outbox path. Status text is generated from Ticket state and grants no implementation authority; technical answers still require a worker report. Accept, attach, ignore and requeue are refused. A stop still passes through the gate with the follow-up strength described below.
 
 ### Handing back and releasing follow-ups
 

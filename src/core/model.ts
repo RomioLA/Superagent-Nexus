@@ -70,7 +70,7 @@ export interface FollowupRecords {
  * and did not hand it back. A ticket can while it is live, also once a person dropped its Subscription to the Thread, and
  * while it is ended, not by a person, with the Trigger waiting to resume it. None once a person sent it to Eval, or while
  * an Eval holds it, which an earlier version may have queued. While a ticket owns it, the message goes to no Eval, and the
- * main Session may only stop the work on it.
+ * main Session may stop on request or answer explicit lifecycle questions without taking over the work.
  */
 export function followupOwners(trigger: Pick<Trigger, 'id' | 'human' | 'threads'>, records: FollowupRecords): string[] {
   if (!trigger.human) return []
