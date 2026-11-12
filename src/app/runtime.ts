@@ -152,9 +152,10 @@ export class Runtime extends Service implements SourceHost {
             const request = store.triggers.get(ended.origin.triggerId)?.text ?? ''
             for (const message of pullEndNotices(ended, request, setup.deployment.repository)) outbox.send(message)
             if (ended.ended?.by === 'human' && ended.ended.outcome === 'stopped' && store.triggers.get(ended.origin.triggerId)?.channel?.source === 'feishu') {
+              const number = ended.shortId ? ` ${ended.shortId}` : ''
               const text = /\p{Script=Han}/u.test(request)
-                ? `工单 ${ended.id.slice(0, 8)} 已停止，任务已结束；已有改动保留，不会自动恢复。`
-                : `Ticket ${ended.id.slice(0, 8)} stopped. Existing work is kept; it will not resume automatically.`
+                ? `工单${number} 已停止，任务已结束；已有改动保留，不会自动恢复。`
+                : `Ticket${number} stopped. Existing work is kept; it will not resume automatically.`
               engine.reply({ purpose: 'result', ticketId: ended.id, text })
             }
           }

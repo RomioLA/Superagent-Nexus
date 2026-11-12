@@ -121,7 +121,7 @@ export function branchCiTrigger(branch: string, sha: string, revision: number, s
 }
 export function ciTrigger(pr: { number: number; html_url: string; user: { login: string } } & RepoRef, revision: number, summary: string): Trigger {
   const threadId = githubThreadId(pr.repository, pr.primary, pr.number)
-  return { id: key('github-ci', String(pr.number), String(revision)), source: SOURCE, threads: [{ source: SOURCE, id: threadId }],
+  return { id: key('github-ci', threadId, String(revision)), source: SOURCE, threads: [{ source: SOURCE, id: threadId }],
     actor: { source: SOURCE, id: '' }, human: false, at: new Date().toISOString(),
     text: summary, channel: githubChannel(pr.number, undefined, threadId, pr.repository), url: pr.html_url,
     meta: { number: pr.number, isPr: true, prAuthor: pr.user.login, ci: true, revision, ...(pr.repository ? { repository: pr.repository } : {}) } }

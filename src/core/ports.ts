@@ -99,8 +99,8 @@ export interface Executor {
   stop(ticket: Ticket, assignment: Assignment, reason: string): void
 }
 
-/** A message for a Channel; `ticketId` names the Ticket it is for, when there is one. */
-export interface OutboundMessage { id: string; channel: ChannelRef; text: string; kind: 'acknowledgement' | 'reply' | 'notice'; ticketId?: string; purpose?: 'result' }
+/** A message for a Channel; `ticketId` names the Ticket it is for, when there is one, and `ticketShortId` its user-facing number. */
+export interface OutboundMessage { id: string; channel: ChannelRef; text: string; kind: 'acknowledgement' | 'reply' | 'notice'; ticketId?: string; ticketShortId?: string; purpose?: 'result' }
 /** A queued message waits (`pending`), went out (`sent`), or was dropped because its conversation can never receive it (`dropped`). */
 export type ReplyStatus = 'pending' | 'sent' | 'dropped'
 /** The messages queued for Channels; the Engine queues them inside its commands, and a sender delivers them later. */

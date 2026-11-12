@@ -35,8 +35,8 @@ export interface AvailabilityReading {
 export interface RouteCandidate {
   harness: HarnessName
   model?: string
-  /** Configured preference order; lower is preferred and decides whenever resource evidence does not exclude a candidate. */
-  priority: number
+  /** Trustworthy configured preference order, when named; lower is preferred among selectable candidates. */
+  priority?: number
   /** Whether the candidate meets the task's capability requirement. A miss is never selectable. */
   capable: boolean
   /** The person explicitly required this Harness (or model); automatic advice keeps it and never substitutes silently. */
@@ -71,7 +71,7 @@ export interface RouteDecision {
   selected?: CandidateEvaluation
   /** Every candidate's assessment in input order, selectable or excluded, so a caller can explain each channel. */
   evaluated: CandidateEvaluation[]
-  /** The selectable candidates in selection order (the first is `selected`). */
+  /** The selectable candidates in selection order (the first is `selected` only when it has configured priority). */
   ranked: CandidateEvaluation[]
   /** Fields still unknown across the candidate set that were not used for any adjustment. */
   unknown: string[]
@@ -133,13 +133,18 @@ function evaluate(candidate: RouteCandidate, options: RouteOptions): CandidateEv
   if (reading?.state === 'available') reasons.push(`[evidence] ${reading.evidence}`)
   else unknown.push(`${label}: ${reading?.evidence ?? candidate.unknownReason ?? 'no availability reading'}`)
 
-  reasons.push(`[configured] priority=${candidate.priority}`)
+  if (candidate.priority !== undefined) reasons.push(`[configured] priority=${candidate.priority}`)
   return { candidate, selectable: true, reasons, unknown }
 }
 
 /** Order selectable candidates by configured priority, then by whether availability is known (`available` before `unknown`). */
 function compare(a: CandidateEvaluation, b: CandidateEvaluation): number {
-  if (a.candidate.priority !== b.candidate.priority) return a.candidate.priority - b.candidate.priority
+  const aPriority = a.candidate.priority
+  const bPriority = b.candidate.priority
+  if (aPriority !== undefined && bPriority !== undefined) {
+    if (aPriority !== bPriority) return aPriority - bPriority
+  } else if (aPriority !== undefined) return -1
+  else if (bPriority !== undefined) return 1
   const rank = (item: CandidateEvaluation) => item.candidate.reading?.state === 'available' ? 0 : 1
   return rank(a) - rank(b)
 }
@@ -158,7 +163,7 @@ export function rankRouteCandidates(candidates: readonly RouteCandidate[], optio
   // when no required candidate is itself selectable.
   const pool = required.length ? (requiredSelectable.length ? requiredSelectable : options.allowFallback === true ? selectable : []) : selectable
   const ranked = [...pool].sort(compare)
-  const selected = ranked[0]
+  const selected = ranked[0]?.candidate.priority !== undefined ? ranked[0] : undefined
   const unknown = [...new Set(evaluated.flatMap(item => item.unknown))]
 
   const excluded = evaluated.filter(item => !item.selectable)
@@ -166,6 +171,8 @@ export function rankRouteCandidates(candidates: readonly RouteCandidate[], optio
   if (selected) {
     const label = selected.candidate.model ? `${selected.candidate.harness}/${selected.candidate.model}` : selected.candidate.harness
     parts.push(`Selected ${label} by configured priority ${selected.candidate.priority}${selected.candidate.reading?.state === 'available' ? ' with a known available reading' : ' with availability unknown'}`)
+  } else if (ranked.length) {
+    parts.push('No trustworthy priority: only resource evidence is reported')
   } else if (required.length) {
     const blocked = required.filter(item => !item.selectable).map(item => `${item.candidate.harness}${item.excludedBecause ? ` (${item.excludedBecause})` : ''}`)
     parts.push(`No authorized replacement: required ${blocked.join(', ')} is not selectable and fallback is not authorized`)
@@ -185,7 +192,7 @@ export interface RoutingChannel {
   model: string
   provider?: string
   account_ref?: string
-  priority: number
+  priority?: number
   availability: Availability
   remaining?: number
   resets_at?: string
@@ -233,29 +240,30 @@ export function summarizeRoutingSignals(snapshot: unknown): RoutingSignals {
 
   // Build candidates from the model channels actually observed for these keys; unknown account linkage stays unknown.
   const candidates: RouteCandidate[] = []
-  const meta = new Map<string, { provider?: string; account_ref?: string }>()
+  const meta = new Map<RouteCandidate, { provider?: string; account_ref?: string }>()
   const usage = Array.isArray(data.request_usage) ? data.request_usage : []
-  usage.forEach((group, index) => {
+  usage.forEach(group => {
     if (!isRecord(group)) return
     const model = text(group.served_model) ?? text(group.requested_model)
     if (!model) return
     const ref = text(group.account_ref)
     const reading = ref ? byAccount.get(ref) : undefined
-    const key = `${index}:${model}`
-    meta.set(key, { ...(text(group.provider) ? { provider: text(group.provider) } : {}), ...(ref ? { account_ref: ref } : {}) })
-    candidates.push({
-      harness: 'dsh', model, priority: index, capable: true,
+    const candidate: RouteCandidate = {
+      harness: 'dsh', model, capable: true,
       ...(reading ? { reading } : { unknownReason: ref ? 'no matching quota snapshot for this account' : 'account not linked to a quota snapshot' }),
-    })
+    }
+    meta.set(candidate, { ...(text(group.provider) ? { provider: text(group.provider) } : {}), ...(ref ? { account_ref: ref } : {}) })
+    candidates.push(candidate)
   })
 
   const decision = rankRouteCandidates(candidates)
   // Every observed channel is shown, including one excluded as exhausted, so the Router sees the real evidence and why.
   const observedChannels: RoutingChannel[] = decision.evaluated.map(item => {
     const reading = item.candidate.reading
-    const channel = meta.get(`${item.candidate.priority}:${item.candidate.model!}`)
+    const channel = meta.get(item.candidate)
     return {
-      harness: item.candidate.harness, model: item.candidate.model!, priority: item.candidate.priority,
+      harness: item.candidate.harness, model: item.candidate.model!,
+      ...(item.candidate.priority !== undefined ? { priority: item.candidate.priority } : {}),
       ...(channel?.provider ? { provider: channel.provider } : {}),
       ...(channel?.account_ref ? { account_ref: channel.account_ref } : {}),
       availability: reading?.state ?? 'unknown',

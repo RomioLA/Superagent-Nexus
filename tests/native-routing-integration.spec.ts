@@ -43,7 +43,8 @@ it('routes one message to three actual native workers, retains the source and ne
   await host.runtime.idle()
   const tickets = host.runtime.store.tickets.list()
   expect(tickets).toHaveLength(3)
-  expect(host.runtime.store.receipts.get(key('ack', source.id))?.text).toBe('On it: three independent changes.')
+  const agyTicket = tickets.find(t => t.title === 'AGY change')!
+  expect(host.runtime.store.receipts.get(key('ack', source.id))?.text).toBe(`Ticket ${agyTicket.shortId} | AGY change\n\nOn it: three independent changes.`)
   expect(tickets.every(t => t.execution?.assignment.includes('Keep each scope independent.'))).toBe(true)
   expect(tickets.every(t => t.origin.triggerId === source.id && latestAssignment(t)?.state === 'running')).toBe(true)
   expect(new Set(tickets.map(t => t.execution?.directory)).size).toBe(3)

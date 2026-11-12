@@ -318,6 +318,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/passes.ts` | Passes, the pass scheduler |
 | `src/app/outbox.ts` | The Outbox: the Engine's `Outbox` port, the receipts and the `reply` effects that send them |
 | `src/app/notices.ts` | The main Session's notices and relays: `eventNotice`, `reportRelay`, `resultRelay` and `followupRelay` |
+| `src/app/receipts.ts` | Ordinary user-facing receipts: the ticket heading (short number and title), the true state from native facts, and the composed result text |
 | `src/app/store.ts` | The Store, and `Receipt`, a message of the outbox |
 | `src/app/store-read.ts` | `storeReads`: the Store's read queries for the views, the tools and the Sources' polls, which never write |
 | `src/app/migration.ts` | The schema 11 migration: one step from schema 10 that writes every stored record in its current shape |
@@ -434,6 +435,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/native-routing-integration.spec.ts` | Native `orchestrator_route` project selection and split-task routing integration |
 | `tests/harness-instructions.spec.ts` | Harness instruction text that matches the fallback rule the delegate guard enforces |
 | `tests/notification-integration.spec.ts` | Runtime result receipts and notification deduplication |
+| `tests/ticket-receipts.spec.ts` | Short ticket numbers, their lookup by number or resource, and ordinary receipts that show number, title and true state |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |
 | `tests/background.spec.ts` | Waiting for a worker's shell jobs and subagents: an end that woke it, and a host that stops |

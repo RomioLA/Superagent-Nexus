@@ -1,16 +1,26 @@
 /** Cross-project GitHub PR/CI tracking: repository-scoped Threads, scope and pull binding for authorized repos. */
 import { describe, expect, it, vi } from 'vitest'
 import { githubKind, type GithubConfig } from '../src/sources/github.ts'
-import { commentTrigger, githubThreadId, issueTrigger, parseGithubThreadId } from '../src/sources/github-trigger.ts'
+import { ciTrigger, commentTrigger, githubThreadId, issueTrigger, parseGithubThreadId } from '../src/sources/github-trigger.ts'
 import { claimPull, observePull, pullsOf, readPull } from '../src/sources/github-pull.ts'
 import type { SourceContext } from '../src/sources/host.ts'
-import type { Ticket, Trigger } from '../src/core/index.ts'
+import { key, type Ticket, type Trigger } from '../src/core/index.ts'
 
 const PRIMARY = 'acme/widgets'
 const GADGETS = 'acme/gadgets'
 const config = { repository: PRIMARY, repositories: [GADGETS] } as unknown as GithubConfig
 
 describe('repository-scoped GitHub Threads', () => {
+  it('keeps primary CI ids unchanged and qualifies secondary repository CI ids', () => {
+    const primary = ciTrigger({ number: 6, html_url: `https://github.com/${PRIMARY}/pull/6`, user: { login: 'alice' }, repository: PRIMARY, primary: PRIMARY }, 1, 'CI')
+    const other = ciTrigger({ number: 6, html_url: `https://github.com/${GADGETS}/pull/6`, user: { login: 'alice' }, repository: GADGETS, primary: PRIMARY }, 1, 'CI')
+    expect(primary.id).toBe(key('github-ci', '6', '1'))
+    expect(primary.threads).toEqual([{ source: 'github', id: '6' }])
+    expect(other.threads).toEqual([{ source: 'github', id: 'acme/gadgets#6' }])
+    expect(other.id).toBe(key('github-ci', 'acme/gadgets#6', '1'))
+    expect(other.id).not.toBe(primary.id)
+    expect(other.meta.repository).toBe(GADGETS)
+  })
   it('keeps the primary repository\'s bare number and qualifies every other repository', () => {
     expect(githubThreadId(PRIMARY, PRIMARY, 6)).toBe('6')
     expect(githubThreadId(undefined, PRIMARY, 6)).toBe('6')

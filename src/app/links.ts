@@ -1,9 +1,10 @@
 /** Source message link resolution and candidate card assembly for the main Session. */
-import type { Candidate, Ticket, Trigger } from '../core/index.ts'
+import { sameActor, type Candidate, type Ticket, type Trigger } from '../core/index.ts'
 import type { Commands } from '../infra/commands.ts'
 import { readFeishuLink } from '../sources/feishu-read.ts'
 import { feishuRef, feishuSettings } from '../sources/feishu.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
+import { ProjectSchema } from '../sources/feishu-projects.ts'
 import { triggerMessage } from '../executor/dsh.ts'
 import { relatedTickets, ticketCard, triggerCard } from './cards.ts'
 import type { Store } from './store.ts'
@@ -44,10 +45,22 @@ export function repliedTo({ store, sources }: { store: Pick<Store, 'triggers'>; 
   const parent = sources.repliesTo(trigger)
   return parent === undefined ? undefined : store.triggers.get(parent)
 }
-/** Finds tickets subscribed to threads referenced in `trigger.text` (such as `#12` or URLs) that are not already in `known`. */
+/** Finds tickets subscribed to threads referenced in `trigger.text` (such as `#12` or URLs), or named by their short number, that are not already in `known`. */
 function referencedTickets(host: LinkHost, trigger: Trigger, known: readonly Ticket[]): Ticket[] {
   const threads = (trigger.text.match(/#\d+|https?:\/\/[^\s)>\]]+/g) ?? []).flatMap(reference => host.sources.find(reference).threads)
   const ids = new Set(threads.flatMap(thread => host.store.threads.get(thread)?.subscriptions ?? []))
+  // A short number only locates a candidate within the requester's identity and selected project.
+  const numbers = new Set(trigger.text.match(/(?<!\d)\d{8,}(?!\d)/g) ?? [])
+  if (numbers.size) {
+    const projectRequired = !!(trigger.meta.projectRequired || trigger.meta.projects || trigger.meta.projectId)
+    const project = projectRequired ? ProjectSchema.array().parse(trigger.meta.projects).find(item => item.id === trigger.meta.projectId) : undefined
+    for (const ticket of host.store.tickets.list()) {
+      if (!ticket.shortId || !numbers.has(ticket.shortId) || !sameActor(ticket.mandate.actor, trigger.actor)) continue
+      const repository = ticket.execution?.project?.repository
+      if (repository && projectRequired && project?.repository !== repository) continue
+      ids.add(ticket.id)
+    }
+  }
   for (const ticket of known) ids.delete(ticket.id)
   return [...ids].flatMap(id => host.store.tickets.get(id) ?? []).slice(0, 4)
 }

@@ -7,6 +7,7 @@ import { UserError, followupOwners, key, reasonText, type Decision, type Decisio
 import { IM_WORDS, NOTE_WORDS, wordCount } from '../../infra/text.ts'
 import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type MasterAssessor } from '../assessment.ts'
 import { ticketCard } from '../cards.ts'
+import { composeTicketReceipt, isChinese } from '../receipts.ts'
 import { PromptConfigSchema, savePrompts, type Prompts } from '../prompts.ts'
 import { readResource, type MainResourceHost, type ResourceHost } from '../resources.ts'
 import type { Sessions } from '../sessions.ts'
@@ -46,7 +47,7 @@ function routed(host: MainToolsHost, result: { decision?: DecisionKind; reason: 
 const fromDecision = (decision: Decision) => ({ decision: decision.kind, reason: reasonText(decision.reason), ticketId: decision.ticketId })
 /** The Harness and model an owner explicitly requires; the model supplies it, so no keyword parsing guesses it. */
 const HarnessSpecSchema = z.object({
-  harness: z.enum(['dsh', 'agy', 'codex', 'grok']).describe('Owner’s Worker backend; AGY requires agy. Choose dsh when unspecified.'),
+  harness: z.enum(['dsh', 'agy', 'codex', 'grok']).describe('The Worker backend you judge suitable and authorized from the request and task, not a fixed default; AGY requires agy.'),
   model: z.enum(['3.8f', '4a']).optional().describe('AGY default: 3.8f. 4a needs explicit authorization.'),
   forbid4a: z.boolean().optional().describe('Never upgrade to 4a.'),
   allowFallback: z.boolean().optional().describe('Only explicit authorization permits fallback.'),
@@ -77,7 +78,7 @@ const RouteItemSchema = z.object({
   reason: z.string().nullish().describe('ignore and stop: why, at most 500 characters; an ignore needs it.'),
   project_id: z.string().nullish().describe('accept: registered project id; ask if ambiguous.'),
   tasks: z.array(TaskSpecSchema).max(6).nullish().describe('accept: independent subrequests, each a native Ticket; omit for one.'),
-  harness: HarnessSpecSchema.nullish().describe('accept: required Worker backend/model, not merely a note; inherited by tasks. For unspecified execution choose {harness:"dsh"}.'),
+  harness: HarnessSpecSchema.nullish().describe('accept: the Worker backend/model you judged suitable and authorized, not merely a note; inherited by tasks.'),
 }).strict()
 type RouteItem = z.infer<typeof RouteItemSchema>
 type Kind = RouteItem['kind']
@@ -109,7 +110,7 @@ function invalid(item: RouteItem): string | undefined {
     if (!checked.success) return `${field}: ${checked.error.issues[0]?.message ?? 'invalid'}`
   }
   if (item.kind === 'accept' && (split ? item.tasks!.some(task => !(task.harness ?? item.harness)) : !item.harness))
-    return 'accept needs structured harness: select the backend/model from the original request; use {harness:"dsh"} only when no other backend was requested. A routing note is not a Harness constraint.'
+    return 'accept needs structured harness: choose the backend and model that fit the request and task from those authorized; a routing note is not a Harness constraint.'
 
   return undefined
 }
@@ -304,7 +305,16 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
             if (status) return { status }
           }
         }
-        const reply = host.engine.reply({ purpose: args.purpose, text: args.text, ...(args.trigger_id ? { triggerId: args.trigger_id } : {}),
+        // An ordinary Feishu receipt leads with the ticket's number, title and true native state; the worker's text is the result body.
+        let text = args.text
+        if (ticket && !args.status_only && (args.purpose === 'result' || args.purpose === 'attention')) {
+          const trigger = host.store.triggers.get(ticket.origin.triggerId)
+          if (ticket.channels.some(channel => channel.source === 'feishu') || trigger?.source === 'feishu') {
+            const composed = composeTicketReceipt(ticket, args.text, isChinese(trigger?.text ?? ''))
+            if (wordCount(composed) <= IM_WORDS) text = composed
+          }
+        }
+        const reply = host.engine.reply({ purpose: args.purpose, text, ...(args.trigger_id ? { triggerId: args.trigger_id } : {}),
           ...(args.ticket_id ? { ticketId: args.ticket_id } : {}), ...(args.status_only ? { statusOnly: true } : {}), ...(args.human_action ? { question: args.human_action } : {}) })
         await host.sendReplies()
         return { status: host.store.replyStatus(reply.id) ?? reply.status }

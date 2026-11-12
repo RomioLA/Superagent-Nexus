@@ -1,7 +1,7 @@
 /** Tickets: their lifecycle from an accept to their end, their Subscriptions and their Inputs. */
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
-import { latestAssignment, latestReport, liveTicket, readUntil, runningAssignment, settled, threadKey, waitsForPerson } from './model.ts'
+import { latestAssignment, latestReport, liveTicket, readUntil, runningAssignment, sameActor, settled, threadKey, waitsForPerson } from './model.ts'
 import type { Assignment, ChannelRef, Evaluation, Follow, Mandate, PolicyEffect, ThreadRef, Ticket, TicketEndBy, TicketInput, TicketOutcome,
   Trigger, TriggerDisposition } from './model.ts'
 import type { AssessmentOutcome } from './ports.ts'
@@ -10,6 +10,14 @@ import type { Replies } from './replies.ts'
 import { canRetry } from './stage.ts'
 
 const sameChannel = (a: ChannelRef, b: ChannelRef): boolean => JSON.stringify(a) === JSON.stringify(b)
+/** The day of `at` in the project's timezone, as `YYMMDD`; Asia/Shanghai unless the project states another. */
+export function shortDayKey(at: string, timeZone = 'Asia/Shanghai'): string {
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone, year: '2-digit', month: '2-digit', day: '2-digit' }).formatToParts(new Date(at))
+  const part = (type: string) => parts.find(item => item.type === type)?.value ?? ''
+  return `${part('year')}${part('month')}${part('day')}`
+}
+/** A short ticket number: `YYMMDD` and a sequence of at least two digits that extends past 99 instead of repeating. */
+export const shortTicketId = (dayKey: string, sequence: number): string => `${dayKey}${String(sequence).padStart(2, '0')}`
 /** Whether an Input is a message no person wrote, such as CI's, a bot's, or the main Session's note. */
 export const automatic = (input: TicketInput | undefined): boolean => input?.kind === 'note' || (input?.kind === 'trigger' && !input.human)
 /**
@@ -47,6 +55,8 @@ export class Tickets extends EnginePart {
       if (channel && !ticket.channels.some(item => sameChannel(item, channel))) ticket.channels.push(channel)
     }
     ticket = this.options.prepareTicket?.(ticket, outcome) ?? ticket
+    // Allocate the stable user-facing short number once, from the tickets already stored for that day, so parsing stays in one place.
+    if (!ticket.shortId) ticket = { ...ticket, shortId: this.nextShortId(at) }
     const assignment = this.newAssignment(ticket)
     this.repo.tickets.save(ticket)
     for (const triggerId of triggerIds) for (const ref of this.repo.triggers.get(triggerId)?.threads ?? []) this.subscribe(id, ref)
@@ -111,6 +121,8 @@ export class Tickets extends EnginePart {
     const current = this.require(ticketId)
     if (current.ended?.by === 'human') throw new UserError('ticketStopped')
     if (!liveTicket(current) && !this.policy().revalidate(current.mandate)) throw new UserError('mandateRevoked')
+    // A reference from another conversation locates a ticket but grants no authority to continue its work.
+    if (!this.reaches(current, trigger) && !sameActor(trigger.actor, current.mandate.actor)) throw new UserError('notReached')
     return trigger
   }
   /**
@@ -376,6 +388,18 @@ export class Tickets extends EnginePart {
     const report = latest?.report
     const later = ticket.inputs.some(input => input.kind !== 'policy-changed' && Date.parse(input.at) > Date.parse(report?.at ?? ''))
     return report?.state !== 'ready' || ticket.undelivered.length > 0 || later
+  }
+  /** The next short number for `at`'s day among the tickets already stored, so a number is never reused; gaps are harmless. */
+  private nextShortId(at: string): string {
+    const dayKey = shortDayKey(at)
+    let max = 0
+    for (const other of this.repo.tickets.list()) {
+      const id = other.shortId
+      if (!id || !id.startsWith(dayKey) || id.length <= dayKey.length) continue
+      const sequence = Number(id.slice(dayKey.length))
+      if (Number.isInteger(sequence) && sequence > max) max = sequence
+    }
+    return shortTicketId(dayKey, max + 1)
   }
   /** Add a pending Assignment; a failed delivery to the one before it no longer concerns the ticket. */
   private newAssignment(ticket: Ticket): Assignment {

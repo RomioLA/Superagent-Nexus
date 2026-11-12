@@ -37,8 +37,9 @@ interface Skill { name: string; description: string; content: string }
  * Maximum combined character count of system prompt and tool definitions per role (~5% above baseline).
  * Lower this limit when shrinking model-facing text; raise it only intentionally and explain why in the commit message.
  */
-// The bounded tasks/project/Harness route schema adds ~1.6k characters; no second router prompt.
-const BUDGET: Record<Role, number> = { orchestrator: 61_000, worker: 40_500 }
+// The bounded tasks/project/Harness route schema adds ~1.6k characters; no second router prompt. The task-fit Harness
+// selection policy adds ~0.7k characters of dispatch and route-schema guidance, replacing the old fixed-DSH default.
+const BUDGET: Record<Role, number> = { orchestrator: 62_500, worker: 40_500 }
 const PROMPTS = 'prompts/, skills/', TOOLS = 'src/app/tools/', SESSIONS = 'src/app/sessions.ts'
 const NOTICES = 'src/app/notices.ts', LINKS = 'src/app/links.ts', ASSESSMENT = 'src/app/assessment.ts'
 const EXECUTOR = 'src/executor/dsh.ts', ERRORS = 'src/core/errors.ts'
@@ -403,6 +404,25 @@ it('keeps the routing rules in dispatch, which says the main Session may accept 
   expect(dispatch).toContain('you may accept the rest of the message as new work')
   expect(dispatch).toContain('decide those whose card already settles them in one orchestrator_route call')
   expect(route).not.toMatch(/needs a new ticket on another explicit instruction/)
+})
+
+it('routes by task fit instead of defaulting every unspecified task to DSH', () => {
+  const dispatch = surfaces.find(surface => surface.where === 'orchestrator prompt runtime/dispatch')!.text
+  const route = surfaces.find(surface => surface.where === 'orchestrator tool orchestrator_route')!.text
+  // The old mechanical default is gone from every model-visible instruction.
+  expect(dispatch).not.toContain('only if none was requested')
+  expect(route).not.toContain('Choose dsh when unspecified')
+  expect(route).not.toContain('For unspecified execution choose')
+  // An explicit person requirement stays authoritative, and otherwise the Router judges an authorized backend by task fit.
+  expect(dispatch).toContain('must never be overridden')
+  expect(dispatch).toContain('choose the authorized backend and model that fit the task instead of a fixed default')
+  expect(dispatch).toContain('a more capable model for complex coding, cross-module edits or architecture')
+  // A reported resource figure counts; an unknown stays unknown, and no subjective preference becomes a quality score.
+  expect(dispatch).toContain('unknown stays unknown')
+  expect(dispatch).toContain('not present a preference or reputation as a measured quality score')
+  // The chosen backend and its basis are recorded, and 4A is never an automatic upgrade after a failure.
+  expect(dispatch).toContain('Record the chosen Harness and model')
+  expect(dispatch).toContain('never an automatic upgrade after another model fails')
 })
 
 it('lists in the main Session\'s Policy section exactly the enabled rules, as the drive\'s save left them', () => {

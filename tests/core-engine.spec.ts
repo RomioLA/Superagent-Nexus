@@ -121,7 +121,7 @@ describe('eval', () => {
     expect(ticket).not.toHaveProperty('ended')
     expect(ticket.assignments).toEqual([expect.objectContaining({ state: 'running', startedAt: expect.any(String) })])
     expect(h.repo.threads.get('chat:t1')?.subscriptions).toEqual([ticket.id])
-    expect(h.outbox).toEqual([{ id: key('ack', '1'), channel: trigger('1').channel, text: 'ok', kind: 'acknowledgement', ticketId: ticket.id }])
+    expect(h.outbox).toEqual([{ id: key('ack', '1'), channel: trigger('1').channel, text: `Ticket ${ticket.shortId} | Fix\n\nok`, kind: 'acknowledgement', ticketId: ticket.id }])
     expect(h.executor.start).toHaveBeenCalledOnce()
   })
   it('refuses to decide an eval that a later eval replaced, and decides the later one', async () => {
@@ -356,7 +356,7 @@ describe('resume and stop', () => {
   it('resumes an ended ticket at once when a person attaches a message to it', async () => {
     const h = harness()
     const ticketId = await ended(h, 'executor')
-    h.engine.receive(trigger('2', { actor: guest, threads: [{ source: 'chat', id: 'elsewhere' }] }))
+    h.engine.receive(trigger('2', { threads: [{ source: 'chat', id: 'elsewhere' }] }))
     const subject = h.engine.attach(ticketId, '2')
     expect(subject).toMatchObject({ assignments: [expect.anything(), expect.objectContaining({ state: 'pending' })] })
     expect(subject).not.toHaveProperty('ended')
@@ -988,7 +988,8 @@ describe('direct decisions', () => {
     const second = h.decide(h.requests.at(-1)!, { kind: 'accept', title: 'Other', scope: 'small', reason: 'routed', acknowledgement: 'On it' })
     expect(second.ticketId).not.toBe(first.ticketId)
     expect(h.repo.tickets.get(second.ticketId!)!.origin).toEqual({ triggerId: '2', triggerIds: ['2'] })
-    expect(h.outbox.find(message => message.id === key('ack', '2'))).toMatchObject({ text: 'On it', kind: 'acknowledgement' })
+    expect(h.outbox.find(message => message.id === key('ack', '2'))).toMatchObject({
+      text: `Ticket ${h.repo.tickets.get(second.ticketId!)!.shortId} | Other\n\nOn it`, kind: 'acknowledgement' })
     // The replayed request still answers with the ticket it started.
     expect(h.engine.decide('1', { kind: 'accept', title: 'Again', scope: 'small', reason: 'again' })).toEqual(first)
   })
@@ -1046,7 +1047,7 @@ describe('replies', () => {
     const ticketId = accepted(h).ticketId!
     // The acknowledgement of the accept stays; a later request for one reuses it.
     expect(h.engine.reply({ purpose: 'acknowledgement', ticketId, triggerId: '1', text: 'On it' })).toEqual({ id: key('ack', '1'), status: 'pending', reused: true })
-    expect(h.outbox.map(message => message.text)).toEqual(['ok'])
+    expect(h.outbox.map(message => message.text)).toEqual([`Ticket ${h.repo.tickets.get(ticketId)!.shortId} | Fix\n\nok`])
     h.engine.receive(trigger('2', { actor: guest }))
     expect(h.engine.reply({ purpose: 'acknowledgement', ticketId, triggerId: '2', text: 'Looking' })).toEqual({ id: key('ack', '2'), status: 'pending', reused: false })
     h.engine.receive(trigger('3', { human: false }))
@@ -1410,7 +1411,7 @@ describe('model-surface review', () => {
     const h = harness()
     const ticketId = accepted(h).ticketId!
     h.engine.report(ticketId, { state: 'ready', summary: 'Done' })
-    h.tick(1); h.engine.receive(trigger('2', { human: false, actor: { source: 'chat', id: 'ci' }, threads: [{ source: 'chat', id: 'ci' }] }))
+    h.tick(1); h.engine.receive(trigger('2', { human: false, actor: { source: 'chat', id: 'ci' }, threads: [{ source: 'chat', id: 't1' }] }))
     h.engine.attach(ticketId, '2')
     expect(h.repo.tickets.get(ticketId)!.ended).toBeDefined()
     // A person's message resumes it, with what waited.

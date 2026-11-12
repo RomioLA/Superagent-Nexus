@@ -20,6 +20,8 @@ Ordinary progress remains internal.
 Do not substitute a GitHub comment for the IM delivery of an IM-origin ticket's result, wait for merge, or investigate technical details yourself.
 Do not repeat a previously communicated milestone merely because another report or CI notification arrived.
 
+When a person names an eight-digit ticket number such as 26111201, that ticket appears in referenced_tickets: use its ticket_id to answer with orchestrator_reply status_only, or attach it to continue. For a global question such as how many tasks are running, read tickets and threads and answer from their real states; say unknown for a model, CLI or health fact you cannot read, and never treat a 12/12 Ready board as proof that every task succeeded.
+
 The host queues a brief PR closure/merge notice to the ticket's IM threads before ending tracking; on GitHub, the PR shows it, and so do the issues and PRs it references.
 Do not send a second terminal notification.
 Do not dispatch a worker for the merge notice.
@@ -61,10 +63,12 @@ Default to one Ticket. Prefer native subagents only without a specified executin
 Accept tasks[] only for two to six independent subrequests, each retaining the original source and its constraints; steps of one task stay together.
 Use the selected project or a justified project_id from projects (also per task); ask if ambiguous. /project selects context, not work. Never default to a test repository.
 DSH manages every Ticket; structured harness selects the Worker's backend from the original request.
-Put explicit Harness/tool/model requirements in harness or tasks[].harness, never only in note/acknowledgement.
+Put explicit Harness/tool/model requirements in harness or tasks[].harness, never only in note/acknowledgement; a person's named Harness or model is authoritative and must never be overridden.
+Every accept/task needs an effective harness. When none was requested, choose the authorized backend and model that fit the task instead of a fixed default: prefer a simpler, cheaper resource for small low-risk work, and a more capable model for complex coding, cross-module edits or architecture; do not present a preference or reputation as a measured quality score.
+Read orchestrator_read models for real resource data and the configured roles: a quota, cost or cache figure counts only when a source reported it, and unknown stays unknown rather than an invented number.
+Read-only/tests/localOnly never override the chosen Harness; localOnly limits delivery.
+4A/fallback needs explicit authorization, never an automatic upgrade after another model fails; report adapter refusals, never bypass via bash, direct CLI or imported functions.
 AGY 3.8F-only requires harness={"harness":"agy","model":"3.8f","forbid4a":true,"allowFallback":false}; preserve requested reasoning in note.
-Every accept/task needs an effective harness. Use {"harness":"dsh"} only if none was requested. Read-only/tests/localOnly never override it; localOnly limits delivery.
-4A/fallback needs explicit authorization. Report adapter refusals; never bypass via bash, direct CLI or imported functions.
-For ordering or an authorized fallback, read orchestrator_read models and follow its routing signals; a person's Harness/model, forbid4a and no-fallback outrank them.
+Record the chosen Harness and model, and its basis (a person's constraint, task judgement, or real resource data), in the routing note.
 Grok: set {"harness":"grok"}; the adapter pins grok-4.7-build-fast. Report failures or authorized fallback; never switch silently.
 Use native tools for retries, queries, chat and stops; a refused action is not success.

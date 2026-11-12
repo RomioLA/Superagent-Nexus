@@ -45,6 +45,25 @@ it('never feeds an unknown availability into a numeric score: configured priorit
   expect(decision.unknown.join(' ')).toContain('dsh/m-a')
 })
 
+it('reports resource evidence without selecting when priority is absent, and ranks a configured priority first', () => {
+  const unconfigured = [
+    candidate({ harness: 'dsh', model: 'm-a', unknownReason: 'no quota reading' }),
+    candidate({ harness: 'dsh', model: 'm-b', reading: available(5) }),
+  ]
+  const evidence = rankRouteCandidates(unconfigured)
+  expect(evidence.selected).toBeUndefined()
+  expect(evidence.ranked.map(item => item.candidate.model)).toEqual(['m-b', 'm-a'])
+  expect(evidence.reason).toContain('No trustworthy priority: only resource evidence is reported')
+  expect(evidence.evaluated.every(item => item.reasons.every(reason => !reason.includes('[configured]')))).toBe(true)
+
+  const configured = rankRouteCandidates([
+    ...unconfigured,
+    candidate({ harness: 'dsh', model: 'm-c', priority: 5, unknownReason: 'no quota reading' }),
+  ])
+  expect(configured.selected?.candidate.model).toBe('m-c')
+  expect(configured.ranked.map(item => item.candidate.model)).toEqual(['m-c', 'm-b', 'm-a'])
+})
+
 it('keeps explicit Harness, model and no-fallback constraints from being overridden', () => {
   const forbidden = rankRouteCandidates([
     candidate({ harness: 'agy', model: '3.8f', priority: 0, forbidden: true, reading: available() }),
@@ -113,13 +132,29 @@ it('projects observed Magpie channels into an explainable routing view without i
   }
   const routing = summarizeRoutingSignals(snapshot)
   expect(routing.source).toBe('magpie')
-  expect(routing.preferred_channel?.model).toBe('model-b')
+  expect(routing.preferred_channel).toBeNull()
   expect(routing.observed_channels).toHaveLength(2) // every observed channel, including the exhausted one as excluded
   const byModel = Object.fromEntries(routing.observed_channels.map(channel => [channel.model, channel]))
-  expect(byModel['model-a']).toMatchObject({ availability: 'exhausted', selectable: false, excluded_because: 'exhausted' })
+  expect(byModel['model-a']).toMatchObject({ availability: 'exhausted', resets_at: '2026-11-13T00:00:00Z', selectable: false, excluded_because: 'exhausted' })
   expect(byModel['model-b']).toMatchObject({ availability: 'available', remaining: 500, selectable: true })
+  for (const channel of routing.observed_channels) expect(channel.priority).toBeUndefined()
   expect(routing.unknown).toEqual(expect.arrayContaining(['cost_usd', 'cache_hit_rate', 'agy_quota', 'grok_quota', 'codex_quota']))
   expect(JSON.stringify(routing)).not.toContain('900') // no derived total from the two quota windows
+})
+
+it.each([['model-a', 'model-b'], ['model-b', 'model-a']])('does not treat observed channel order %s, %s as priority', (first, second) => {
+  const routing = summarizeRoutingSignals({
+    status: 'ok',
+    account_quotas: [{ account_ref: 'ref-a', state: 'ok', windows: [{ remaining: 500 }] }],
+    request_usage: [first, second].map(model => ({ served_model: model, account_ref: 'ref-a' })),
+  })
+  expect(routing.preferred_channel).toBeNull()
+  expect(routing.observed_channels).toHaveLength(2)
+  for (const channel of routing.observed_channels) {
+    expect(channel).toMatchObject({ availability: 'available', remaining: 500, selectable: true })
+    expect(channel).not.toHaveProperty('priority')
+    expect(channel.reason).not.toContain('[configured]')
+  }
 })
 
 it('reports a not-configured Magpie source as unknown rather than healthy', () => {
@@ -150,5 +185,5 @@ it('serves the routing projection from the existing models resource alongside th
     magpie: async () => snapshot,
   } as never, 'models', 0, undefined) as Record<string, any>
   expect(result.magpie).toEqual(snapshot)
-  expect(result.routing).toMatchObject({ source: 'magpie', preferred_channel: { model: 'model-b' } })
+  expect(result.routing).toMatchObject({ source: 'magpie', preferred_channel: null })
 })

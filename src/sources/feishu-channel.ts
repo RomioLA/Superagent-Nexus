@@ -44,8 +44,9 @@ export async function sendFeishu(host: Pick<SourceContext, 'commands'>, message:
         break
       } catch { /* After the bounded read attempts, keep the existing chat-link fallback. */ }
     }
+    const label2 = message.ticketShortId ? `工单 ${message.ticketShortId} 结果已更新` : '工单结果已更新'
     await host.commands.lark(['im', '+messages-send', '--chat-id', chatId,
-      '--markdown', `工单结果已更新（${message.ticketId.slice(0, 8)}）：[查看${label}](${link})`,
+      '--markdown', `${label2}：[查看${label}](${link})`,
       '--idempotency-key', key('feishu-result-main', message.id)])
   }
   return 'sent'

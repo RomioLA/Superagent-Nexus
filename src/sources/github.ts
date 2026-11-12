@@ -437,7 +437,7 @@ async function pollChecks(ctx: SourceContext, round: Round, number: number, pr: 
   const previous = ctx.state.get(KV.github.ci(threadId))
   if (previous?.fingerprint === fingerprint) return
   const revision = previous ? previous.revision + 1 : 0
-  if (previous) await ctx.receive(ciTrigger({ number, html_url: pr.html_url, user: pr.user, ...(primary ? {} : { repository }) },
+  if (previous) await ctx.receive(ciTrigger({ number, html_url: pr.html_url, user: pr.user, primary: ctx.deployment.repository, ...(primary ? {} : { repository }) },
     revision, ciSummary(snapshot, `PR #${number}`, `github/pulls/${number}/checks`)))
   ctx.state.set(KV.github.ci(threadId), { fingerprint, revision })
   ctx.threads.describe(`github:${threadId}`, { facts: { ci: ciFact(ciCounts(snapshot)) } })

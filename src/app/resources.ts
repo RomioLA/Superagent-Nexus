@@ -242,17 +242,19 @@ const ROUTES: readonly Route[] = [
     const [id, section, part, ...more] = rest.split('/')
     if (!id || more.length) throw new Error('Unknown context resource')
     if (ticketId && ticketId !== id) throw new Error('Ticket does not belong to this worker')
-    const ticket = host.store.tickets.get(id)
+    // The main Session may name a ticket by its user-facing short number; the worker always uses the internal id.
+    const ticket = host.store.tickets.get(id) ?? (!ticketId ? host.store.tickets.list().find(item => item.shortId === id) : undefined)
     if (!ticket) throw new UserError('unknownTicket')
+    const ticketKey = ticket.id
     if (section === undefined) {
       const running = runningAssignment(ticket) && workerSessionId(ticket.id)
       const retry = 'sessions' in host ? (host as MainResourceHost).sessions.modelRetry(running) : {}
       // Merge subscribed threads (including context-only subscriptions) and source-bound threads without duplicates.
       const bound = new Set((ticket.follows ?? []).map(follow => follow.thread))
-      const subscribed = host.store.read.subscribedThreads().filter(thread => thread.subscriptions.includes(id))
+      const subscribed = host.store.read.subscribedThreads().filter(thread => thread.subscriptions.includes(ticketKey))
       const marked = (key: string, context: boolean): TicketThread =>
         ({ thread: key, ...context ? { context: true } : {}, ...bound.has(key) ? { bound: true } : {} })
-      const threads = [...subscribed.map(thread => marked(thread.key, !!thread.context?.includes(id))),
+      const threads = [...subscribed.map(thread => marked(thread.key, !!thread.context?.includes(ticketKey))),
         ...[...bound].filter(key => !subscribed.some(thread => thread.key === key)).map(key => marked(key, false))]
       return { ...ticketDetails(ticket, threads, batchOf(host, ticket), !!ticketId), ...retry }
     }
@@ -274,7 +276,7 @@ const ROUTES: readonly Route[] = [
       if (message === undefined) throw new Error('Unknown ticket input')
       body = message
     } else if (section === 'message' && part && /^\d+$/.test(part)) {
-      const event = (await transcript(host, id))[Number(part)]
+      const event = (await transcript(host, ticketKey))[Number(part)]
       const entry = event && transcriptEntry(event)
       if (!entry) throw new Error('Unknown transcript entry')
       body = JSON.stringify(entry)
@@ -286,11 +288,11 @@ const ROUTES: readonly Route[] = [
     else if (section === 'assignment') body = ticket.execution?.assignment ?? ''
     else if (section === 'result') body = latestReport(ticket)?.summary ?? ''
     else if (section === 'transcript') {
-      body = (await transcript(host, id)).flatMap((event, index) => {
+      body = (await transcript(host, ticketKey)).flatMap((event, index) => {
         const entry = transcriptEntry(event)
         const said = entry?.message.content.map(block => block.type === 'text' ? block.text : `[${block.type}]`).join(' ') ?? ''
         return entry ? [{ type: entry.type, preview: preview(said).slice(0, 80), chars: JSON.stringify(entry).length,
-          read: `ticket/${id}/message/${index}` }] : []
+          read: `ticket/${ticketKey}/message/${index}` }] : []
       }).reverse().map(event => JSON.stringify(event)).join('\n')
     } else throw new Error('Unknown context resource')
     return text(read, body)

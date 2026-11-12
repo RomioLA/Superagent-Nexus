@@ -3,6 +3,8 @@ import type { Reason } from './reasons.ts'
 
 /** Actor identity in the source's own vocabulary; Policy decides which actors may originate work on that Source. */
 export interface ActorRef { source: string; id: string }
+/** Whether two source identities name the same requester. */
+export const sameActor = (a: ActorRef, b: ActorRef): boolean => a.source === b.source && a.id === b.id
 /** Thread identity; the rule that derives `id` from a native event belongs to the source. */
 export interface ThreadRef { source: string; id: string }
 /** Write-only address on a thread; the address format belongs to the source. */
@@ -280,6 +282,12 @@ export interface Attention {
 /** Ticket aggregate: an authorized work item with its assignments, channels, thread bindings, and inputs. */
 export interface Ticket {
   id: string
+  /**
+   * The short number a person can quote, `YYMMDDNN` in the project's timezone: stable for the ticket's whole life across
+   * retries, resumes and restarts, allocated once at creation and never reused. It is a user-facing label only; `id` stays
+   * the internal primary key. Absent on tickets created before short numbers existed (history is not backfilled).
+   */
+  shortId?: string
   title: string
   decisionId: string
   mandate: Mandate
