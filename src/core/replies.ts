@@ -2,7 +2,7 @@
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
 import { latestAssignment, liveTicket, ticketOutcome } from './model.ts'
-import type { ChannelRef, Ticket, Trigger } from './model.ts'
+import type { ChannelRef, Decision, Ticket, Trigger } from './model.ts'
 import type { ReplyStatus } from './ports.ts'
 import { EnginePart } from './part.ts'
 import { ticketStage } from './stage.ts'
@@ -44,6 +44,22 @@ export class Replies extends EnginePart {
    */
   acknowledgeAccepted(ticketId: string, trigger: Trigger, text: string): void {
     if (trigger.channel && trigger.human) this.options.outbox.send({ id: key('ack', trigger.id), channel: trigger.channel, text, kind: 'acknowledgement', ticketId })
+  }
+  /**
+   * Queue one failure receipt to the conversation an explicit request came from when its Eval ended `unavailable` after
+   * the retries, so its sender learns it was not accepted and can send it again. Only a person's request the gate admits
+   * explicitly gets one; the deterministic id keeps a repeated record of the same Decision from queueing it twice.
+   */
+  unaccepted(decision: Decision, trigger: Trigger): void {
+    if (!trigger.human || !trigger.channel) return
+    const thread = this.thread(trigger.threads[0]!)
+    const gate = this.policy().gate(trigger, thread, this.ticketsOnThread(thread))
+    if (!gate.admissible || gate.strength !== 'explicit') return
+    const chinese = /\p{Script=Han}/u.test(trigger.text) && !/[\p{Script=Hiragana}\p{Script=Katakana}]/u.test(trigger.text)
+    const text = chinese
+      ? '请求未被接收：系统连续处理超时，已停止自动尝试，未创建工单。请重新发送以重试。'
+      : 'The request was not accepted: processing timed out repeatedly, so the automatic attempt stopped without creating a ticket. Please send it again to retry.'
+    this.options.outbox.send({ id: key('unaccepted', decision.id, trigger.id), channel: trigger.channel, text, kind: 'reply' })
   }
   /** Withdraw a ticket's question for a person from the outbox, unless it went out already. */
   withdrawAttention(attentionId: string): void { this.options.outbox.withdraw(key('attention-reply', attentionId)) }

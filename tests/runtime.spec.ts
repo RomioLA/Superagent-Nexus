@@ -266,6 +266,29 @@ it('fans a person\'s later thread message out to the live worker as context and 
     .toMatchObject({ trigger_id: followup.id, around: { before: expect.objectContaining({ read: `trigger/${key('feishu', 'om_1')}` }) } })
 })
 
+it('replies in the original Feishu conversation when an explicit request outlives its Eval retries', async () => {
+  const trigger = feishu('301', '@bot 修复登录问题')
+  await receive(trigger)
+  let at = Date.now()
+  const later = async () => {
+    at += 121_000
+    vi.useFakeTimers({ toFake: ['Date'], now: at })
+    try { await runtime.pump(); await runtime.idle() } finally { vi.useRealTimers() }
+  }
+  // The first two expiries queue the request for a fresh Eval without telling anyone.
+  for (let attempt = 0; attempt < 2; attempt++) { await later(); expect(runtime.store.decisions.byThread(`feishu:${CHAT}:om_301`)).toEqual([]) }
+  await later()
+  const decision = runtime.store.decisions.byThread(`feishu:${CHAT}:om_301`)[0]!
+  expect(decision).toMatchObject({ kind: 'unavailable', reason: [{ code: 'timeout' }] })
+  const id = key('unaccepted', decision.id, trigger.id)
+  expect(runtime.store.receipts.get(id)).toMatchObject({ kind: 'reply', status: 'sent',
+    channel: expect.objectContaining({ address: expect.objectContaining({ messageId: 'om_301' }) }),
+    text: expect.stringContaining('请求未被接收') })
+  const calls = vi.mocked(Commands.prototype.lark).mock.calls.map(([args]) => args)
+  expect(calls.find(args => args[1] === '+messages-reply' && args.includes('om_301')))
+    .toEqual(expect.arrayContaining(['--markdown', expect.stringContaining('请求未被接收')]))
+})
+
 it('assesses a proactive observation in the orchestrator Session and creates the ticket only on a positive auto-mode decision', async () => {
   const observe = (mode: 'observe' | 'auto') => runtime.settings.save('eval', { ...runtime.store.settings().eval, mode }, runtime.store.blockRevision('eval'), 'panel')
   await observe('observe')

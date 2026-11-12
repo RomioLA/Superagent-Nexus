@@ -150,6 +150,8 @@ describe('eval', () => {
     const decision = h.decide(h.requests[0]!, { kind: 'accept', title: 'x', scope: 'x', reason: 'x' })
     expect(decision.kind).toBe('unavailable')
     expect(h.repo.tickets.list()).toEqual([])
+    // A re-queued reassessment is not a final failure, so it tells the conversation nothing.
+    expect(h.outbox).toEqual([])
   })
   it('starts every pending eval in one step, so a second pump starts none of them again', () => {
     const h = harness()
@@ -157,6 +159,35 @@ describe('eval', () => {
     expect(h.engine.evaluateDue()).toBeUndefined()
     h.engine.evaluateDue()
     expect(h.requests.map(candidate => candidate.thread.key)).toEqual(['chat:A', 'chat:B'])
+  })
+  it('notifies each explicit Feishu request after the final Eval timeout, without notifying inferred or bot messages', () => {
+    const h = harness({ gate: t => !t.human ? { admissible: false, reason: 'bot' }
+      : { admissible: true, strength: t.actor.id === 'alice' ? 'explicit' : 'inferred', basis: { via: 'listed' } } })
+    const chat = (id: string) => ({ source: 'feishu', thread: 'feishu:chat', address: { chatId: 'chat', messageId: id } })
+    h.engine.receive(trigger('1', { source: 'feishu', channel: chat('1'), text: '修复登录问题' }))
+    h.engine.receive(trigger('2', { source: 'feishu', channel: chat('2'), text: '补一个测试' }))
+    h.engine.receive(trigger('3', { source: 'feishu', actor: guest, channel: chat('3'), text: '顺便看看' }))
+    h.engine.receive(trigger('4', { source: 'feishu', human: false, channel: chat('4'), text: 'bot message' }))
+    h.pump()
+    expect(h.requests.at(-1)!.triggers.map(item => item.id)).toEqual(['1', '2', '3', '4'])
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      h.engine.candidateDelivered(h.requests.at(-1)!.evalId)
+      h.tick(61); h.pump()
+      // Only the terminal timeout tells anyone the request was not accepted.
+      if (attempt < 2) expect(h.outbox).toEqual([])
+    }
+    expect(h.requests).toHaveLength(3)
+    const decision = h.repo.decisions.byThread('chat:t1')[0]!
+    expect(decision).toMatchObject({ kind: 'unavailable', reason: [{ code: 'timeout' }] })
+    // One receipt per explicit person's message, replying to that message; none for an inferred peer or a bot.
+    expect(h.outbox.map(message => [message.id, message.channel, message.kind])).toEqual([
+      [key('unaccepted', decision.id, '1'), chat('1'), 'reply'],
+      [key('unaccepted', decision.id, '2'), chat('2'), 'reply'],
+    ])
+    expect(h.outbox.every(message => message.text.includes('请求未被接收'))).toBe(true)
+    h.pump()
+    expect(h.outbox).toHaveLength(2)
   })
   it('counts an Eval\'s deadline from its delivery, queues its Triggers again twice when it expires, then records it unavailable', async () => {
     const h = harness()
@@ -181,6 +212,8 @@ describe('eval', () => {
     expect(h.repo.threads.get('chat:t1')).toMatchObject({ pending: [] })
     expect(h.repo.threads.get('chat:t1')).not.toHaveProperty('evaluating')
     expect(h.repo.threads.get('chat:t1')).not.toHaveProperty('expired')
+    // A non-Feishu conversation keeps its old behaviour: no failure receipt beyond the recorded Decision.
+    expect(h.outbox).toEqual([])
   })
 })
 describe('subscription fan-out', () => {

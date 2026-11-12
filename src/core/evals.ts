@@ -6,6 +6,7 @@ import type { Decision, DecisionKind, Evaluation, Mandate, MandateBasis, Strengt
 import type { AcceptTasksOutcome, AssessmentOutcome, Candidate, Policy } from './ports.ts'
 import { said, type Reason } from './reasons.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
+import type { Replies } from './replies.ts'
 import type { Tickets } from './tickets.ts'
 
 /** An outcome for the Eval that holds a Trigger; `evalId` names the Eval it was judged for, so a later Eval refuses it. */
@@ -25,7 +26,7 @@ const REQUEUES = 2
  * Engine routes the main Session's decisions, people's replays, worker handbacks, and the pass's Eval work here.
  */
 export class Evals extends EnginePart {
-  constructor(options: EngineOptions, private readonly tickets: Tickets) { super(options) }
+  constructor(options: EngineOptions, private readonly tickets: Tickets, private readonly replies: Replies) { super(options) }
 
   /**
    * Expire a Thread's Eval past its deadline (see `expire`), unless processing is paused: then the Eval notes when the
@@ -59,7 +60,16 @@ export class Evals extends EnginePart {
    */
   private expire(thread: Thread): void {
     const expired = (thread.expired ?? 0) + 1
-    if (expired > REQUEUES) { this.finish(thread, thread.evaluating!, { kind: 'unavailable', reason: [{ code: 'timeout' }] }); return }
+    if (expired > REQUEUES) {
+      const evaluation = thread.evaluating!
+      const decision = this.finish(thread, evaluation, { kind: 'unavailable', reason: [{ code: 'timeout' }] })
+      if (evaluation.strength === 'explicit') for (const id of evaluation.triggerIds) {
+        const trigger = this.repo.triggers.get(id)
+        // This failure receipt covers Feishu explicit requests, the request path that could time out silently.
+        if (trigger?.channel?.source === 'feishu') this.replies.unaccepted(decision, trigger)
+      }
+      return
+    }
     const { id, triggerIds } = thread.evaluating!
     delete thread.evaluating
     thread.expired = expired
