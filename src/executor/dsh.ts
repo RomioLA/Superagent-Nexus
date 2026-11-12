@@ -95,8 +95,13 @@ export function mandateInstructions(mandate: Pick<Mandate, 'strength'>): string 
 }
 /** One sentence per requirement the owner set on the executing Harness, so the worker cannot silently substitute or upgrade. */
 export function harnessInstructions(harness: HarnessSpec): string {
+  // An omitted `allowFallback` means no silent substitution (see HarnessSpec) and is enforced as such by the delegate
+  // guard, so the prompt states it too; only an explicit `true` permits a documented fallback.
+  const fallback = harness.allowFallback === true
   const line = harness.harness === 'dsh'
-    ? 'Harness required by the owner: DSH-native tools; do not delegate this work to AGY, Codex or Grok.'
+    ? 'Harness required by the owner: DSH-native tools; ' + (fallback
+        ? 'prefer these, and fall back to another authorized Harness only if they are unavailable.'
+        : 'do not delegate this work to AGY, Codex or Grok.')
     : harness.harness === 'agy'
       ? 'Harness required by the owner: the AGY native CLI via orchestrator_agy'
         + (harness.model ? ` (model=${harness.model})` : '') + '; do not substitute Codex or DSH-native coding, and never report another Harness\'s work as AGY\'s.'
@@ -105,8 +110,8 @@ export function harnessInstructions(harness: HarnessSpec): string {
         : 'Harness required by the owner: Grok Build via orchestrator_grok using the grok-4.7-build-fast model; never report another Harness or model as Grok.'
   const parts = [line]
   if (harness.forbid4a) parts.push('Do not use model=4a for any reason; if the required model is unavailable, report blocked rather than upgrading to 4a.')
-  if (harness.allowFallback === false) parts.push('Do not fall back to a different Harness on failure; report the failure instead.')
-  else if (harness.allowFallback === true) parts.push('A documented fallback is allowed if the preferred Harness is unavailable.')
+  parts.push(fallback ? 'A documented fallback is allowed if the preferred Harness is unavailable.'
+    : 'Do not fall back to a different Harness on failure; report the failure instead.')
   parts.push('State the Harness and model actually used in the final report.')
   return parts.join(' ')
 }

@@ -4,7 +4,7 @@ import { backfillChat, consumerRetry, feishuKind, feishuTriggerId, feishuRef, fe
   from '../src/sources/feishu.ts'
 import { KV } from '../src/kv.ts'
 import { apply as applyFeishu, pollThreads as pollFeishuThreads } from '../src/sources/feishu.ts'
-import { runFeishu } from '../src/sources/feishu-loops.ts'
+import { FIRST_BACKFILL_MS, runFeishu } from '../src/sources/feishu-loops.ts'
 import { commentTrigger, githubAddress, githubChannel, issueTrigger, type GithubComment, type GithubIssue } from '../src/sources/github-trigger.ts'
 import { claimPull, observePull, pullEndNotices, pullOf, ticketBranch, type Pull } from '../src/sources/github-pull.ts'
 import { ciCounts, ciFact, ciSummary } from '../src/sources/github-read.ts'
@@ -1041,9 +1041,9 @@ describe('feishu event consumer', () => {
   })
   /**
    * A bot CLI whose `event consume` behaves as `mode` says: `never` gets ready, `warn` warns once ready, `ready` stays up,
-   * and `flaky` exits after its first ready. It records each run and the PID of the latest.
+   * `flaky` exits 1 after its first ready, and `clean` exits 0 right after its first ready. It records each run and the PID of the latest.
    */
-  function cli(mode: 'never' | 'warn' | 'ready' | 'flaky' | 'events' | 'late'): string {
+  function cli(mode: 'never' | 'warn' | 'ready' | 'flaky' | 'clean' | 'events' | 'late'): string {
     const path = join(dir, 'lark-bot')
     writeFileSync(path, `#!/bin/sh
   [ "$1" = event ] || { echo '{"ok":true,"data":{}}'; exit 0; }
@@ -1053,6 +1053,7 @@ describe('feishu event consumer', () => {
     warn) echo '[event] ready' >&2; echo 'WARN the connection was reset' >&2; exec sleep 60 ;;
     ready) echo '[event] ready' >&2; exec sleep 60 ;;
     flaky) echo '[event] ready' >&2; [ "$n" -gt 1 ] && exec sleep 60; exit 1 ;;
+    clean) echo '[event] ready' >&2; exit 0 ;;
     events) echo '[event] ready' >&2; cat '${dir}/events'; touch '${dir}/printed'; exec sleep 60 ;;
     late) echo '[event] ready' >&2; sleep 1; cat '${dir}/events'; touch '${dir}/printed'; exec sleep 60 ;;
   esac
@@ -1062,7 +1063,7 @@ describe('feishu event consumer', () => {
   const runs = () => existsSync(join(dir, 'runs')) ? Number(readFileSync(join(dir, 'runs'), 'utf8')) : 0
   const alive = (pid: number) => { try { process.kill(pid, 0); return true } catch { return false } }
   /** The Feishu Source's context, on a fresh Store whose Feishu Source is on, with `cli` as the bot CLI. */
-  function consumerSource(path: string, config: Record<string, unknown> = { chats: [] }) {
+  function consumerSource(path: string, config: Record<string, unknown> = { chats: [] }, overrides: Partial<SourceContextDeps> = {}) {
     const store = new Store(join(dir, 'db.sqlite'))
     store.saveSettings(SettingsSchema.parse({ sources: { feishu: { enabled: true, config } } }))
     const board = new HealthBoard()
@@ -1077,7 +1078,7 @@ describe('feishu event consumer', () => {
     const health = board.all
     const commands = new Commands(() => deployment, {}, controller.signal)
     const deps: SourceContextDeps = { store, engine, outbox: { send: () => {} }, commands, sources, deployment, ready: Promise.resolve(), configured: () => true,
-      receive: (trigger: Trigger) => engine.receive(trigger) }
+      receive: (trigger: Trigger) => engine.receive(trigger), ...overrides }
     const turnOff = () => store.saveSettings(SettingsSchema.parse({ sources: { feishu: { enabled: false, config: { chats: [] } } } }))
     return { ctx: sourceContextOf(deps, feishuKind), health, store, turnOff }
   }
@@ -1143,6 +1144,51 @@ describe('feishu event consumer', () => {
     expect(off.chats).toEqual(['oc_a', 'oc_b'])
     expect(off.cursors.oc_dm).toBe(hour)
   }, 20_000)
+  it('scans a newly known direct chat once over a bounded window without re-reading old group history', async () => {
+    const { ctx, health, store } = consumerSource(cli('ready'), { chats: [{ chatId: 'oc_group', listen: 'mentions' }], directMessages: true })
+    store.set(KV.feishu.chats, { oc_dm: true })
+    const scans: { chat: string; start: number; end: number }[] = []
+    const lark = vi.spyOn(Commands.prototype, 'lark').mockImplementation(async args => {
+      if (args[0] === 'api' && args[2] === '/open-apis/im/v1/messages') {
+        const params = JSON.parse(args.at(-1)!) as { container_id: string; start_time: string; end_time: string }
+        scans.push({ chat: params.container_id, start: Number(params.start_time), end: Number(params.end_time) })
+        if (params.container_id === 'oc_dm') {
+          return { has_more: false, items: [{ message_id: 'om_first', chat_id: 'oc_dm',
+            create_time: String(Number(params.end_time) * 1000 - 1000), sender: { id: 'ou_alice', sender_type: 'user' },
+            body: { content: '{"text":"first direct message"}' } }] }
+        }
+      }
+      return { has_more: false, items: [] }
+    })
+    const stop = new AbortController()
+    const loops = runFeishu(ctx, AbortSignal.any([stop.signal, controller.signal]))
+    await vi.waitFor(() => expect(store.triggers.get(feishuTriggerId('om_first'))).toBeDefined(), until)
+    await vi.waitFor(() => expect(health.history?.state).toMatch(/^(ready|error)$/), until)
+    stop.abort(); await loops; lark.mockRestore()
+    const dm = scans.find(scan => scan.chat === 'oc_dm')!
+    // The one direct-chat scan covers the bounded window and ends at the first round's start.
+    expect(dm.end - dm.start).toBe(FIRST_BACKFILL_MS / 1000)
+    // A configured group with no cursor starts from now instead, so its old history is not read.
+    expect(scans.some(scan => scan.chat === 'oc_group')).toBe(false)
+    expect(store.get(KV.feishu.history('oc_group'))).toBeDefined()
+    expect(store.triggers.get(feishuTriggerId('om_first'))?.meta).toMatchObject({ direct: true })
+    store.close()
+  }, 20_000)
+  it('reports a consumer that exits right after becoming ready as stopped, not Ready', async () => {
+    const { ctx, health, store } = consumerSource(cli('clean'))
+    running = runFeishu(ctx, controller.signal)
+    await vi.waitFor(() => expect(health.feishu).toMatchObject({ state: 'error',
+      detail: expect.stringContaining('exited (0, ready=true)') }), until)
+    controller.abort(); await running; store.close()
+  }, 20_000)
+  it('reports a background loop that stops unexpectedly instead of leaving its health at Ready', async () => {
+    const ready = Promise.reject(new Error('runtime not ready')); ready.catch(() => {})
+    const h = host({ ready })
+    await runFeishu(h, new AbortController().signal)
+    expect(h.health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('event loop stopped') })
+    expect(h.health.history).toMatchObject({ state: 'error', detail: expect.stringContaining('recovery loop stopped') })
+    h.store.close()
+  })
   it('reports an error when the consumer is not ready within 45 seconds', async () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
     const { ctx, health, store } = consumerSource(cli('never'))

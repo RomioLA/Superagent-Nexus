@@ -423,7 +423,9 @@ async function runProcess(args: string[], workspace: string, env: NodeJS.Process
 }
 
 export function isGrokAuthFailure(text: string): boolean {
-  return /(?:unauthori[sz]ed|authentication failed|not authenticated|not signed in|no credentials?|invalid (?:xai )?api.?key|api.?key.{0,20}(?:missing|invalid|expired)|login required|sign.?in required|token expired|\b401\b|\b403\b)/i.test(text)
+  // 401 and missing/expired credentials are authentication. A 403 is the server's permission/forbidden
+  // answer and is reported as a permission failure below, so the two are never conflated.
+  return /(?:unauthori[sz]ed|authentication failed|not authenticated|not signed in|no credentials?|invalid (?:xai )?api.?key|api.?key.{0,20}(?:missing|invalid|expired)|login required|sign.?in required|token expired|\b401\b)/i.test(text)
 }
 function missingCli(error: unknown): boolean {
   return !!error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT'
@@ -446,10 +448,13 @@ function safeFailureDetail(text: string): string | undefined {
     .trim().slice(0, 500)
   return safe || undefined
 }
-function safeFailureCategory(text: string): string | undefined {
+/** Classify a non-zero Grok exit without inventing a retry: authentication, quota, permission and model stay distinct. */
+export function grokFailureCategory(text: string): string | undefined {
   if (!text.trim()) return undefined
   if (isGrokAuthFailure(text)) return 'authentication failure'
-  if (/permission[_\s-]?denied|permission.{0,20}(?:refused|rejected|blocked)|tool.{0,20}(?:not allowed|denied)/i.test(text))
+  if (/\b(?:402|429)\b|rate[_\s-]?limit|quota|usage[_\s-]?limit|insufficient (?:quota|credit|balance|funds)|no available capacity|out of credits|payment required|billing/i.test(text))
+    return 'usage/quota limit'
+  if (/permission[_\s-]?denied|permission.{0,20}(?:refused|rejected|blocked)|tool.{0,20}(?:not allowed|denied)|\b403\b|forbidden/i.test(text))
     return 'permission failure'
   if (/unknown model id|couldn't set model/i.test(text)) return 'model selection failure'
   if (/sandbox|landlock|seatbelt/i.test(text)) return 'sandbox failure'
@@ -457,8 +462,9 @@ function safeFailureCategory(text: string): string | undefined {
 }
 
 /**
- * Run the installed official CLI in this Ticket's exact worktree. Grok credentials live in a private per-Ticket
- * GROK_HOME; the shared user profile and XAI_API_KEY are deliberately not inherited.
+ * Run the installed official CLI in this Ticket's exact worktree. Grok reuses the deployment's `~/.grok/auth.json`
+ * through a symlink into this Ticket's private GROK_HOME; the shared profile settings and XAI_API_KEY are not inherited,
+ * and sessions, caches and temporary files stay per-Ticket.
  */
 export async function runTicketGrok(directory: string, ticketId: string, task: string,
   options: { mode: 'read-only' | 'write'; max_turns?: number }, signal: AbortSignal, timeoutOverrideMs?: number): Promise<GrokRunResult> {
@@ -530,12 +536,12 @@ export async function runTicketGrok(directory: string, ticketId: string, task: s
       throw new Error('Grok execution limit reached (max_turns=' + (limits.max_turns ?? GROK_DEFAULT_MAX_TURNS) + '); inspect partial workspace changes before retrying.')
     const evidence = run.stdout + '\n' + run.stderr
     if (isGrokAuthFailure(evidence)) {
-      throw new Error('Grok authentication failed for this Ticket. Sign in only to its isolated profile with GROK_HOME="' +
-        grokHome + '" grok login --device-auth; shared credentials were not used.')
+      throw new Error('Grok authentication failed for this Ticket. Sign in once as the deployment user (`grok login`, writing ~/.grok/auth.json) so later Tickets reuse it, or sign in to this Ticket\'s isolated profile with GROK_HOME="' +
+        grokHome + '" grok login --device-auth.')
     }
     const ended = run.exitCode === null ? 'signal ' + (run.exitSignal ?? 'unknown') : 'exit code ' + run.exitCode
     const detail = observer
-      ? safeFailureCategory(run.stderr + '\n' + run.stdout)
+      ? grokFailureCategory(run.stderr + '\n' + run.stdout)
       : safeFailureDetail(run.stdout) ?? safeFailureDetail(run.stderr)
     const diagnostics = observer ? '; ' + formatGrokDiagnostics(observer.report()) : ''
     throw new Error('Grok Build failed with ' + ended + (detail ? ': ' + detail : '') + diagnostics + '; inspect partial workspace changes before retrying.')
@@ -556,8 +562,8 @@ export async function runTicketGrok(directory: string, ticketId: string, task: s
   }
   catch (error) {
     if (error instanceof Error && isGrokAuthFailure(run.stdout + '\n' + run.stderr)) {
-      throw new Error('Grok authentication failed for this Ticket. Sign in only to its isolated profile with GROK_HOME="' +
-        grokHome + '" grok login --device-auth; shared credentials were not used.')
+      throw new Error('Grok authentication failed for this Ticket. Sign in once as the deployment user (`grok login`, writing ~/.grok/auth.json) so later Tickets reuse it, or sign in to this Ticket\'s isolated profile with GROK_HOME="' +
+        grokHome + '" grok login --device-auth.')
     }
     throw error
   }

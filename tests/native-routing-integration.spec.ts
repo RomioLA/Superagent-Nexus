@@ -231,3 +231,26 @@ it('keeps ordinary read-only review and authorized fallback on the native path',
   await host.runTool(worker, 'orchestrator_report', { state: 'ready', summary: 'Authorized inspection complete; no files changed.' })
   expect(host.runtime.store.tickets.get(ticket.id)?.ended?.outcome).toBe('completed')
 })
+
+it('keeps the enforced fallback default when allowFallback is omitted, and blocks every CLI Harness for a DSH-native Ticket', async () => {
+  // Omitted allowFallback means no silent substitution: the delegate guard rejects a different Harness, as the prompt states.
+  const source = feishu('95', '必须用 AGY 3.8F；未说允许回退')
+  host.runtime.receive(source); await host.runtime.idle()
+  await route([{ kind: 'accept', trigger_id: source.id, title: 'AGY strict', worktree_name: 'agy-strict', acknowledgement: 'On it',
+    harness: { harness: 'agy', model: '3.8f', forbid4a: true } }]); await host.runtime.idle()
+  const agyTicket = host.runtime.store.tickets.list()[0]!, agyWorker = 'worker-' + agyTicket.id
+  expect(agyTicket.execution?.assignment).toContain('Do not fall back to a different Harness on failure')
+  await expect(host.runTool(agyWorker, 'orchestrator_codex', { task: 'Do the change', mode: 'write' })).rejects.toThrow('requires agy')
+  await expect(host.runTool(agyWorker, 'orchestrator_grok', { task: 'Do the change', mode: 'write' })).rejects.toThrow('requires agy')
+
+  // A DSH-native Ticket may not run any other CLI Harness; its native work tools stay available (see runtime.spec.ts).
+  const dshSource = feishu('96', '直接用内置工具修好')
+  host.runtime.receive(dshSource); await host.runtime.idle()
+  await route([{ kind: 'accept', trigger_id: dshSource.id, title: 'Native', worktree_name: 'native-dsh', acknowledgement: 'On it',
+    harness: { harness: 'dsh' } }]); await host.runtime.idle()
+  const dshTicket = host.runtime.store.tickets.list().find(ticket => ticket.id !== agyTicket.id)!, dshWorker = 'worker-' + dshTicket.id
+  expect(dshTicket.execution?.assignment).toContain('DSH-native tools')
+  await expect(host.runTool(dshWorker, 'orchestrator_agy', { task: 'Do it', model: '3.8f' })).rejects.toThrow('requires dsh')
+  await expect(host.runTool(dshWorker, 'orchestrator_codex', { task: 'Do it', mode: 'write' })).rejects.toThrow('requires dsh')
+  await expect(host.runTool(dshWorker, 'orchestrator_grok', { task: 'Do it', mode: 'write' })).rejects.toThrow('requires dsh')
+})

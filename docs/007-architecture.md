@@ -344,8 +344,8 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/tools/main.ts` | The main Session's tools |
 | `src/app/tools/executor.ts` | An Executor Session's tools |
 | `src/app/tools/agy.ts` | The Ticket-scoped native AGY tool, model and mode arguments, process handling, result parsing, and failure reporting; DSH retains Ticket and Git delivery ownership |
-| `src/app/tools/grok.ts` | Ticket-scoped official Grok Build headless CLI, native JSON result and model-usage evidence, isolated authentication, cancellation, timeout and strict tool permissions; DSH retains Ticket and delivery ownership |
-| `src/app/tools/cli-isolation.ts` | Per-Ticket CLI state and private AGY permission config; existing AGY/Codex credentials are reused through symlinks, while Grok gets a private home and no shared credential |
+| `src/app/tools/grok.ts` | Ticket-scoped official Grok Build headless CLI, native JSON result and model-usage evidence, isolated authentication that reuses the deployment's Grok login, cancellation, timeout and strict tool permissions; DSH retains Ticket and delivery ownership |
+| `src/app/tools/cli-isolation.ts` | Per-Ticket CLI state and private AGY permission config; existing AGY/Codex/Grok credentials are reused through symlinks, while each CLI keeps sessions, caches and temporary files in a private per-Ticket home |
 | `src/app/tools/codex.ts` | DSH ticket-scoped Linux Codex tool; DSH manages workers, worktrees, recovery and PR |
 | `src/app/http.ts` | The `/orchestrator/api` routes: the same-origin check, request limits and one status per kind of failure |
 | `src/app/api.ts` | `Api`, every route with its parameters, query, body and response, and the filters of the lists; it imports only types, so the panel bundles it |
@@ -424,11 +424,12 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/status-reply.spec.ts` | Busy Ticket status answers, source channel, language, permission gates and Outbox deduplication |
 | `tests/magpie.spec.ts` | Existing scoped Magpie routing telemetry |
 | `tests/grok-ticket.spec.ts` | Grok Build headless arguments, permission profile, model-usage evidence and fail-closed result parsing |
-| `tests/cli-isolation.spec.ts` | Per-Ticket CLI state directories, AGY/Codex credential symlinks and a private Grok home |
+| `tests/cli-isolation.spec.ts` | Per-Ticket CLI state directories and AGY/Codex/Grok credential symlinks, with private per-Ticket homes |
 | `tests/cli-security.spec.ts` | CLI state path symlink checks, credential-target validation and concurrent credential-link setup |
 | `tests/project-environment.spec.ts` | Per-Ticket GitHub repository and worktree root environment routing, including default fallback |
 | `tests/feishu-native-engine.spec.ts` | Native Engine two-Ticket admission, duplicate suppression, independent worktrees, retry and cancellation |
 | `tests/native-routing-integration.spec.ts` | Native `orchestrator_route` project selection and split-task routing integration |
+| `tests/harness-instructions.spec.ts` | Harness instruction text that matches the fallback rule the delegate guard enforces |
 | `tests/notification-integration.spec.ts` | Runtime result receipts and notification deduplication |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |

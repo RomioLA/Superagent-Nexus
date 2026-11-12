@@ -1,7 +1,7 @@
 /**
- * Per-Ticket isolation for the executor CLIs: temporary files, caches and per-run artifacts live under a
- * Ticket-specific directory beside its workspace, so parallel Tickets never share them. Existing Codex and
- * Antigravity credentials are reused through symlinks; Grok gets a private home and never borrows shared auth.
+ * Per-Ticket isolation for the executor CLIs: temporary files, caches, sessions and per-run artifacts live under a
+ * Ticket-specific directory beside its workspace, so parallel Tickets never share them. Existing Codex, Antigravity
+ * and Grok credentials are reused through symlinks, so one deployment login serves every Ticket without a copy.
  */
 import { chmod, lstat, mkdir, readFile, realpath, symlink, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
@@ -59,11 +59,18 @@ export async function reuseCredential(target: string, link: string): Promise<voi
 export const sharedAgyHome = (): string => join(homedir(), '.gemini')
 /** The shared Codex home the deployment already authenticated. */
 export const sharedCodexHome = (): string => join(homedir(), '.config/superagent/codex-home')
+/** The shared Grok home `grok login` writes as the deployment user; its `auth.json` is the one reusable credential. */
+export const sharedGrokHome = (): string => join(homedir(), '.grok')
 
-/** Creates a private Grok home for one Ticket. No shared Grok credential is copied or linked into it. */
-export async function prepareGrokHome(root: string): Promise<string> {
+/**
+ * Creates a private Grok home for one Ticket. Only the deployment's `auth.json` is reused through a symlink, so a
+ * single `grok login` serves later Tickets; sessions, caches, temporary files and settings stay in this Ticket's home.
+ */
+export async function prepareGrokHome(root: string, shared: string = sharedGrokHome()): Promise<string> {
   const home = await ensureCliDir(join(root, 'grok-user-home'))
-  return ensureCliDir(join(home, '.grok'))
+  const grokHome = await ensureCliDir(join(home, '.grok'))
+  await reuseCredential(join(shared, 'auth.json'), join(grokHome, 'auth.json'))
+  return grokHome
 }
 
 const grokSandboxProfile = [

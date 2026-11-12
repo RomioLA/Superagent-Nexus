@@ -100,15 +100,29 @@ describe('per-Ticket CLI isolation', () => {
     expect(await readFile(join(shared, 'auth.json'), 'utf8')).toBe('{"a":1}')
   })
 
-  it('creates a private Grok home without linking shared credentials', async () => {
-    const grokHome = await prepareGrokHome(join(dir, 'root'))
+  it('reuses only the shared Grok auth.json by symlink and keeps the rest of the home private', async () => {
+    const shared = join(dir, 'grok-shared')
+    await mkdir(shared)
+    await writeFile(join(shared, 'auth.json'), '{"token":"shared"}')
+    await writeFile(join(shared, 'config.toml'), '[cli]\ninstaller="npm"\n')
+    const grokHome = await prepareGrokHome(join(dir, 'root'), shared)
     expect(grokHome).toBe(join(dir, 'root', 'grok-user-home', '.grok'))
     expect((await lstat(grokHome)).isSymbolicLink()).toBe(false)
+    expect(await readlink(join(grokHome, 'auth.json'))).toBe(join(shared, 'auth.json'))
+    // Nothing else from the shared home leaks into the Ticket: settings and sessions stay private.
+    await expect(lstat(join(grokHome, 'config.toml'))).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await readFile(join(shared, 'auth.json'), 'utf8')).toBe('{"token":"shared"}')
+  })
+
+  it('leaves the Grok auth link unset until the deployment has signed in once', async () => {
+    const shared = join(dir, 'grok-shared-empty')
+    await mkdir(shared)
+    const grokHome = await prepareGrokHome(join(dir, 'root'), shared)
     await expect(lstat(join(grokHome, 'auth.json'))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('creates a ticket-private workspace sandbox profile and fails closed on unknown settings', async () => {
-    const grokHome = await prepareGrokHome(join(dir, 'root'))
+    const grokHome = await prepareGrokHome(join(dir, 'root'), join(dir, 'no-shared-grok'))
     const profile = join(grokHome, 'sandbox.toml')
     await prepareGrokSandboxProfile(grokHome)
     const config = await readFile(profile, 'utf8')

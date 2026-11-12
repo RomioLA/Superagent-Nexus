@@ -233,13 +233,28 @@ From an allowed GitHub account, open an Issue or post a comment containing `@<ag
 ## Upgrade
 
 1. Wait until no Executor is in the middle of a turn.
-2. Back up `<stateDir>/orchestrator.sqlite`.
+2. Back up the database with SQLite's online snapshot (`VACUUM INTO`), as verified in `docs/sqlite-backup-restore-audit-2026-11-12.md`. Never copy `<stateDir>/orchestrator.sqlite` alone while the service runs: in WAL mode committed data can still be only in `orchestrator.sqlite-wal`, and a running copy can be torn.
+
+   ```sh
+   BACKUP_DIR=/home/superagent/.dsh/backups/superagent
+   mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR"
+   DSH_SRC=<stateDir>/orchestrator.sqlite DSH_DEST="$BACKUP_DIR/orchestrator-$(date -u +%Y%m%dT%H%M%SZ).sqlite" node --input-type=module - <<'NODE'
+   import { DatabaseSync } from 'node:sqlite'
+   const db = new DatabaseSync(process.env.DSH_SRC, { readOnly: true })
+   try { db.exec('PRAGMA busy_timeout=10000'); db.exec(`VACUUM INTO '${process.env.DSH_DEST.replace(/'/g, "''")}'`) } finally { db.close() }
+   NODE
+   ```
+
 3. Run `git pull && pnpm install && pnpm build`.
 4. Run `scripts/dsh-superagent restart` and inspect its status.
 
 A restart ends running Assignments and starts replacements with recovery notes. Team text and overridden prompt parts are retained; parts without overrides follow the new defaults. Review parts marked **Default updated** after upgrading.
 
 A database migrated by a newer version cannot be opened by an older one. Rollback therefore requires the pre-upgrade backup. After upgrading DeepSeek Harness itself, restart the running instance so the panel loads matching artifacts.
+
+### Executor CLI sign-in
+
+The Executor CLIs reuse the operator's existing login through symlinks into each Ticket's private home. Sign the deployment's Grok Build CLI in once with `grok login` (or `grok login --device-auth` on a host without a browser); it writes `~/.grok/auth.json`, and every later Ticket links that file while its sessions, caches and temporary files stay per-Ticket. Codex reuses `~/.config/superagent/codex-home` and Antigravity reuses `~/.gemini` the same way. Never copy a credential file into a Ticket directory.
 
 ### Agent presets
 

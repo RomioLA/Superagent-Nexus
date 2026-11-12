@@ -16,8 +16,27 @@ import { KV } from '../kv.ts'
 import { cursorAt, POLL_HORIZON_MS, polled, pollThreads as pollEach } from './poll.ts'
 import type { FeishuConfig } from './feishu.ts'
 
+/**
+ * A newly known direct chat is scanned once over the last hour, so a first message missed while the consumer reconnected is
+ * recovered without re-reading old history. The bot CLI cannot enumerate p2p chats (`+chat-list --types=p2p` needs a user
+ * identity), so a first message from a chat the bot has never seen cannot be discovered here; only a later event that makes
+ * the chat known lets this scan recover it.
+ */
+export const FIRST_BACKFILL_MS = 3_600_000
+type FeishuLoop = (ctx: SourceContext, signal: AbortSignal) => Promise<void>
+/**
+ * Runs a long-lived loop and reports an error on its health entry if it throws while the Source is still running, so
+ * `Promise.allSettled` cannot hide a listener or recovery loop that stopped on its own.
+ */
+async function supervise(entry: string, label: string, loop: FeishuLoop, ctx: SourceContext, signal: AbortSignal): Promise<void> {
+  try { await loop(ctx, signal) }
+  catch (error) {
+    if (!signal.aborted) ctx.report(entry, { state: 'error', detail: `The Feishu ${label} loop stopped: ${String(error)}`, at: new Date().toISOString() })
+  }
+}
 export const runFeishu = (ctx: SourceContext, signal: AbortSignal): Promise<unknown> =>
-  Promise.allSettled([watch, backfillLoop, chatNamesLoop].map(loop => loop(ctx, signal)))
+  Promise.allSettled([supervise('feishu', 'event', watch, ctx, signal), supervise('history', 'recovery', backfillLoop, ctx, signal),
+    chatNamesLoop(ctx, signal)])
 const enabled = (ctx: SourceContext): FeishuConfig | undefined => ctx.config<FeishuConfig>(SOURCE)
 const bot = (ctx: SourceContext): FeishuBot => {
   const resolved = ctx.deployment.feishu
@@ -56,6 +75,8 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
     const check = setInterval(() => { if (!enabled(ctx)) running.abort() }, 5000)
     const stop = () => running.abort()
     signal.addEventListener('abort', stop, { once: true })
+    // Not ready until this run reports its own ready marker; after an exit this replaces the stale Ready while it reconnects.
+    ctx.report('feishu', { state: 'starting', detail: 'Connecting to Feishu events' })
     const began = Date.now()
     try { await consume(ctx, running.signal) }
     catch (error) { if (!running.signal.aborted) ctx.report('feishu', { state: 'error', detail: String(error) }) }
@@ -73,7 +94,7 @@ async function consume(ctx: SourceContext, signal: AbortSignal): Promise<void> {
     { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1',
       LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } })
   const stdout = createInterface({ input: child.stdout }); const stderr = createInterface({ input: child.stderr })
-  let chain = Promise.resolve(); let diagnostic = ''; let ready = false
+  let chain = Promise.resolve(); let diagnostic = ''; let ready = false; let ended = false
   const stop = (): void => { child.stdin.end(); child.kill('SIGTERM') }
   signal.addEventListener('abort', stop, { once: true })
   const timeout = setTimeout(() => { diagnostic = 'Feishu event consumer did not become ready within 45 seconds'; stop() }, 45_000)
@@ -81,8 +102,9 @@ async function consume(ctx: SourceContext, signal: AbortSignal): Promise<void> {
     diagnostic = line.slice(0, 4000)
     if (line.startsWith('[event] ready')) {
       ready = true; clearTimeout(timeout)
-      ctx.report('feishu', { state: 'ready', detail: 'Listening for bot events', at: new Date().toISOString() })
-    } else if (/WARN|drop|error/.test(line)) ctx.report('feishu', { state: 'error', detail: diagnostic })
+      // A ready marker read after the process exited must not overwrite the stopped state it just reported.
+      if (!ended) ctx.report('feishu', { state: 'ready', detail: 'Listening for bot events', at: new Date().toISOString() })
+    } else if (!ended && /WARN|drop|error/.test(line)) ctx.report('feishu', { state: 'error', detail: diagnostic })
   })
   stdout.on('line', (line: string) => {
     chain = chain.then(async () => {
@@ -100,7 +122,14 @@ async function consume(ctx: SourceContext, signal: AbortSignal): Promise<void> {
     await new Promise<void>((resolve, reject) => {
       child.once('error', reject)
       const exited = (code: number | null) => new Error(`Feishu event consumer exited (${code}, ready=${ready}): ${diagnostic}`)
-      child.once('close', (code) => signal.aborted ? resolve() : reject(exited(code)))
+      // Report the exit at once, even while an event already read is still being processed, so a dead listener is never shown as Ready.
+      child.once('close', (code) => {
+        ended = true
+        if (signal.aborted) { resolve(); return }
+        const error = exited(code)
+        ctx.report('feishu', { state: 'error', detail: String(error), at: new Date().toISOString() })
+        reject(error)
+      })
     })
   } finally { clearTimeout(timeout); signal.removeEventListener('abort', stop); stdout.close(); stderr.close(); await chain }
 }
@@ -146,9 +175,12 @@ async function backfillLoop(ctx: SourceContext, signal: AbortSignal): Promise<vo
       const started = new Date().toISOString()
       const cursorKey = KV.feishu.history(chatId)
       const since = ctx.state.get(cursorKey)
-      if (since === undefined) { ctx.state.set(cursorKey, started); continue }
+      // A direct chat with no cursor is scanned once over a bounded recent window: its first message may have arrived
+      // while the consumer was down, and the chat became known only later. Groups start at now so old history is not re-read.
+      const from = since ?? (direct ? new Date(Date.parse(started) - FIRST_BACKFILL_MS).toISOString() : undefined)
+      if (from === undefined) { ctx.state.set(cursorKey, started); continue }
       try {
-        await backfillChat(ctx, chatId, direct, since, started, signal, tally)
+        await backfillChat(ctx, chatId, direct, from, started, signal, tally)
         if (!signal.aborted) ctx.state.set(cursorKey, cursorAt(started))
       } catch (error) { if (!signal.aborted) errors.push(`${chatId}: ${String(error)}`) }
     }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { diagnoseGrokStream, grokArgs, grokCliArgs, isGrokAuthFailure, parseGrokOutput, parseGrokStreamingOutput, ticketGrokTool } from '../src/app/tools/grok.ts'
+import { diagnoseGrokStream, grokArgs, grokCliArgs, grokFailureCategory, isGrokAuthFailure, parseGrokOutput, parseGrokStreamingOutput, ticketGrokTool } from '../src/app/tools/grok.ts'
 import type { Ticket } from '../src/core/index.ts'
 
 describe('Grok Build is a native Executor CLI tool', () => {
@@ -140,5 +140,18 @@ describe('Grok Build is a native Executor CLI tool', () => {
   it('recognizes the CLI not-signed-in error without exposing raw authentication output', () => {
     expect(isGrokAuthFailure('Not signed in. To authenticate without a browser, run grok login --device-code.')).toBe(true)
     expect(isGrokAuthFailure('unrecognized option --example')).toBe(false)
+  })
+
+  it('keeps authentication, quota, permission and model failures distinct instead of inventing a retry', () => {
+    expect(grokFailureCategory('401 Unauthorized: token expired')).toBe('authentication failure')
+    expect(grokFailureCategory('HTTP 429 Too Many Requests: rate limit exceeded')).toBe('usage/quota limit')
+    expect(grokFailureCategory('402 Payment Required: insufficient quota')).toBe('usage/quota limit')
+    expect(grokFailureCategory('permission_denied: tool not allowed')).toBe('permission failure')
+    expect(grokFailureCategory('403 Forbidden: permission denied')).toBe('permission failure')
+    expect(grokFailureCategory('unknown model id: grok-missing')).toBe('model selection failure')
+    expect(grokFailureCategory('landlock sandbox denied the write')).toBe('sandbox failure')
+    // A permission denial is not an authentication failure and must not be mistaken for a sign-in problem.
+    expect(isGrokAuthFailure('403 Forbidden: permission denied')).toBe(false)
+    expect(isGrokAuthFailure('HTTP 429 Too Many Requests')).toBe(false)
   })
 })
