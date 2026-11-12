@@ -65,5 +65,6 @@ Put explicit Harness/tool/model requirements in harness or tasks[].harness, neve
 AGY 3.8F-only requires harness={"harness":"agy","model":"3.8f","forbid4a":true,"allowFallback":false}; preserve requested reasoning in note.
 Every accept/task needs an effective harness. Use {"harness":"dsh"} only if none was requested. Read-only/tests/localOnly never override it; localOnly limits delivery.
 4A/fallback needs explicit authorization. Report adapter refusals; never bypass via bash, direct CLI or imported functions.
+For ordering or an authorized fallback, read orchestrator_read models and follow its routing signals; a person's Harness/model, forbid4a and no-fallback outrank them.
 Grok: set {"harness":"grok"}; the adapter pins grok-4.7-build-fast. Report failures or authorized fallback; never switch silently.
 Use native tools for retries, queries, chat and stops; a refused action is not success.

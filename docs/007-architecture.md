@@ -333,6 +333,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
 | `src/app/magpie.ts` | Existing scoped Magpie routing telemetry |
+| `src/app/routing.ts` | Lightweight, explainable resource-aware candidate ordering over trustworthy Magpie quota signals; unknown values stay unknown and explicit Harness/model/4A constraints win |
 | `src/app/role-models.ts` | Resolves the Eval and Executor models, and seeds a new Session with its role's model |
 | `src/app/assessment.ts` | The MasterAssessor, the assessment schema and the window `orchestrator_eval` answers |
 | `src/app/execution-environment.ts` | The execution environment: its variables, a Ticket's values, the directory root and the lines of the prompt section, which `src/app/prompts.ts` fills into its template |
@@ -423,6 +424,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/grok-execution.spec.ts` | Mock Grok native limits, cancellation, ordinary retries and file-write evidence |
 | `tests/status-reply.spec.ts` | Busy Ticket status answers, source channel, language, permission gates and Outbox deduplication |
 | `tests/magpie.spec.ts` | Existing scoped Magpie routing telemetry |
+| `tests/routing.spec.ts` | Resource-aware candidate ordering: a known exhausted reading changes the choice, unknown stays neutral, explicit Harness/model/4A constraints win, and the `models` resource carries the explainable routing projection |
 | `tests/grok-ticket.spec.ts` | Grok Build headless arguments, permission profile, model-usage evidence and fail-closed result parsing |
 | `tests/cli-isolation.spec.ts` | Per-Ticket CLI state directories and AGY/Codex/Grok credential symlinks, with private per-Ticket homes |
 | `tests/cli-security.spec.ts` | CLI state path symlink checks, credential-target validation and concurrent credential-link setup |
