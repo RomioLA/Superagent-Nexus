@@ -57,14 +57,30 @@ function membership(error: unknown): unknown {
  * Restricts GitHub API calls to the configured repository and translates CLI failures into CliError instances for Sources, MasterAssessor, Outbox, and Settings.
  */
 export class Commands {
+  /** Set by `forRepository`; every other command, credential, and guard stays exactly as configured. */
+  private repositoryOverride?: string
   /**
    * @param resolved - returns the resolved deployment setup, or throws while setup is still pending.
    * @param environment - variables overriding `process.env` for every command (such as isolated git settings).
    */
   constructor(private readonly resolved: () => Deployment, private readonly environment: Record<string, string | undefined>, private readonly signal: AbortSignal) {}
   get deployment(): Deployment { return this.resolved() }
-  get repository(): string { return this.deployment.repository }
-  withSignal(signal?: AbortSignal): Commands { return signal ? new Commands(this.resolved, this.environment, AbortSignal.any([this.signal, signal])) : this }
+  get repository(): string { return this.repositoryOverride ?? this.deployment.repository }
+  /**
+   * Returns the same CLI calls scoped to another repository, so a Source that the operator authorized for several
+   * repositories can read each one; callers must first check that the Source authorizes `repository`.
+   */
+  forRepository(repository: string): Commands {
+    const scoped = Object.create(this) as Commands
+    scoped.repositoryOverride = repository
+    return scoped
+  }
+  withSignal(signal?: AbortSignal): Commands {
+    if (!signal) return this
+    const scoped = new Commands(this.resolved, this.environment, AbortSignal.any([this.signal, signal]))
+    scoped.repositoryOverride = this.repositoryOverride
+    return scoped
+  }
   async run(program: string, args: string[], cwd?: string): Promise<string> {
     try {
       const { stdout } = await exec(program, args, { cwd, signal: this.signal, timeout: TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,

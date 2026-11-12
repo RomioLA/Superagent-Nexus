@@ -4,9 +4,22 @@ import { key, type ChannelRef, type Trigger } from '../core/index.ts'
 import { escapeRegExp, sameName } from '../infra/text.ts'
 
 export const SOURCE = 'github'
+/** A repository and the Source's primary repository, whose Threads keep the historical bare-number key. */
+export interface RepoRef { repository?: string; primary?: string }
+/**
+ * Thread id of a GitHub Issue or PR. The primary repository keeps the historical bare number so existing Thread keys stay
+ * valid; any other repository is qualified with its full name, so PR #6 in two repositories never shares a Thread.
+ */
+export const githubThreadId = (repository: string | undefined, primary: string | undefined, number: number): string =>
+  !repository || !primary || sameName(repository, primary) ? String(number) : `${repository.toLowerCase()}#${number}`
+/** Splits a GitHub Thread id back into its repository (undefined for the primary's bare number) and Issue/PR number. */
+export function parseGithubThreadId(id: string): { repository?: string; number: number } {
+  const match = /^(.+)#(\d+)$/.exec(id)
+  return match ? { repository: match[1]!, number: Number(match[2]!) } : { number: Number(id) }
+}
 /** GitHub reply address: issue/PR conversation, or a review thread when `url` points at a discussion comment. */
-export const githubChannel = (number: number, url?: string): ChannelRef =>
-  ({ source: SOURCE, thread: `github:${number}`, address: { number: String(number), ...(url ? { url } : {}) } })
+export const githubChannel = (number: number, url?: string, threadId = String(number), repository?: string): ChannelRef =>
+  ({ source: SOURCE, thread: `github:${threadId}`, address: { number: String(number), ...(repository ? { repository } : {}), ...(url ? { url } : {}) } })
 export const githubPage = (repository: string, number: number, pr = false): string =>
   `https://github.com/${repository}/${pr ? 'pull' : 'issues'}/${number}`
 /** Parses a web or API URL for an Issue, PR, or review comment in `repository`; returns undefined for other URLs or repositories. */
@@ -38,7 +51,9 @@ export const IssueSchema = CommentSchema.extend({
 })
 export type GithubIssue = z.infer<typeof IssueSchema>
 type Opened = Pick<GithubIssue, 'number' | 'title' | 'body' | 'user' | 'created_at' | 'html_url'>
-export interface PullRef { number: number; isPr: boolean; url?: string; prAuthor?: string }
+export interface PullRef extends RepoRef { number: number; isPr: boolean; url?: string; prAuthor?: string }
+/** Thread id a PullRef belongs to; bare for the primary repository, repository-qualified otherwise. */
+const refThreadId = (ref: RepoRef & { number: number }): string => githubThreadId(ref.repository, ref.primary, ref.number)
 /**
  * True when GitHub reports the account as a regular user rather than a bot or GitHub App.
  * Review bots running under ordinary user accounts count as human here; the prompts identify which accounts are automated.
@@ -66,12 +81,13 @@ export function commentTrigger(comment: GithubComment, ref: PullRef, kind: 'conv
   const at = comment.updated_at ?? comment.submitted_at ?? comment.created_at ?? new Date().toISOString()
   const version = comment.updated_at ?? comment.submitted_at ?? ''
   const id = key('github-comment', comment.html_url ?? `github:${ref.number}`, String(comment.id), version)
-  return { id, source: SOURCE, threads: [{ source: SOURCE, id: String(ref.number) }], ...author(comment.user, agent), at,
+  const threadId = refThreadId(ref)
+  return { id, source: SOURCE, threads: [{ source: SOURCE, id: threadId }], ...author(comment.user, agent), at,
     text: commentText(comment, kind),
     ...(mentions(comment.body ?? '', agent) ? { addressed: 'mention' as const } : {}),
-    channel: githubChannel(ref.number, comment.html_url ?? undefined),
+    channel: githubChannel(ref.number, comment.html_url ?? undefined, threadId, ref.repository),
     ...(comment.html_url ?? ref.url ? { url: comment.html_url ?? ref.url } : {}),
-    meta: { number: ref.number, isPr: ref.isPr, ...(ref.prAuthor ? { prAuthor: ref.prAuthor } : {}), commentId: comment.id, kind,
+    meta: { number: ref.number, isPr: ref.isPr, ...(ref.repository ? { repository: ref.repository } : {}), ...(ref.prAuthor ? { prAuthor: ref.prAuthor } : {}), commentId: comment.id, kind,
       ...comment.path ? { path: comment.path, line: comment.line ?? comment.original_line ?? null } : {},
       ...comment.in_reply_to_id ? { inReplyTo: comment.in_reply_to_id } : {} } }
 }
@@ -79,20 +95,23 @@ export function commentTrigger(comment: GithubComment, ref: PullRef, kind: 'conv
  * Builds the trigger for a newly opened Issue's title and body.
  * The ID is the same as when Issue bodies were stored previously, so already-stored bodies are not ingested again.
  */
-export function issueTrigger(issue: Opened, agent: string): Trigger {
+export function issueTrigger(issue: Opened, agent: string, repo: RepoRef = {}): Trigger {
   const body = issue.body ?? ''
+  const threadId = githubThreadId(repo.repository, repo.primary, issue.number)
   return { id: key('github-issue', String(issue.number)), source: SOURCE,
-    threads: [{ source: SOURCE, id: String(issue.number) }], ...author(issue.user, agent), at: issue.created_at,
+    threads: [{ source: SOURCE, id: threadId }], ...author(issue.user, agent), at: issue.created_at,
     text: `${issue.title}\n\n${body}`,
     ...(mentions(body, agent) ? { addressed: 'mention' as const } : {}),
-    channel: githubChannel(issue.number, issue.html_url), url: issue.html_url, meta: { number: issue.number, isPr: false, kind: 'issue' } }
+    channel: githubChannel(issue.number, issue.html_url, threadId, repo.repository), url: issue.html_url,
+    meta: { number: issue.number, isPr: false, kind: 'issue', ...(repo.repository ? { repository: repo.repository } : {}) } }
 }
 /**
  * Builds the trigger for a newly opened PR's title and description.
  * PR and Issue numbers share one sequence in GitHub and never collide, so this reuses `issueTrigger`'s `github-issue` ID format.
  */
-export function pullTrigger(pull: Opened, agent: string): Trigger {
-  return { ...issueTrigger(pull, agent), meta: { number: pull.number, isPr: true, prAuthor: pull.user.login, kind: 'pull' } }
+export function pullTrigger(pull: Opened, agent: string, repo: RepoRef = {}): Trigger {
+  return { ...issueTrigger(pull, agent, repo), meta: { number: pull.number, isPr: true, prAuthor: pull.user.login, kind: 'pull',
+    ...(repo.repository ? { repository: repo.repository } : {}) } }
 }
 /** Builds a trigger for a default-branch CI transition; default-branch CI has no person to reply to, so it has no `channel`. */
 export function branchCiTrigger(branch: string, sha: string, revision: number, summary: string, url: string): Trigger {
@@ -100,9 +119,10 @@ export function branchCiTrigger(branch: string, sha: string, revision: number, s
     threads: [{ source: SOURCE, id: `ci:${branch}` }], actor: { source: SOURCE, id: '' }, human: false, at: new Date().toISOString(),
     text: summary, url, meta: { ci: true, branch, sha, revision } }
 }
-export function ciTrigger(pr: { number: number; html_url: string; user: { login: string } }, revision: number, summary: string): Trigger {
-  return { id: key('github-ci', String(pr.number), String(revision)), source: SOURCE, threads: [{ source: SOURCE, id: String(pr.number) }],
+export function ciTrigger(pr: { number: number; html_url: string; user: { login: string } } & RepoRef, revision: number, summary: string): Trigger {
+  const threadId = githubThreadId(pr.repository, pr.primary, pr.number)
+  return { id: key('github-ci', String(pr.number), String(revision)), source: SOURCE, threads: [{ source: SOURCE, id: threadId }],
     actor: { source: SOURCE, id: '' }, human: false, at: new Date().toISOString(),
-    text: summary, channel: githubChannel(pr.number), url: pr.html_url,
-    meta: { number: pr.number, isPr: true, prAuthor: pr.user.login, ci: true, revision } }
+    text: summary, channel: githubChannel(pr.number, undefined, threadId, pr.repository), url: pr.html_url,
+    meta: { number: pr.number, isPr: true, prAuthor: pr.user.login, ci: true, revision, ...(pr.repository ? { repository: pr.repository } : {}) } }
 }

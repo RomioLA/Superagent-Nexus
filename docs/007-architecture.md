@@ -429,6 +429,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/cli-isolation.spec.ts` | Per-Ticket CLI state directories and AGY/Codex/Grok credential symlinks, with private per-Ticket homes |
 | `tests/cli-security.spec.ts` | CLI state path symlink checks, credential-target validation and concurrent credential-link setup |
 | `tests/project-environment.spec.ts` | Per-Ticket GitHub repository and worktree root environment routing, including default fallback |
+| `tests/github-multi-repo.spec.ts` | Repository-scoped GitHub Threads, scope of authorized project repositories, and cross-project pull binding, CI and closure |
 | `tests/feishu-native-engine.spec.ts` | Native Engine two-Ticket admission, duplicate suppression, independent worktrees, retry and cancellation |
 | `tests/native-routing-integration.spec.ts` | Native `orchestrator_route` project selection and split-task routing integration |
 | `tests/harness-instructions.spec.ts` | Harness instruction text that matches the fallback rule the delegate guard enforces |

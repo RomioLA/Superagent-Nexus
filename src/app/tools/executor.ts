@@ -2,7 +2,7 @@
 import { z } from 'zod'
 import { latestAssignment, liveTicket, type EngineForExecutor, type HarnessRun, type HarnessUsage, type Ticket } from '../../core/index.ts'
 import { IM_WORDS } from '../../infra/text.ts'
-import { claimPull, readPull } from '../../sources/github-pull.ts'
+import { claimPull, readPull, repositoryAuthorized } from '../../sources/github-pull.ts'
 import type { SourceContext } from '../../sources/host.ts'
 import { readResource, type ResourceHost } from '../resources.ts'
 import type { Store } from '../store.ts'
@@ -169,19 +169,19 @@ export function executorTools(host: ExecutorToolsHost, ticket: Ticket): Tool[] {
       execute: async (args, signal) => {
         const current = host.store.tickets.get(ticketId)
         if (!current || !liveTicket(current)) throw new Error('Ticket ended (PR was closed or work finished); do not resume it')
-        // The native GitHub watcher is bound to its configured primary repository.
-        // A PR number from a different project may refer to an unrelated PR in that repository.
-        const originRepo = current.execution?.project?.repository ?? host.github.triggers.get(current.origin.triggerId)?.meta.projectRepository
+        // A project Ticket's PR lives in that project's repository, which the GitHub Source must authorize for tracking.
+        const projectRepository = current.execution?.project?.repository ?? host.github.triggers.get(current.origin.triggerId)?.meta.projectRepository
+        const repository = typeof projectRepository === 'string' && projectRepository ? projectRepository : host.github.deployment.repository
         if (args.pr_number != null && current.execution?.project?.localOnly) throw new Error('Local-only Ticket cannot claim a PR')
         const required = current.execution?.harness
         const run = current.execution?.harnessRun
         if (args.state === 'ready' && required && required.harness !== 'dsh'
           && (!run || run.assignmentId !== latestAssignment(current)?.id || (run.harness !== required.harness && required.allowFallback !== true)))
           throw new Error('No successful execution of the required Harness for this assignment; report blocked or failed')
-        if (args.pr_number != null && typeof originRepo === 'string'
-          && originRepo.toLowerCase() !== host.github.deployment.repository.toLowerCase())
-          throw new Error('This ticket targets another repository: omit pr_number and include the full PR URL in summary')
-        const pull = args.pr_number != null ? await readPull(host.github, args.pr_number, signal) : undefined
+        const sourceConfig = host.github.config<{ repositories?: string[] }>('github')
+        if (args.pr_number != null && !repositoryAuthorized(repository, host.github.deployment.repository, sourceConfig?.repositories))
+          throw new Error(`The GitHub Source does not authorize tracking ${repository}: add it to its repositories, or omit pr_number and include the full PR URL in summary`)
+        const pull = args.pr_number != null ? await readPull(host.github, repository, args.pr_number, signal) : undefined
         // Claim the PR, record the report, and queue the relay atomically so a rejected PR claim or invalid report leaves no partial state, and a recorded report always reaches the main Session.
         return host.store.atomic(() => {
           const refused = pull && claimPull(host.github, ticketId, pull)
