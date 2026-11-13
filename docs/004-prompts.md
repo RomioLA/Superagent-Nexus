@@ -15,6 +15,13 @@ A team can edit three team sections, add skills, and override every built-in sys
 
 The built-in text covers the roles, tool usage, host mechanics, authorization rules, and the GitHub and Feishu skills. It refers to the team sections by their headings instead of repeating them.
 
+### Multi-step development
+
+In **Prompts**, add a team skill named `multistep-development`. Copy the Markdown body below the front matter from [the skill file](../skills/dsh-superagent-multistep-development/SKILL.md), preview the change and save a new revision. The management API uses the same body in `config.skills["multistep-development"]` and saves against the current `baseRevision`.
+
+Assign one Ticket with the requirements document, acceptance criteria, authorized work scope and expected deliverable. The default Worker prompt tells the Worker to load `dsh-superagent-multistep-development` from the native skill catalog when the assignment has multiple deliverables or dependent implementation stages. If the team overrides `runtime/work`, include the same instruction in its override.
+The Worker tracks and verifies steps in that Ticket, then records the outcome with `orchestrator_report`.
+
 ### Built-in parts and templates
 
 Overrides use these keys:

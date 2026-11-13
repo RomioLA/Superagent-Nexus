@@ -3,13 +3,15 @@
  * orchestrator and worker roles against tool schemas, environment variables, glossary rules (`docs/001`), and size budgets.
  */
 import { Context } from '@deepseek-ai/cordis'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { SkillRegistry } from '@deepseek-ai/dsh-skill'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterAll, beforeAll, expect, it, vi } from 'vitest'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import { latestAssignment } from '../src/core/index.ts'
 import { promptParts } from '../src/app/prompts.ts'
+import { packagePath } from '../src/infra/paths.ts'
 import { RESOURCES } from '../src/app/resources.ts'
 import { TICKET_STATES } from '../src/app/cards.ts'
 import { Runtime } from '../src/app/runtime.ts'
@@ -31,7 +33,6 @@ interface Tool {
   execute: (args: unknown, execution: { signal: AbortSignal }) => Promise<unknown>
 }
 type Section = (context: { signal?: AbortSignal }) => string
-interface Skill { name: string; description: string; content: string }
 
 /**
  * Maximum combined character count of system prompt and tool definitions per role (~5% above baseline).
@@ -100,16 +101,16 @@ async function start() {
   const agents = new Map<string, { status: string }>()
   const tools = new Map<string, Map<string, Tool>>()
   const sections = new Map<string, Section>()
-  const skills = new Map<string, Skill[]>()
+  const skills = new Map<string, SkillRegistry>()
   const inputs: { sessionId: string; text: string }[] = []
   const create = async ({ sessionId }: { sessionId: string }) => {
     if (agents.has(sessionId)) return
     const agentCtx = new Context()
-    const own = new Map<string, Tool>(), registered: Skill[] = []
-    tools.set(sessionId, own); skills.set(sessionId, registered)
+    await agentCtx.plugin(SkillRegistry)
+    const own = new Map<string, Tool>()
+    tools.set(sessionId, own); skills.set(sessionId, agentCtx.skills)
     const register = (tool: Tool) => { own.set(tool.name, tool); return () => own.delete(tool.name) }
     agentCtx.reflect.provide('tools', { register, get: () => undefined, restrict: () => () => {}, guard: () => () => {} })
-    agentCtx.reflect.provide('skills', { register: (skill: Skill) => { registered.push(skill); return () => {} } })
     const section = (spec: { text: Section }) => { sections.set(sessionId, spec.text); return () => {} }
     agentCtx.reflect.provide('systemPrompt', { section })
     const inbox = { nextTurn: [] as UserMessage[], nextStep: [] as UserMessage[],
@@ -238,7 +239,7 @@ function walk(node: unknown, visit: (node: Record<string, unknown>, property?: s
 }
 
 /** Collect all model-visible text surfaces (prompt sections, tool schemas, skills, errors, and session inputs) with their owning module. */
-function collect(host: Host, { a, b, workerA, workerB, refusal }: Awaited<ReturnType<typeof drive>>): Surface[] {
+async function collect(host: Host, { a, b, workerA, workerB, refusal }: Awaited<ReturnType<typeof drive>>): Promise<Surface[]> {
   const { runtime } = host
   const surfaces: Surface[] = []
   const config = runtime.prompts.current().config
@@ -259,8 +260,10 @@ function collect(host: Host, { a, b, workerA, workerB, refusal }: Awaited<Return
       surfaces.push({ where: `${role} tool ${tool.name}`, owner: TOOLS, role, text: descriptions.join('\n') })
     }
   }
-  for (const { name, description, content } of host.skills.get(runtime.masterId)!) {
-    surfaces.push({ where: `skill ${name}`, owner: PROMPTS, role: 'both', text: `${description}\n${content}` })
+  const registry = host.skills.get(runtime.masterId)!
+  for (const { name, description } of await registry.list()) {
+    const skill = (await registry.get(name))!
+    surfaces.push({ where: `skill ${name}`, owner: PROMPTS, role: 'both', text: `${description}\n${skill.content}` })
   }
   surfaces.push({ where: 'orchestrator tool orchestrator_reply error', owner: ERRORS, role: 'orchestrator', text: refusal })
   for (const { text } of host.inputs.filter(input => input.sessionId === runtime.masterId)) {
@@ -294,7 +297,7 @@ let surfaces: Surface[]
 beforeAll(async () => {
   host = await start()
   sessions = await drive(host)
-  surfaces = collect(host, sessions)
+  surfaces = await collect(host, sessions)
 })
 afterAll(async () => { await host?.stop() })
 const toolsOf = (role: Role) => host.tools.get(role === 'orchestrator' ? host.runtime.masterId : sessions.workerA)!
@@ -366,6 +369,34 @@ it('collects both roles\' tools, prompts, skills and inputs', () => {
     'worker input recovery', 'worker input note', 'worker input trigger (context)', 'orchestrator input follow_up',
     'orchestrator input thread_followed', 'orchestrator tool orchestrator_reply error']) expect(wheres).toContain(where)
   expect(sessions.refusal).not.toBe('')
+})
+
+it('exposes the saved multi-step team skill and its full body in the native Worker skill registry', async () => {
+  const { prompts } = host.runtime
+  const current = prompts.current()
+  const name = 'multistep-development'
+  const registered = 'dsh-superagent-multistep-development'
+  const file = readFileSync(packagePath('skills', registered, 'SKILL.md'), 'utf8')
+  const body = file.split('\n---\n\n')[1]!
+  expect(body).toBeTruthy()
+  const registry = host.skills.get(sessions.workerA)!
+  const builtIns = await registry.list()
+  expect(builtIns.map(skill => skill.name)).toEqual(['dsh-superagent-feishu', 'dsh-superagent-github'])
+
+  const config = { ...current.config, skills: { ...current.config.skills, [name]: body } }
+  expect(prompts.preview(config).skills[name]).toBe(body)
+  const saved = prompts.save(config, current.revision, 'panel')
+  const render = host.sections.get(sessions.workerA)!
+  const request = { signal: new AbortController().signal }
+  try {
+    expect(prompts.version(saved.revision).config.skills[name]).toBe(body)
+    expect(render(request)).toContain(`call the skill tool for ${registered} when it is listed`)
+    expect(await registry.list()).toEqual([...builtIns, expect.objectContaining({ name: registered, invocation: { modelInvocable: true, userInvocable: true } })])
+    expect((await registry.get(registered))?.content).toBe(body)
+  } finally {
+    prompts.save(current.config, saved.revision, 'panel')
+    render(request)
+  }
 })
 
 it('names only registered tools, schema options, environment variables and glossary words, with the enforced word limits', () => {
