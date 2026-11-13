@@ -21,9 +21,10 @@ export async function sendFeishu(host: Pick<SourceContext, 'commands'>, message:
   const messageId = message.channel.address.messageId
   if (!messageId) throw new Error('Missing Feishu reply target')
   const text = checkedImText(message.text)
-  // Acknowledgements should be visible in the main chat; keep results and follow-ups in their original topic.
+  // Acknowledgements stay in the main chat; other messages keep the existing threaded default unless the core chose a location.
+  const replyInThread = message.replyInThread ?? message.kind !== 'acknowledgement'
   const reply = ['im', '+messages-reply', '--message-id', messageId, '--markdown', text,
-    ...(message.kind === 'acknowledgement' ? [] : ['--reply-in-thread']), '--idempotency-key', message.id]
+    ...(replyInThread ? ['--reply-in-thread'] : []), '--idempotency-key', message.id]
   try { await host.commands.lark(reply) }
   catch (error) {
     if (gone(error)) return 'gone'

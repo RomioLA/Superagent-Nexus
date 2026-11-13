@@ -157,8 +157,27 @@ describe('Source registry', () => {
     const run = vi.spyOn(commands, 'run').mockResolvedValue('{"ok":true,"data":{}}')
     const reply: OutboundMessage = { id: 'reply-1', channel, text: 'Done', kind: 'reply' }
     expect(await sources.send(reply, commands)).toBe('sent')
-    expect(run.mock.calls[0]![1]).toEqual(expect.arrayContaining(['+messages-reply', '--message-id', 'om_dm']))
+    expect(run.mock.calls[0]![1]).toEqual(expect.arrayContaining(['+messages-reply', '--message-id', 'om_dm', '--reply-in-thread']))
     expect(run).toHaveBeenCalledTimes(1)
+  })
+  it('honors status reply placement while preserving reply and acknowledgement defaults', async () => {
+    const sources = new SourceRegistry(() => SettingsSchema.parse({}))
+    sources.register(feishuKind)
+    const commands = new Commands(() => testDeployment(), {}, new AbortController().signal)
+    const run = vi.spyOn(commands, 'run').mockResolvedValue('{"ok":true,"data":{}}')
+    const channel = feishuChannel('oc_dm', 'om_dm', true)
+    const send = async (message: OutboundMessage) => {
+      expect(await sources.send(message, commands)).toBe('sent')
+      return run.mock.calls.at(-1)![1]
+    }
+
+    const mainStatus = await send({ id: 'status-main', channel, text: 'Status', kind: 'reply', replyInThread: false })
+    expect(mainStatus).toEqual(expect.arrayContaining(['+messages-reply', '--message-id', 'om_dm']))
+    expect(mainStatus).not.toContain('--reply-in-thread')
+    const topicStatus = await send({ id: 'status-topic', channel, text: 'Status', kind: 'reply', replyInThread: true })
+    expect(topicStatus).toContain('--reply-in-thread')
+    const ordinaryReply = await send({ id: 'ordinary-reply', channel, text: 'Answer', kind: 'reply' })
+    expect(ordinaryReply).toContain('--reply-in-thread')
   })
   it('keeps the final result in its topic and notifies the originating direct chat', async () => {
     const sources = new SourceRegistry(() => SettingsSchema.parse({}))

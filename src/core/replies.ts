@@ -140,8 +140,11 @@ export class Replies extends EnginePart {
     if (!existing) {
       const chinese = /\p{Script=Han}/u.test(trigger.text) && !/[\p{Script=Hiragana}\p{Script=Katakana}]/u.test(trigger.text)
       const detail = ticketStatusText(ticket, chinese ? 'zh' : 'en')
+      const inThread = trigger.source === 'feishu' && ['rootId', 'parentId', 'threadId']
+        .some(field => typeof trigger.meta[field] === 'string' && trigger.meta[field] !== '')
       this.options.outbox.send({ id, channel: trigger.channel, kind: 'reply', ticketId: ticket.id,
         ...ticket.shortId ? { ticketShortId: ticket.shortId } : {},
+        ...trigger.source === 'feishu' ? { replyInThread: inThread } : {},
         text: `${ticketHeading(ticket, chinese)}\n\n` + (chinese ? '当前记录状态：' : 'Recorded status: ') + detail })
     }
     return { id, status: this.options.outbox.status(id) ?? 'pending', reused: existing !== undefined }

@@ -22,12 +22,29 @@ it('answers a busy Ticket status question immediately through native Reply/Outbo
   })
   expect(sent).toEqual({ status: 'sent' })
   const receipt = h.runtime.store.receipts.get(key('status', ticket.id, question.id))!
-  expect(receipt).toMatchObject({ status: 'sent', channel: question.channel, ticketId: ticket.id, kind: 'reply' })
+  expect(receipt).toMatchObject({ status: 'sent', channel: question.channel, ticketId: ticket.id, kind: 'reply', replyInThread: true })
   expect(receipt.text).toContain('仍在运行；尚不能确认执行正常或任务成功')
   expect(receipt.text).not.toContain('运行正常，已经完成')
   expect(receipt.channel.thread).toBe(`feishu:${CHAT}`)
   expect(receipt.channel.address.messageId).toBe('om_2')
   expect(h.candidates()).not.toContain(question.id)
+})
+
+it('answers a status query from the main private chat without changing the Ticket or starting work', async () => {
+  h = await startRuntime()
+  const { ticket, sessionId } = await h.acceptedTicket(feishu('1', '@bot inspect README', { chat_type: 'p2p', mentions: [] }))
+  const question = feishu('2', '查询工单的真实状态', { chat_type: 'p2p', mentions: [] })
+  h.runtime.store.triggers.save(question)
+  const assignments = h.runtime.store.tickets.get(ticket.id)!.assignments.map(item => item.id)
+  const ticketIds = h.runtime.store.tickets.list().map(item => item.id)
+
+  const reply = h.runtime.engine.reply(status(ticket.id, question.id))
+  const receipt = h.runtime.store.receipts.get(reply.id)!
+  expect(receipt).toMatchObject({ channel: question.channel, ticketId: ticket.id, kind: 'reply', replyInThread: false })
+  expect(receipt.text).toContain('仍在运行；尚不能确认执行正常或任务成功')
+  expect(h.runtime.store.tickets.list().map(item => item.id)).toEqual(ticketIds)
+  expect(h.runtime.store.tickets.get(ticket.id)!.assignments.map(item => item.id)).toEqual(assignments)
+  expect(h.agents.get(sessionId)!.status).toBe('running')
 })
 
 it('deduplicates status answers across wording and state changes, while a new question gets current state', async () => {
