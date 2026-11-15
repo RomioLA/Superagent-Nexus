@@ -449,6 +449,9 @@ it('routes by task fit instead of defaulting every unspecified task to DSH', () 
   expect(route).not.toContain('For unspecified execution choose')
   // An explicit person requirement stays authoritative, and otherwise the Router judges an authorized backend by task fit.
   expect(dispatch).toContain('must never be overridden')
+  expect(dispatch).toContain('Named Harness/model requirements are a single hard constraint and must never be overridden; use structured harness per accept/task')
+  expect(dispatch).toContain('With no Harness/model named and several authorized legal candidates, Router may pass auto_route (candidates + quality context)')
+  expect(dispatch).toContain('accept selects by comparable validated quality, then legal configured priority')
   expect(dispatch).toContain('choose the authorized backend and model that fit the task instead of a fixed default')
   expect(dispatch).toContain('a more capable model for complex coding, cross-module edits or architecture')
   // A reported resource figure counts; an unknown stays unknown, and no subjective preference becomes a quality score.

@@ -328,7 +328,7 @@ export interface Ticket {
  */
 export interface Follow { thread: string; own: boolean; closed?: { at: string; outcome: 'merged' | 'closed' } }
 /**
- * Trustworthy usage a Harness CLI reported for one run. Each field is written only when the CLI named it; a metric the CLI
+ * Trustworthy usage a native adapter or Harness CLI reported for one run. Each field is written only when the source named it; a metric it
  * did not return stays absent (unknown) rather than being estimated. Cost is never inferred from tokens.
  */
 export interface HarnessUsage {
@@ -341,19 +341,21 @@ export interface HarnessUsage {
   costUSD?: number
 }
 /**
- * One actual Harness CLI call made inside a Ticket's worker, as real execution evidence.
- * It records the request (Harness and model alias) and only what the CLI verifiably returned: a served model, usage, and IDs.
+ * One actual native model attempt or delegated Harness CLI call, as real execution evidence.
+ * It records the request and only what the execution source verifiably returned: a served model, usage, and IDs.
  * `assignmentId` ties it to the DSH worker Assignment that made the call, so the worker is the parent agent and the Harness is
  * the executing member. A team result never splits into per-member success here; each record is one member's actual call.
  */
 export interface HarnessRun {
   assignmentId: string
-  harness: 'agy' | 'codex' | 'grok'
+  harness: 'dsh' | 'agy' | 'codex' | 'grok'
+  /** Native provider route, as recorded on the response's source; not a served-model identity. */
+  provider?: string
   /** The model or alias the caller asked the Harness for; absent when the caller named none. */
   model?: string
-  /** Full model identifier requested from the CLI, when known; distinct from its reported served model. */
+  /** Model identifier on the actual request, when known; distinct from the reported served model. */
   requestedModel?: string
-  /** A model the CLI itself reported as served, only when it named exactly one; otherwise unknown. */
+  /** A model the execution source itself reported as served; absent means unknown, never the requested model by default. */
   servedModel?: string
   /** Every model the CLI reported using, when it named them. */
   models?: string[]
@@ -368,9 +370,11 @@ export interface HarnessRun {
   turns?: number
   writeEvidence?: { changedFiles: number; completedEditCalls: number }
   sessionId?: string
+  /** Native Session settlement event sequence; sessionId and at locate it even if the Session was later recreated. */
+  eventSeq?: number
   requestId?: string
   usage?: HarnessUsage
-  /** When this record was written (ISO 8601). */
+  /** When the source event occurred, or a CLI record was written (ISO 8601). */
   at?: string
 }
 export interface QualityReview {
@@ -386,7 +390,7 @@ export interface Execution {
   assignment: string
   harness?: import('./ports.ts').HarnessSpec
   project?: import('./ports.ts').ProjectTarget
-  /** The latest successfully finished Harness call; kept for older readers and the ready-report gate. */
+  /** The latest successfully finished delegated Harness call; kept for older readers and the ready-report gate. */
   harnessRun?: HarnessRun
   /** Every actual Harness call for this Ticket in order, newest last; a later call never replaces an earlier one. */
   harnessRuns?: HarnessRun[]

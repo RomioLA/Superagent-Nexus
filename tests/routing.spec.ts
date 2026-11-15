@@ -265,6 +265,17 @@ it('adjusts comparable quality order while quota exhaustion/restoration leaves h
   expect(rankRouteCandidates(qualityCandidates, options).selected?.candidate.harness).toBe('codex')
   expect(qualityReviews[1]?.verdict).toBe('meets')
 })
+it.each(['required', 'forbidden', '4a', 'exhausted', 'rate-limited'] as const)('better comparable quality cannot bypass %s', constraint => {
+  const candidates = qualityCandidates.map(row => ({ ...row }))
+  if (constraint === 'required') candidates[0]!.required = true
+  if (constraint === 'forbidden') candidates[1]!.forbidden = true
+  if (constraint === '4a') candidates[1] = { ...candidates[1]!, harness: 'agy', model: '4a' }
+  if (constraint === 'exhausted' || constraint === 'rate-limited')
+    candidates[1]!.reading = { state: constraint, evidence: `known ${constraint}` }
+  const reviews = qualityReviews.map(row => constraint === '4a' && row.harness === 'codex' ? { ...row, harness: 'agy' as const, model: '4a' } : row)
+  const result = rankRouteCandidates(candidates, { quality: { context: qualityContext, reviews, origin: 'fixture' } })
+  expect(result.selected?.candidate.harness).toBe('grok')
+})
 it('keeps fixtures, uncalibrated reviews, different difficulty/model/Harness out of live quality ranking', () => {
   expect(rankRouteCandidates(qualityCandidates, { quality: { context: qualityContext, reviews: qualityReviews } }).selected?.candidate.harness).toBe('grok')
   const renamed = qualityCandidates.map(row => row.harness === 'codex' ? { ...row, model: 'new-model' } : row)

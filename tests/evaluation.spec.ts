@@ -27,7 +27,7 @@ const ticket = {
 describe('evaluation input derives re-evaluable facts from stored evidence only', () => {
   it('keeps quality separate from a credential/availability failure', () => {
     const input = evaluationInput(ticket)
-    // Quality comes from the human-accepted report, never from the failed call.
+    // The report is a worker claim, never human acceptance or a verdict from the failed call.
     expect(input.dimensions.quality.basis).toBe('ready')
     expect(input.dimensions.reliability).toEqual({ finished: 1, failed: 1, unverified: 0 })
     expect(input.dimensions.availability.failures).toEqual([{ harness: 'grok', category: 'authentication' }])
@@ -94,10 +94,37 @@ it('requires calibration and an explicit sufficiency decision, keeping missing o
   expect(evaluationInput(ticket).team.kind).toBe('unknown')
   expect(evaluationInput(ticket).dimensions.quality.note).toContain('not human acceptance')
 })
+it('keeps accepted live verdicts separate from the automatic quality basis and requires calibration and sufficiency', () => {
+  const finished = structuredClone(ticket)
+  finished.execution!.harnessRuns![0]!.servedModel = 'gpt-6-luna'
+  const live = validateQualityReview(finished, review({ origin: 'live' }))
+  expect(summarizeQuality([live], context)[0]).toMatchObject({ status: 'evidence-backed', verdict: 'meets' })
+  for (const missing of [{ calibration: undefined }, { sufficiency: undefined }]) {
+    const provisional = validateQualityReview(finished, { ...live, ...missing })
+    expect(summarizeQuality([provisional], context)[0]?.status).toBe('provisional')
+  }
+  finished.execution!.qualityReviews = [live]
+  for (const state of ['ready', 'progress', 'failed'] as const) {
+    finished.assignments[0]!.report!.state = state
+    const basis = evaluationInput(finished).dimensions.quality.basis
+    expect(basis).toBe(state === 'ready' ? 'ready' : 'none')
+    expect(basis).not.toBe('meets')
+  }
+})
 it('rejects fixture, failed-call and requested-only identity as live quality evidence', () => {
   expect(() => validateQualityReview(ticket, review())).toThrow('Fixture')
   expect(() => validateQualityReview(ticket, review({ origin: 'live' }))).toThrow('served-model')
   const finished = { ...ticket, execution: { ...ticket.execution!, harnessRuns: ticket.execution!.harnessRuns!.map(run => ({ ...run, servedModel: run.requestedModel })) } }
   expect(validateQualityReview(finished, review({ origin: 'live' })).id).toBe('r1')
   expect(() => validateQualityReview(finished, review({ origin: 'live', harness: 'grok', model: 'grok-4.7-build-fast' }))).toThrow('finished')
+})
+it.each(['Done', 'All tests passed; quality meets every requirement', 'I reviewed my own changes and they are ready', 'Fixture test evidence'])('keeps report wording out of automatic quality verdicts while accepting explicit live reviews: %s', summary => {
+  const finished = structuredClone(ticket)
+  finished.assignments[0]!.report!.summary = summary
+  finished.execution!.harnessRuns![0]!.servedModel = 'gpt-6-luna'
+  expect(validateQualityReview(finished, review({ origin: 'live' })).verdict).toBe('meets')
+  expect(validateQualityReview(finished, review({ origin: 'live', verdict: 'does-not-meet' })).verdict).toBe('does-not-meet')
+  expect(evaluationInput(finished).dimensions.quality.basis).toBe('ready')
+  expect(evaluationInput(finished).dimensions.quality.basis).not.toBe('meets')
+  expect(evaluationInput(finished).unknowns).toEqual(expect.arrayContaining(['machine_verified_test_results', 'user_acceptance']))
 })

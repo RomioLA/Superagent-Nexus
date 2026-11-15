@@ -1,11 +1,12 @@
 /** DSH executor: manages one persistent worker session and workspace directory per ticket. */
 import type { Context } from '@deepseek-ai/cordis'
-import type { SessionId } from '@deepseek-ai/dsh-session'
+import type { Session, SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
+import { lastAssistantStreamChunk } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { mkdir, rmdir, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import { key, latestAssignment, latestReport, liveTicket, runningAssignment, threadKey, waitsForPerson } from '../core/index.ts'
-import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Executor, HarnessSpec, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
+import type { AssessmentOutcome, Assignment, EngineForExecutor, Execution, Executor, HarnessRun, HarnessSpec, Mandate, PolicyEffect, Ticket, TicketInput, Trigger }
   from '../core/index.ts'
 import type { Machine } from '../deployment.ts'
 import { runAsWorker, verifyDirectory } from '../infra/environment.ts'
@@ -254,6 +255,8 @@ export class DshExecutor implements Executor {
   private readonly personal = new Map<string, string>()
   /** The timers of workers that go on after a passing failure, which dispose clears. */
   private readonly timers = new Set<ReturnType<typeof setTimeout>>()
+  /** Bind an entered model step to its original Assignment before a continuation can replace it. No historical inference. */
+  private readonly nativeSteps = new WeakMap<Session, { turn: number; step: number; assignmentId: string }>()
   /** Registers launch and delivery handlers held while paused, and a watcher for in-flight external deployments. */
   constructor(private readonly host: ExecutorHost) {
     this.slots = new WorkerSlots(() => host.store.tickets.open().filter(ticket => this.running(ticket)).map(ticket => ticket.id),
@@ -522,9 +525,72 @@ export class DshExecutor implements Executor {
     const ticketId = ticketOfSession(agent.id)
     return ticketId === undefined ? undefined : this.host.store.tickets.get(ticketId)
   }
+  /** Record live native settlements in the existing Harness history; never replace the delegated ready-gate receipt. */
+  private nativeEvidence(session: Session, event: SessionEvent): void {
+    const ticketId = ticketOfSession(session.id)
+    if (ticketId === undefined || this.host.closing() || this.host.context.agents.get(session.id)?.session !== session) return
+    if (event.type === 'step/start') {
+      this.nativeSteps.delete(session)
+      const ticket = this.host.store.tickets.get(ticketId)
+      const assignment = ticket && liveTicket(ticket) ? runningAssignment(ticket) : undefined
+      if (assignment) this.nativeSteps.set(session, { ...event.data, assignmentId: assignment.id })
+      return
+    }
+    const step = this.nativeSteps.get(session)
+    if (!step) return
+    if (event.type === 'turn/end' || event.type === 'step/end') {
+      if (event.data.turn === step.turn && (event.type === 'turn/end' || event.data.step === step.step)) this.nativeSteps.delete(session)
+      return
+    }
+    if (event.type !== 'assistant/message' && event.type !== 'assistant/attempt') return
+    if (event.data.turn !== step.turn || event.data.step !== step.step) return
+    const finish = lastAssistantStreamChunk(event.data.stream, 'finish')?.reason
+    const source = event.type === 'assistant/message' ? event.data.message.source : undefined
+    const replay = source?.replayState as { response?: Record<string, unknown> } | undefined
+    const response = replay?.response
+    // The loop fills source.model from request.model. Only the pi-ai v2 responseModel is response-reported;
+    // its model/provider fields must agree with this exact message. Other adapters/versions remain unknown.
+    const servedModel = response?.kind === 'pi-ai' && response.version === 2
+      && response.provider === source?.provider && response.model === source?.model
+      && typeof response.responseModel === 'string' && response.responseModel.trim()
+      ? response.responseModel : undefined
+    const interrupted = event.type === 'assistant/message' && event.data.interrupted
+    const status = finish?.kind === 'error' ? 'failed'
+      : event.type === 'assistant/message' && !interrupted && (finish?.kind === 'stop' || finish?.kind === 'tool-calls') ? 'finished' : 'unverified'
+    const failure = finish?.kind === 'error' || finish?.kind === 'aborted' ? finish.failure : undefined
+    // Use only bounded, redacted provider failure text, as for delegated calls.
+    const error = failure?.message.replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
+      .replace(/\b(?:xai-|sk-)[A-Za-z0-9._-]{12,}\b/gi, '[redacted credential]')
+      .replace(/[\r\n\t ]+/g, ' ').trim().slice(0, 400)
+    const usage = event.type === 'assistant/message' ? event.data.usage : lastAssistantStreamChunk(event.data.stream, 'usage')?.usage
+    const run: HarnessRun = {
+      harness: 'dsh', assignmentId: step.assignmentId, sessionId: session.id, eventSeq: event.seq,
+      status, at: new Date(event.time).toISOString(),
+      ...(source?.provider ? { provider: source.provider } : {}),
+      ...(source?.model ? { requestedModel: source.model } : {}),
+      ...(servedModel ? { servedModel } : {}),
+      ...(failure?.requestId ? { requestId: failure.requestId } : {}),
+      ...(error ? { error } : {}),
+      ...(usage ? { usage: { inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
+        ...(usage.totalTokens !== undefined ? { totalTokens: usage.totalTokens } : {}),
+        ...(usage.cacheReadTokens !== undefined ? { cacheReadTokens: usage.cacheReadTokens } : {}) } } : {}),
+    }
+    this.host.store.atomic(() => {
+      const ticket = this.host.store.tickets.get(ticketId)
+      if (!ticket?.execution || !ticket.assignments.some(item => item.id === step.assignmentId)) return
+      const runs = ticket.execution.harnessRuns ?? (ticket.execution.harnessRun ? [ticket.execution.harnessRun] : [])
+      if (runs.some(item => item.harness === 'dsh' && item.sessionId === session.id && item.eventSeq === event.seq && item.at === run.at)) return
+      ticket.execution.harnessRuns = [...runs, run]
+      this.host.store.tickets.save(ticket)
+    })
+  }
   /** Subscribes to host `agent/status`, `agent/inbox/claimed`, `session/event` and `agent/error` events for worker sessions. Call once at startup. */
   install(): void {
     const ctx = this.host.context
+    this.disposers.push(ctx.on('session/event', (session, event) => {
+      try { this.nativeEvidence(session, event) }
+      catch (error) { void this.background(Promise.reject(error)) }
+    }))
     this.disposers.push(ctx.on('agent/status', ({ agent, status }) => {
       // A turn that starts ends the look at its worker's background work; the turn's own idle looks afresh.
       if (status === 'running') { this.settling.get(ticketOfSession(agent.id) ?? '')?.abort(); return }

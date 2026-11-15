@@ -2,8 +2,8 @@
  * Lightweight, explainable resource-aware candidate ordering for the Router (P1-S7).
  *
  * It only consumes trustworthy values that a source actually reported. A value the source did not return stays `unknown`
- * and never becomes a number, so no cost, quota or cache score is invented. Real quality scoring and dynamic learning are
- * deferred to S9: this is a temporary, transparent rule set — not a second Router, Queue, database or scoring service.
+ * and never becomes a number, so no cost, quota or cache score is invented. Comparable validated reviews can reorder
+ * evidence-backed candidates; incomplete quality remains provisional.
  *
  * The rules are deliberately narrow:
  *  - A person's explicit requirement (a named Harness/model, `forbid4a`, "no fallback") is authoritative over any advice.
@@ -232,6 +232,7 @@ export function rankRouteCandidates(candidates: readonly RouteCandidate[], optio
   // when no required candidate is itself selectable.
   const pool = required.length ? (requiredSelectable.length ? requiredSelectable : options.allowFallback === true ? selectable : []) : selectable
   const ranked = [...pool].sort(compare)
+  const configuredSelection = ranked[0]
   const quality = options.quality ? summarizeQuality(options.quality.reviews, options.quality.context, options.quality.origin) : []
   const standing = (item: CandidateEvaluation) => quality.find(row => row.harness === item.candidate.harness && row.model === item.candidate.model)
   // Keep unknown candidates in their configured slots; only comparable evidence-backed candidates change places.
@@ -248,9 +249,13 @@ export function rankRouteCandidates(candidates: readonly RouteCandidate[], optio
   const parts: string[] = []
   if (selected) {
     const label = selected.candidate.model ? `${selected.candidate.harness}/${selected.candidate.model}` : selected.candidate.harness
-    parts.push(standing(selected)?.status === 'evidence-backed'
+    parts.push(selected.candidate.required
+      ? `Selected ${label} by user-specified requirement`
+      : selected !== configuredSelection || selected.candidate.priority === undefined
       ? `Selected ${label} using comparable calibrated quality evidence (${options.quality!.context.ruleVersion}); availability remains independent`
       : `Selected ${label} by configured priority ${selected.candidate.priority}${selected.candidate.reading?.state === 'available' ? ' with a known available reading' : ' with availability unknown'}`)
+    if (excluded.some(item => item.excludedBecause === 'exhausted' || item.excludedBecause === 'rate-limited'))
+      parts.push('resource state excludes known unavailable candidates')
   } else if (ranked.length) {
     parts.push('No trustworthy priority: only resource evidence is reported')
   } else if (required.length) {

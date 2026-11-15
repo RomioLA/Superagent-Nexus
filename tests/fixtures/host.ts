@@ -269,7 +269,7 @@ export async function startRuntime(seed?: (store: Store) => void) {
   }
   /** Route one decision with the main Session's orchestrator_route, answering its result; a refused one throws its reason. */
   async function route(item: Record<string, unknown>): Promise<Record<string, unknown>> {
-    if (item.kind === 'accept' && !item.harness && !item.tasks) item = { ...item, harness: { harness: 'dsh' } }
+    if (item.kind === 'accept' && !item.harness && !item.tasks && !item.auto_route) item = { ...item, harness: { harness: 'dsh' } }
     const { results } = await runTool(runtime.masterId, 'orchestrator_route', { decisions: [item] }) as { results: Record<string, unknown>[] }
     if (results[0]!.refused) throw new Error(String(results[0]!.refused))
     return results[0]!
