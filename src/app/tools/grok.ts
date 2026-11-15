@@ -39,6 +39,10 @@ export interface GrokRunResult {
   write_evidence?: { changedFiles: number; completedEditCalls: number }
   /** Model text retained separately when workspace evidence cannot verify its claimed write. */
   model_summary?: string
+  /** `limit_reached` means a model turn limit kept its partial changes; it is not a failed Ticket. */
+  status?: 'finished' | 'limit_reached'
+  /** A bounded reason when the call did not complete, such as a model turn limit. */
+  error?: string
 }
 
 export type GrokDiagnosticPhase = 'startup' | 'model_error' | 'waiting_model_response' | 'assistant_response' |
@@ -113,7 +117,7 @@ function cleanId(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim().slice(0, 160) : undefined
 }
 
-/** Parse only Grok's documented terminal JSON envelope; modelUsage must record a real Grok model call. */
+/** Parse Grok's terminal JSON envelope; absent model usage leaves the served model unknown rather than failing the run. */
 export function parseGrokOutput(output: string): Omit<GrokRunResult, 'cli_version'> {
   let result: unknown
   try { result = JSON.parse(output) } catch {
@@ -134,14 +138,11 @@ export function parseGrokOutput(output: string): Omit<GrokRunResult, 'cli_versio
     ? Object.entries(modelUsage)
       .filter(([name, raw]) => {
         const usage = record(raw)
-        return name.startsWith('grok-') && positive(usage?.modelCalls) !== undefined
+        return Boolean(name.trim()) && positive(usage?.modelCalls) !== undefined
       })
       .map(([name]) => name)
       .sort()
     : []
-  if (!models.includes(GROK_BUILD_MODEL)) {
-    throw new Error('Grok did not report the requested model ' + GROK_BUILD_MODEL + ' in modelUsage; execution is unverified.')
-  }
 
   const rawUsage = record(data.usage)
   const rows = models.map(name => record(modelUsage?.[name])).filter((row): row is Record<string, unknown> => row !== undefined)
@@ -531,9 +532,24 @@ export async function runTicketGrok(directory: string, ticketId: string, task: s
     if (missingCli(error)) throw new Error('Grok Build CLI disappeared before the run started. ' + installHint)
     throw error
   }
+  // A model turn limit is checked before exit-code handling and parsing: it can arrive with exit 0 or non-zero, and it is
+  // not a failed execution. Keep partial changes and let the Worker decide how to continue.
+  const limited = observer?.report().phase === 'execution_limit' || /max_turns_reached/.test(run.stdout)
+  if (limited) {
+    const limit = limits.max_turns ?? GROK_DEFAULT_MAX_TURNS
+    let writeEvidence: { changedFiles: number; completedEditCalls: number } | undefined
+    if (before) {
+      const after = await workspaceEvidence(workspace, env)
+      writeEvidence = { changedFiles: changedFiles(before, after),
+        completedEditCalls: observer?.report().toolCalls.filter(call =>
+          ['search_replace', 'write', 'write_file', 'hashline_edit'].includes(call.tool) && call.status === 'completed').length ?? 0 }
+    }
+    return { status: 'limit_reached',
+      summary: 'Grok reached max_turns=' + limit + '; partial workspace changes are kept. Inspect them and continue the remaining work with another orchestrator_grok call for the same Ticket; a model turn limit does not fail the Ticket.',
+      error: 'max_turns_reached (max_turns=' + limit + ')', requested_model: GROK_BUILD_MODEL, models: [], cli_version: cliVersion,
+      ...(writeEvidence ? { write_evidence: writeEvidence } : {}) }
+  }
   if (run.exitCode !== 0) {
-    if (observer?.report().phase === 'execution_limit' || /max_turns_reached/.test(run.stdout))
-      throw new Error('Grok execution limit reached (max_turns=' + (limits.max_turns ?? GROK_DEFAULT_MAX_TURNS) + '); inspect partial workspace changes before retrying.')
     const evidence = run.stdout + '\n' + run.stderr
     if (isGrokAuthFailure(evidence)) {
       throw new Error('Grok authentication failed for this Ticket. Sign in once as the deployment user (`grok login`, writing ~/.grok/auth.json) so later Tickets reuse it, or sign in to this Ticket\'s isolated profile with GROK_HOME="' +
@@ -579,7 +595,7 @@ export function ticketGrokTool(ticket: Ticket, control: { timeoutMs?: number } =
       const directory = ticket.execution?.directory
       if (!directory) throw new Error('Native Ticket has no prepared workspace')
       const result = await runTicketGrok(directory, ticket.id, args.task, args, signal, control.timeoutMs)
-      return { status: args.mode === 'write' && !result.write_evidence?.changedFiles ? 'unverified' : 'finished', ...result }
+      return { ...result, status: (result as { status?: string }).status === 'limit_reached' ? 'limit_reached' : args.mode === 'write' && !result.write_evidence?.changedFiles ? 'unverified' : 'finished' }
     },
   } satisfies Tool<typeof grokArgs>
 }

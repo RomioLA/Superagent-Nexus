@@ -9,9 +9,11 @@ import { feishuTriggerId } from '../sources/feishu-trigger.ts'
 import { ASSIGNMENTS, INPUTS, assignmentLine, decisionCard, decisionDetails, inputLine, newestPage, preview, textPage, threadCard, ticketCard,
   ticketDetails, triggerCard, type TicketThread } from './cards.ts'
 import { threadTitle } from './views/records.ts'
+import { ticketStatusCountsOf } from './views/tickets.ts'
 import { transcriptEntry } from './context.ts'
 import { builtInParts, defaultPrompts } from './prompts.ts'
-import { summarizeCodexQuotaSignals, summarizeRoutingSignals } from './routing.ts'
+import { diffModelSurface, summarizeCodexQuotaSignals, summarizeRoutingSignals, type ModelSurfaceSnapshot } from './routing.ts'
+import { evaluationInput } from './evaluation.ts'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Commands } from '../infra/commands.ts'
 import type { PromptVersion, Prompts } from './prompts.ts'
@@ -25,12 +27,13 @@ import type { TextCache } from './cache.ts'
 export const RESOURCES: readonly { name: string; holds: string; executor?: true }[] = [
   { name: 'tickets', holds: 'ticket cards, newest first; a card\'s state is person/review after a ready report, person/blocked or person/failed after those reports, person/answer with a question, person/delivery when an input could not reach the worker, working or working/queued while it works, idle once the worker ended its turn without a report, else how the ticket ended' },
   { name: 'triggers', holds: 'trigger cards with where each went, newest first' },
+  { name: 'status', holds: 'open ticket counts by native stage: executing, queued, waitingPerson, followUp, plus open and ended totals and whether any open ticket remains' },
   { name: 'threads', holds: 'subscribed threads, newest activity first, with their labels, tickets, current assessment and polling errors' },
   { name: 'thread/<key>', holds: 'one thread: its label and link, its tickets and latest decisions, and its triggers, newest first', executor: true },
   { name: 'decisions', holds: 'decisions, newest first' },
   { name: 'decision/<id>', holds: 'one decision with its audit' },
-  { name: 'ticket/<id>', holds: 'a ticket\'s card, the trigger, decision and threads it is tied to, its latest assignments with the start of each '
-    + 'report, and its inputs, newest first', executor: true },
+  { name: 'ticket/<id>', holds: 'ticket card, current constraints, origin, threads, reports and inputs', executor: true },
+  { name: 'ticket/<id>/evidence', holds: 'execution identity, corrections and versioned reviews', executor: true },
   { name: 'ticket/<id>/assignment', holds: 'its assignment text', executor: true },
   { name: 'ticket/<id>/assignments', holds: 'its assignments, newest first, with the start of each report', executor: true },
   { name: 'ticket/<id>/inputs', holds: 'its inputs, newest first', executor: true },
@@ -135,6 +138,7 @@ const ROUTES: readonly Route[] = [
     const threads = store.read.subscribedThreads().sort((a, b) => (b.lastAt ?? b.createdAt).localeCompare(a.lastAt ?? a.createdAt))
     return list(read, (offset, count) => threads.slice(offset, offset + count).map(thread => threadCard(thread, threadTitle(store, thread))))
   }],
+  ['status', read => ticketStatusCountsOf(main(read).store)],
   ['thread/', read => {
     const { host, rest, ticketId } = read
     const thread = host.store.threads.get(rest)
@@ -198,9 +202,29 @@ const ROUTES: readonly Route[] = [
     const roles = { orchestrator: settings.eval.model, worker: settings.executor.model }
     const magpie = host.magpie ? await host.magpie() : { status: 'not-configured' }
     const codexQuota = host.codexQuota ? await host.codexQuota(read.signal) : { status: 'unknown', error: 'reader-not-configured' }
+    const routing = summarizeRoutingSignals(magpie)
+    // Report what this refresh read versus the previous one, and keep an unreadable source visible as unknown.
+    const statusOf = (value: unknown): string => {
+      const status = value && typeof value === 'object' ? (value as { status?: unknown }).status : undefined
+      return typeof status === 'string' ? status : 'unknown'
+    }
+    let snapshot: ModelSurfaceSnapshot = {
+      catalog: catalog.groups.flatMap(group => group.models.map(model => `${group.id}/${model.id}`)),
+      availability: Object.fromEntries(routing.observed_channels.map(channel => [`${channel.harness}:${channel.model}`, channel.availability])),
+      sources: { catalog: catalog.failures.length ? 'failed' : 'ok', magpie: statusOf(magpie), codex: statusOf(codexQuota) },
+    }
+    const previous = host.pages?.get(`${read.sessionId}:model-surface`)
+    const prior = previous ? JSON.parse(previous) as ModelSurfaceSnapshot : undefined
+    const refresh = diffModelSurface(prior, snapshot)
+    // A failed catalog read keeps the successful catalog baseline while other sources still advance their own snapshot.
+    if (snapshot.sources.catalog !== 'ok') snapshot = { ...snapshot, catalog: prior?.catalog ?? [] }
+    host.pages?.set(`${read.sessionId}:model-surface`, JSON.stringify(snapshot))
     return { default: catalog.default, roles, failures: catalog.failures,
       providers: catalog.groups.map(group => ({ id: group.id, name: group.name, count: group.models.length, read: `models/${group.id}` })),
-      magpie, codex_quota: codexQuota, routing: summarizeRoutingSignals(magpie), codex_routing: summarizeCodexQuotaSignals(codexQuota) }
+      magpie, codex_quota: codexQuota, routing, codex_routing: summarizeCodexQuotaSignals(codexQuota),
+      quality_reviews: host.store.tickets.list().flatMap(ticket => (ticket.execution?.qualityReviews ?? []).map(review => ({ ticket_id: ticket.id, ...review }))),
+      quality_status: 'Provisional unless exact live identity, comparable context, calibrated review and sufficiency evidence exist; use orchestrator_rank_candidates.',
+      refresh: { first: previous === undefined, ...refresh } }
   }],
   ['models/', async read => {
     const models = (await main(read).context.sessionController.modelCatalog()).groups.find(group => group.id === read.rest)?.models
@@ -259,7 +283,7 @@ const ROUTES: readonly Route[] = [
         ({ thread: key, ...context ? { context: true } : {}, ...bound.has(key) ? { bound: true } : {} })
       const threads = [...subscribed.map(thread => marked(thread.key, !!thread.context?.includes(ticketKey))),
         ...[...bound].filter(key => !subscribed.some(thread => thread.key === key)).map(key => marked(key, false))]
-      return { ...ticketDetails(ticket, threads, batchOf(host, ticket), !!ticketId), ...retry }
+      return { ...ticketDetails(ticket, threads, batchOf(host, ticket), !!ticketId), harness: ticket.execution?.harness, evidence: `ticket/${ticket.id}/evidence`, ...retry }
     }
     if (section === 'assignments' || section === 'inputs') {
       if (part !== undefined) throw new Error('Unknown context resource')
@@ -288,6 +312,9 @@ const ROUTES: readonly Route[] = [
       if (!report) throw new Error('Unknown assignment report')
       body = report.summary
     } else if (part !== undefined) throw new Error('Unknown context resource')
+    else if (section === 'evidence') body = JSON.stringify({ harness: ticket.execution?.harness, continuations: ticket.execution?.continuations ?? [],
+      harnessRuns: ticket.execution?.harnessRuns ?? (ticket.execution?.harnessRun ? [ticket.execution.harnessRun] : []),
+      qualityReviews: ticket.execution?.qualityReviews ?? [], evaluation: evaluationInput(ticket) })
     else if (section === 'assignment') body = ticket.execution?.assignment ?? ''
     else if (section === 'result') body = latestReport(ticket)?.summary ?? ''
     else if (section === 'transcript') {

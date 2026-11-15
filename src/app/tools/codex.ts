@@ -17,6 +17,13 @@ const toolArgs = z.object({
 
 const maxCapture = 16000
 
+export function codexCliArgs(options: { mode: 'read-only' | 'write'; reasoning?: 'low' | 'medium' | 'high'; model?: string },
+  workspace: string, resultPath: string): string[] {
+  return ['exec', '-C', workspace, '--sandbox', options.mode === 'write' ? 'workspace-write' : 'read-only', '--ephemeral',
+    ...(options.model ? ['--model', options.model] : []),
+    '-c', 'model_reasoning_effort="' + (options.reasoning ?? (options.mode === 'write' ? 'medium' : 'low')) + '"', '-o', resultPath, '-']
+}
+
 export function reportedCodexTokens(log: string): number | undefined {
   const found = [...log.matchAll(/tokens\s+used\s*[:：]?\s*([\d,]+)/gi)].at(-1)?.[1]
   if (!found) return
@@ -24,8 +31,8 @@ export function reportedCodexTokens(log: string): number | undefined {
   return Number.isSafeInteger(tokens) && tokens > 0 ? tokens : undefined
 }
 export async function runTicketCodex(directory: string, ticketId: string, task: string,
-  options: { mode: 'read-only' | 'write'; reasoning?: 'low' | 'medium' | 'high' },
-  signal: AbortSignal): Promise<{ summary: string; tokens?: number }> {
+  options: { mode: 'read-only' | 'write'; reasoning?: 'low' | 'medium' | 'high'; model?: string },
+  signal: AbortSignal): Promise<{ summary: string; tokens?: number; requested_model?: string }> {
   signal.throwIfAborted()
   const workspace = await realpath(directory)
   if (workspace !== directory || !(await stat(workspace)).isDirectory()) throw new Error('Ticket workspace unavailable')
@@ -37,8 +44,6 @@ export async function runTicketCodex(directory: string, ticketId: string, task: 
   const codexHome = await prepareCodexHome(root)
   const base = await mkdtemp(join(tmp, 'run-'))
   const resultPath = join(base, 'final.txt')
-  const mode = options.mode === 'write' ? 'workspace-write' : 'read-only'
-  const reasoning = options.reasoning ?? (options.mode === 'write' ? 'medium' : 'low')
   const prompt = [
     'Work ONLY in the current DSH Ticket workspace.',
     options.mode === 'write' ? 'Implement the requested code change, but do NOT run git branch, commit, push, merge or gh PR commands. The parent DSH Executor handles review and delivery.'
@@ -54,8 +59,7 @@ export async function runTicketCodex(directory: string, ticketId: string, task: 
   try {
     const merged = AbortSignal.any([signal, AbortSignal.timeout(12 * 60_000)])
     const exitCode = await new Promise<number | null>((resolve, reject) => {
-      const child = spawn(cli, ['exec', '-C', workspace, '--sandbox', mode, '--ephemeral',
-        '-c', 'model_reasoning_effort="' + reasoning + '"', '-o', resultPath, '-'], {
+      const child = spawn(cli, codexCliArgs(options, workspace, resultPath), {
         cwd: workspace,
         stdio: ['pipe', 'pipe', 'pipe'],
         detached: process.platform !== 'win32',
@@ -82,7 +86,8 @@ export async function runTicketCodex(directory: string, ticketId: string, task: 
     const summary = (await readFile(resultPath, 'utf8')).trim()
     if (!summary) throw new Error('Codex finished without a summary')
     const tokens = reportedCodexTokens(output)
-    return { summary: summary.slice(0, 5500), ...(tokens !== undefined ? { tokens } : {}) }
+    return { summary: summary.slice(0, 5500), ...(tokens !== undefined ? { tokens } : {}),
+      ...(options.model ? { requested_model: options.model } : {}) }
   } finally {
     await rm(base, { recursive: true, force: true }).catch(() => {})
   }
@@ -90,13 +95,15 @@ export async function runTicketCodex(directory: string, ticketId: string, task: 
 export function ticketCodexTool(ticket: Ticket): Tool<typeof toolArgs> {
   return {
     name: 'orchestrator_codex',
-    description: 'Run Codex in THIS Ticket worktree (write/read-only); DSH owns Git/PR delivery. Inspect partial edits after failure. Tokens included when available.',
+    description: 'Run Codex in THIS Ticket worktree. Ticket model auto-binds via --model; no model argument needed. Never use shell Codex or edit shared config.toml. DSH owns Git/PR.',
     schema: toolArgs,
     execute: async (raw: unknown, signal: AbortSignal) => {
       const args = toolArgs.parse(raw)
       const directory = ticket.execution?.directory
       if (!directory) throw new Error('Native Ticket has no prepared workspace')
-      const outcome = await runTicketCodex(directory, ticket.id, args.task, args, signal)
+      // A structured Codex model binding is applied here from the Ticket's HarnessSpec, never a shared config write.
+      const bound = ticket.execution?.harness?.harness === 'codex' ? ticket.execution.harness.model : undefined
+      const outcome = await runTicketCodex(directory, ticket.id, args.task, { ...args, ...(bound ? { model: bound } : {}) }, signal)
       return { status: 'finished', ...outcome }
     },
   } satisfies Tool

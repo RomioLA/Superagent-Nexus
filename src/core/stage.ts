@@ -46,7 +46,7 @@ export function ticketStatusKey(ticket: Ticket): string {
 export const STATUS_TEXT: Readonly<Record<string, { zh: string; en: string }>> = {
   working: { zh: '仍在运行；尚不能确认执行正常或任务成功。', en: 'Still running; healthy execution or task success is not yet confirmed.' },
   'working/queued': { zh: '正在排队，尚未开始执行。', en: 'Queued; execution has not started.' },
-  idle: { zh: '当前空闲，尚不能确认任务成功。', en: 'Currently idle; task success is not confirmed.' },
+  idle: { zh: '当前空闲；本轮已结束、等待人工跟进，不代表后台任务仍在执行，也不代表任务成功。', en: 'Currently idle; this turn ended and awaits a follow-up, which does not mean background work is still running or that the task succeeded.' },
   'person/delivery': { zh: '消息未能送达执行器，需要处理投递问题。', en: 'Input delivery to the worker failed and needs attention.' },
   'person/answer': { zh: '正在等待人工回答。', en: 'Waiting for a human answer.' },
   'person/review': { zh: '已报告可供审核，正在等待人工审核。', en: 'Reported ready for human review.' },
@@ -62,4 +62,36 @@ export const STATUS_TEXT: Readonly<Record<string, { zh: string; en: string }>> =
 /** The state text for a ticket, in one language, from its native lifecycle facts. */
 export function ticketStatusText(ticket: Ticket, language: 'zh' | 'en'): string {
   return (STATUS_TEXT[ticketStatusKey(ticket)] ?? { zh: '当前状态未知。', en: 'Current state is unknown.' })[language]
+}
+
+export interface TicketStatusCounts {
+  executing: number;
+  queued: number;
+  waitingPerson: number;
+  followUp: number;
+  open: number;
+  ended: number;
+  hasOpen: boolean;
+}
+
+export function ticketStatusCounts(tickets: readonly Ticket[]): TicketStatusCounts {
+  let executing = 0, queued = 0, waitingPerson = 0, followUp = 0, open = 0, ended = 0;
+  for (const ticket of tickets) {
+    if (ticket.ended) {
+      ended++;
+      continue;
+    }
+    const s = ticketStage(ticket);
+    if (s.stage === 'person') {
+      waitingPerson++;
+    } else if (s.stage === 'idle') {
+      followUp++;
+    } else if (s.stage === 'working' && s.action === 'queued') {
+      queued++;
+    } else {
+      executing++;
+    }
+    open++;
+  }
+  return { executing, queued, waitingPerson, followUp, open, ended, hasOpen: open > 0 };
 }

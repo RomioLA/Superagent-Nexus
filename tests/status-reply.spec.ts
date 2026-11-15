@@ -117,7 +117,7 @@ it('refuses non-human, unrelated, context-only and non-answer status requests', 
 
 it.each([
   ['queued', 'Queued; execution has not started.'],
-  ['idle', 'Currently idle; task success is not confirmed.'],
+  ['idle', 'Currently idle; this turn ended and awaits a follow-up, which does not mean background work is still running or that the task succeeded.'],
   ['delivery', 'Input delivery to the worker failed'],
 ] as const)('reports %s from current state in the question language', async (state, expected) => {
   h = await startRuntime()
@@ -132,4 +132,19 @@ it.each([
   const reply = h.runtime.engine.reply(status(ticket.id, question.id))
   expect(h.runtime.store.receipts.get(reply.id)?.text).toContain(expected)
   expect(h.runtime.store.receipts.get(reply.id)?.text).not.toContain('任务状态')
+})
+
+it('routes an original-thread question about an ended Ticket to the Router without restarting its Worker', async () => {
+  h = await startRuntime()
+  const { ticket, sessionId } = await h.acceptedTicket(feishu('1', '@bot inspect this'))
+  await h.runTool(sessionId, 'orchestrator_report', { state: 'ready', summary: 'Inspection finished' })
+  await h.runtime.idle()
+  const count = h.runtime.store.tickets.get(ticket.id)!.assignments.length
+  const question = followup('891', '这个工单状态如何？')
+  h.runtime.receive(question); await h.runtime.idle()
+  expect(h.runtime.store.tickets.get(ticket.id)?.ended?.outcome).toBe('completed')
+  expect(h.runtime.store.tickets.get(ticket.id)?.assignments).toHaveLength(count)
+  expect(h.runtime.store.triggers.disposition(question.id)?.fanout).toEqual([])
+  h.runtime.engine.reply(status(ticket.id, question.id)); await h.runtime.sendReplies()
+  expect(h.runtime.store.receipts.get(key('status', ticket.id, question.id))?.text).toContain('已记录为完成')
 })

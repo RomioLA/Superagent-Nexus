@@ -202,7 +202,10 @@ async function drive(host: Host) {
   await runtime.pump()
   await runtime.idle()
   await run(workerA, 'orchestrator_report', { state: 'ready', summary: 'Done.' })
-  await runtime.receive(feishu('2', '再加一个按钮', { mentions: [], root_id: 'om_1' }))
+  const continuation = feishu('2', '再加一个按钮', { mentions: [], root_id: 'om_1' })
+  await runtime.receive(continuation)
+  // Idle Feishu follow-ups are classified by the Router before an explicit attach wakes the original Ticket.
+  await run(master, 'orchestrator_route', { decisions: [{ kind: 'attach', ticket_id: a, trigger_id: continuation.id }] })
   await vi.waitFor(async () => {
     await runtime.pump()
     expect(runtime.store.tickets.get(a)!.inputs.some(input => input.kind === 'resumed')).toBe(true)

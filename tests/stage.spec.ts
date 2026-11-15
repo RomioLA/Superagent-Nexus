@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { canRetry, ticketStage, type Assignment, type ReportState, type Ticket } from '../src/core/index.ts'
+import { canRetry, ticketStage, ticketStatusCounts, type Assignment, type ReportState, type Ticket } from '../src/core/index.ts'
 
 const assignment = (overrides: Partial<Assignment> = {}): Assignment => ({ id: 'a', state: 'running', createdAt: '', ...overrides })
 const reported = (state: ReportState, overrides: Partial<Assignment> = {}) => assignment({ report: { state, summary: '', at: '' }, ...overrides })
@@ -57,5 +57,25 @@ describe('canRetry', () => {
     const delivery = ticket({ ...answered, delivery: { error: 'offline', at: '' }, assignments: [reportedAt('failed')] })
     expect(ticketStage(delivery)).toEqual({ stage: 'person', action: 'delivery' })
     expect(canRetry(delivery)).toBe(true)
+  })
+})
+
+describe('ticketStatusCounts', () => {
+  it('partitions every open ticket into exactly one of the four categories, excluding ended tickets', () => {
+    const tickets = [
+      ticket({ id: 'exec' }), // running Assignment -> executing
+      ticket({ id: 'queued', assignments: [] }),
+      ticket({ id: 'answer', attention }),
+      ticket({ id: 'idle', assignments: [reported('waiting')] }),
+      ticket({ id: 'ended', ended, assignments: [reported('ready')] }),
+    ]
+    expect(ticketStatusCounts(tickets)).toEqual({
+      executing: 1, queued: 1, waitingPerson: 1, followUp: 1, open: 4, ended: 1, hasOpen: true,
+    })
+  })
+  it('reports no open ticket once every ticket has ended', () => {
+    expect(ticketStatusCounts([ticket({ ended, assignments: [reported('ready')] })])).toEqual({
+      executing: 0, queued: 0, waitingPerson: 0, followUp: 0, open: 0, ended: 1, hasOpen: false,
+    })
   })
 })

@@ -1,6 +1,6 @@
 /** Ticket list, ticket detail, mandate basis formatting, and executor load views. */
 import { liveTicket, threadKey, ticketStage, type AcceptMode, type AdmissionCell, type MandateBasis, type Ticket,
-  type TicketStage } from '../../core/index.ts'
+  type TicketStage, type TicketStatusCounts, ticketStatusCounts } from '../../core/index.ts'
 import { workerSessionId } from '../../executor/dsh.ts'
 import type { Store } from '../store.ts'
 import { channelLink, decisionView, newestFirst, page, snapshot, threadSummary, ticketLine, type Snapshot,
@@ -32,13 +32,25 @@ export function basisFacts(basis: MandateBasis, rule: Snapshot['rule']): { facts
   if (authority) facts.push({ name: 'legacyAuthority', value: authority })
   return { facts, legacy: authority !== undefined }
 }
-export function ticketList(host: ViewHost, stage: 'open' | TicketStage['stage'], offset: number, limit: number) {
+export type TicketListStage = 'open' | 'executing' | 'queued' | TicketStage['stage']
+/** Whether a ticket belongs to the requested list stage; `executing` and `queued` split the native `working` stage. */
+function inStage(ticket: Ticket, stage: TicketListStage): boolean {
+  if (stage === 'open') return liveTicket(ticket)
+  const current = ticketStage(ticket)
+  if (stage === 'executing') return current.stage === 'working' && current.action !== 'queued'
+  if (stage === 'queued') return current.stage === 'working' && current.action === 'queued'
+  return current.stage === stage
+}
+export function ticketList(host: ViewHost, stage: TicketListStage, offset: number, limit: number) {
   const view = snapshot(host)
   const { store } = view
-  const shown = (ticket: Ticket) => stage === 'open' ? liveTicket(ticket) : ticketStage(ticket).stage === stage
+  const shown = (ticket: Ticket) => inStage(ticket, stage)
   const tickets = (stage === 'ended' ? store.tickets.list() : store.tickets.open()).filter(shown).sort(newestFirst)
   const result = page(tickets, offset, limit)
   return { ...result, items: result.items.map(ticket => ticketRow(view, ticket)) }
+}
+export function ticketStatusCountsOf(store: Pick<Store, 'tickets'>): TicketStatusCounts {
+  return ticketStatusCounts(store.tickets.list())
 }
 export type TicketListView = ReturnType<typeof ticketList>
 export function ticketRow(view: Snapshot, ticket: Ticket) {
@@ -52,6 +64,12 @@ export interface ExecutorLoad { running: number; queued: number }
 export function executorLoad(store: Store, running: number): ExecutorLoad {
   const queued = (ticket: Ticket) => { const stage = ticketStage(ticket); return stage.stage === 'working' && stage.action === 'queued' }
   return { running, queued: store.tickets.open().filter(queued).length }
+}
+/** Count unresolved Tickets separately from occupied Worker slots; zero Workers does not mean all work ended. */
+export function taskSummary(store: Store, running: number) {
+  const load = executorLoad(store, running)
+  const open = store.tickets.open().length
+  return { ...load, waiting: Math.max(0, open - load.queued - running), hasWork: open > 0 || running > 0 }
 }
 export function ticketDetail(host: ViewHost, id: string) {
   const { store } = host

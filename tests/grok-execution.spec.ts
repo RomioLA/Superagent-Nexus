@@ -63,14 +63,18 @@ const args = { task: 'Create the target file' }
 const modelRuns = () => vi.mocked(spawn).mock.calls.filter(([, argv]) => (argv as string[]).includes('-p'))
 
 describe('native Grok execution without real model calls', () => {
-  it.each([0, 1])('reports the official limit at exit %s and allows a subsequent run in the same binding', async exit => {
+  it.each([0, 1])('reports the official limit at exit %s, keeps partial edits, and allows a subsequent run in the same binding', async exit => {
     outcome = async argv => {
       expect(argv[argv.indexOf('--max-turns') + 1]).toBe('3')
+      await writeFile(join(workspace, 'partial.txt'), 'partial edit before the limit')
       return { exit, events: [{ type: 'tool_call', toolCallId: 'read', toolName: 'read_file' },
         { type: 'max_turns_reached' }, { ...end, stopReason: 'max_turns_reached' }] }
     }
     const tool = ticketTool()
-    await expect(tool.execute({ ...args, max_turns: 3 }, new AbortController().signal)).rejects.toThrow('max_turns')
+    const limited = await tool.execute({ ...args, max_turns: 3 }, new AbortController().signal)
+    expect(limited).toMatchObject({ status: 'limit_reached', error: expect.stringContaining('max_turns'),
+      write_evidence: { changedFiles: 1 } })
+    expect(await readFile(join(workspace, 'partial.txt'), 'utf8')).toBe('partial edit before the limit')
     outcome = async argv => {
       expect(argv[argv.indexOf('--max-turns') + 1]).toBe('100')
       await writeFile(join(workspace, 'target.txt'), 'recovered edit')

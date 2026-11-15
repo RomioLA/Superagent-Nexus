@@ -42,6 +42,9 @@ export class Intake extends EnginePart {
         const followed = !!thread.context?.includes(ticketId)
         const resumes = trigger.human && ticket?.ended?.by !== 'human' && !followed
         if (!ticket || (!liveTicket(ticket) && !resumes)) continue
+        // Let the existing Router distinguish status questions from continuation before waking an idle Feishu worker.
+        // No keyword parser: explicit continue/attach is the native admission point after model intent classification.
+        if (trigger.human && trigger.source === 'feishu' && !followed && this.options.executor.active?.(ticket) === false) continue
         reached.set(ticketId, { ticket, context: followed && (reached.get(ticketId)?.context ?? true) })
       }
       this.repo.threads.save(thread)

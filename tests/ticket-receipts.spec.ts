@@ -1,6 +1,7 @@
+import { wordCount, IM_WORDS } from '../src/infra/text.ts'
 import { afterEach, expect, it, vi } from 'vitest'
 import { Commands } from '../src/infra/commands.ts'
-import { composeTicketReceipt, receiptStatusText } from '../src/app/receipts.ts'
+import { appendTaskSummary, composeTicketReceipt, receiptStatusText } from '../src/app/receipts.ts'
 import { key, shortDayKey, shortTicketId, UserError, type Ticket } from '../src/core/index.ts'
 import { CHAT, MEMBER, feishu, startRuntime, type Host } from './fixtures/host.ts'
 
@@ -167,4 +168,16 @@ it.each([
   await expect(h.route({ kind: 'attach', ticket_id: created.id, trigger_id: question.id })).rejects.toThrow('does not belong')
   expect(h.runtime.store.tickets.get(created.id)).toEqual(before)
   expect(h.runtime.store.threads.get(`feishu:${CHAT}:om_9`)?.subscriptions).toEqual([])
+})
+
+it('shows unresolved work with zero Workers and reserves the existing IM budget for the factual footer', () => {
+  const unfinished = appendTaskSummary('检查已结束', { running: 0, queued: 0, waiting: 3, hasWork: true }, true)
+  expect(unfinished).toContain('执行中 0，排队中 0，等待处理 3')
+  expect(unfinished).toContain('当前仍有工作')
+  expect(unfinished).not.toContain('全部任务已结束')
+  const done = appendTaskSummary('Done', { running: 0, queued: 0, waiting: 0, hasWork: false }, false)
+  expect(done).toMatch(/All current tasks have ended\.$/)
+  const long = appendTaskSummary('result '.repeat(100), { running: 1, queued: 2, waiting: 3, hasWork: true }, false)
+  expect(long).toMatch(/Work remains\.$/)
+  expect(wordCount(long)).toBeLessThanOrEqual(IM_WORDS)
 })

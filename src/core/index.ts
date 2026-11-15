@@ -6,6 +6,6 @@ export { Engine, type EngineForExecutor, type EngineForMainSession, type EngineF
 export { UserError, USER_ERRORS, type UserErrorCode } from './errors.ts'
 export { REASONS, reasonText, said, type Reason, type ReasonCode } from './reasons.ts'
 export { MemoryRepositories } from './memory.ts'
-export { canRetry, ticketHeading, ticketStage, ticketStatusKey, ticketStatusText, STATUS_TEXT, type TicketStage } from './stage.ts'
+export { canRetry, ticketHeading, ticketStage, ticketStatusCounts, ticketStatusKey, ticketStatusText, STATUS_TEXT, type TicketStage, type TicketStatusCounts } from './stage.ts'
 export { shortDayKey, shortTicketId } from './tickets.ts'
 export { key } from './ids.ts'

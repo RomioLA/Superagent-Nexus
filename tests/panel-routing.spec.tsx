@@ -1,0 +1,21 @@
+// @vitest-environment jsdom
+// The model routing page.
+import { expect, it } from 'vitest'
+import { zh } from '../src/client/locales.ts'
+import { usePanel, mount, tab, click, text } from './fixtures/panel.tsx'
+import { server } from './fixtures/panel-server.ts'
+
+usePanel()
+it('shows the model routing page from the shared routing view', async () => {
+  await mount()
+  await click(tab(zh['tab.models']))
+  expect(tab(zh['tab.models']).getAttribute('aria-selected')).toBe('true')
+  expect(server.requests.some(request => request.path === 'models/routing' && request.method === 'GET')).toBe(true)
+  // Channel identity, availability and remaining quota come from the routing projection, not a second table.
+  expect(text()).toContain('dsh/worker-model')
+  expect(text()).toContain('42')
+  expect(text()).toContain('Selected dsh/worker-model by configured priority 0')
+  expect(text()).toContain('Codex account availability is unknown')
+  // Quality is reported as insufficient rather than shown as a fabricated score.
+  expect(text()).toContain(zh.modelQualityInsufficient)
+})

@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { Engine, MemoryRepositories, UserError, followupOwners, key, runningAssignment, ticketOutcome, ticketStage,
   waitsForPerson } from '../src/core/index.ts'
 import type { Assessor, Assignment, Candidate, EngineOptions, Executor, OutboundMessage, Outcome, Policy, Ticket, Trigger } from '../src/core/index.ts'
+import { IM_WORDS, wordCount } from '../src/infra/text.ts'
 
 const member = { source: 'chat', id: 'alice' }
 const guest = { source: 'chat', id: 'guest' }
@@ -762,6 +763,101 @@ describe('interrupted assignments', () => {
     expect(running.deliveredAt! > running.report!.at).toBe(true)
     h.engine.assignmentInterrupted(other, running.id)
     expect(h.repo.tickets.get(other)!.assignments.map(item => item.state)).toEqual(['ended', 'pending'])
+  })
+  it('resumes an interrupted Feishu worker silently when there is no deployment notice', () => {
+    const h = harness()
+    const source = trigger('1', { source: 'feishu', threads: [{ source: 'feishu', id: 'oc_chat' }], text: '请修复部署失败通知问题',
+      channel: { source: 'feishu', thread: 'oc_chat', address: { message: 'om_1' } }, meta: { rootId: 'om_1' } })
+    h.engine.receive(source); h.pump()
+    const decision = h.decide(h.requests.at(-1)!, { kind: 'accept', title: 'Deploy', scope: 'small', reason: 'requested' })
+    h.settle()
+    const ticketId = decision.ticketId!
+    const running = runningAssignment(h.repo.tickets.get(ticketId)!)!
+    h.outbox.length = 0
+    h.engine.assignmentInterrupted(ticketId, running.id)
+    const ticket = h.repo.tickets.get(ticketId)!
+    expect(h.outbox).toEqual([])
+    // The worker still resumes: the ticket is not ended and its Assignment restarted with the recovery note.
+    expect(ticket.ended).toBeUndefined()
+    expect(ticket.assignments.map(item => item.state)).toEqual(['ended', 'pending'])
+    expect(ticket.inputs).toEqual([expect.objectContaining({ kind: 'text', text: expect.stringContaining('The host restarted') })])
+  })
+  it.each([
+    ['succeeded', '外部部署已完成'],
+    ['rolled_back', '外部部署失败，已回滚到原版本'],
+    ['rollback_failed', '外部部署失败，回滚也未成功，需要人工处理'],
+    ['aborted', '外部部署失败，已中止（未回滚）'],
+  ] as const)('queues one %s deployment receipt in the origin Feishu thread', (result, summary) => {
+    const h = harness()
+    const source = trigger('1', { source: 'feishu', threads: [{ source: 'feishu', id: 'oc_chat' }], text: '请修复部署失败通知问题',
+      channel: { source: 'feishu', thread: 'oc_chat', address: { message: 'om_1' } }, meta: { rootId: 'om_1' } })
+    h.engine.receive(source); h.pump()
+    const ticketId = h.decide(h.requests.at(-1)!, { kind: 'accept', title: 'Deploy', scope: 'small', reason: 'requested' }).ticketId!
+    h.settle()
+    h.outbox.length = 0
+    const eventId = '/releases/deploy-1'
+    h.engine.deployOutcome(ticketId, { eventId, result, detail: 'acceptance failed' })
+    expect(h.outbox).toHaveLength(1)
+    expect(h.outbox[0]).toMatchObject({ id: key('deploy-notice', ticketId, eventId),
+      kind: 'reply', ticketId, ticketShortId: h.repo.tickets.get(ticketId)!.shortId, channel: source.channel, replyInThread: true })
+    expect(h.outbox[0]!.text).toContain(`${summary}：acceptance failed`)
+    expect(h.repo.tickets.get(ticketId)!.assignments.map(item => item.state)).toEqual(['running'])
+  })
+  it.each(['Deploy', 'word '.repeat(200)])('bounds long deployment detail and title (%s) without losing the result or number', title => {
+    const h = harness()
+    h.engine.receive(trigger('1', { source: 'feishu', text: 'Deploy this',
+      channel: { source: 'feishu', thread: 'oc_chat', address: { message: 'om_1' } } })); h.pump()
+    const ticketId = h.decide(h.requests.at(-1)!, { kind: 'accept', title, scope: 'small', reason: 'requested' }).ticketId!
+    h.settle()
+    h.outbox.length = 0
+    const notice = { eventId: 'run-long', result: 'rollback_failed' as const, detail: 'long detail '.repeat(200) }
+    h.engine.deployOutcome(ticketId, notice)
+    h.engine.deployOutcome(ticketId, notice)
+    expect(h.outbox).toHaveLength(1)
+    expect(wordCount(h.outbox[0]!.text)).toBeLessThanOrEqual(IM_WORDS)
+    expect(h.outbox[0]!.text).toContain('The external deployment failed and rollback also failed; manual intervention is required')
+    expect(h.outbox[0]!.text).toContain(h.repo.tickets.get(ticketId)!.shortId!)
+    if (title === 'Deploy') {
+      expect(h.outbox[0]!.text).toContain(title)
+      expect(h.outbox[0]!.text).toContain('long detail')
+    }
+  })
+  it('delivers a bounded Chinese notice for a very long Chinese title and long detail', () => {
+    const h = harness()
+    h.engine.receive(trigger('1', { source: 'feishu', text: '请修复部署失败通知问题',
+      threads: [{ source: 'feishu', id: 'oc_chat' }],
+      channel: { source: 'feishu', thread: 'oc_chat', address: { message: 'om_1' } }, meta: { rootId: 'om_1' } })); h.pump()
+    const ticketId = h.decide(h.requests.at(-1)!, {
+      kind: 'accept', title: '超长中文标题'.repeat(30), scope: 'small', reason: 'requested',
+    }).ticketId!
+    h.settle()
+    h.outbox.length = 0
+    h.engine.deployOutcome(ticketId, {
+      eventId: 'run-zh', result: 'rollback_failed', detail: '验收失败的详细原因'.repeat(60),
+    })
+    expect(h.outbox).toHaveLength(1)
+    expect(wordCount(h.outbox[0]!.text)).toBeLessThanOrEqual(IM_WORDS)
+    expect(h.outbox[0]!.text).toContain('外部部署失败，回滚也未成功，需要人工处理')
+    expect(h.outbox[0]!.text).toContain(h.repo.tickets.get(ticketId)!.shortId!)
+  })
+  it('deduplicates by deployment event regardless of result, and allows a different event', () => {
+    const h = harness()
+    h.engine.receive(trigger('1', { source: 'feishu', text: 'Deploy this',
+      channel: { source: 'feishu', thread: 'oc_chat', address: { message: 'om_1' } } })); h.pump()
+    const ticketId = h.decide(h.requests.at(-1)!, { kind: 'accept', title: 'Deploy', scope: 'small', reason: 'requested' }).ticketId!
+    h.settle()
+    h.outbox.length = 0
+    const notice = { eventId: '/releases/deploy-1', result: 'rolled_back' as const, detail: 'acceptance failed' }
+    h.engine.deployOutcome(ticketId, notice)
+    h.engine.deployOutcome(ticketId, notice)
+    h.engine.deployOutcome(ticketId, { ...notice, result: 'rollback_failed' })
+    expect(h.outbox).toHaveLength(1)
+    expect(h.outbox[0]).toMatchObject({ id: key('deploy-notice', ticketId, notice.eventId),
+      text: expect.stringContaining('The external deployment failed and rolled back to the original version: acceptance failed') })
+    expect(h.outbox[0]).not.toHaveProperty('replyInThread')
+    h.engine.deployOutcome(ticketId, { ...notice, eventId: '/releases/deploy-2', result: 'rollback_failed' })
+    expect(h.outbox).toHaveLength(2)
+    expect(h.outbox[1]!.text).toContain('rollback also failed; manual intervention is required')
   })
 })
 describe('pause', () => {

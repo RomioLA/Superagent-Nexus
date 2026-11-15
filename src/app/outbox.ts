@@ -1,6 +1,7 @@
 /** Reliable outbound message delivery backed by persistent receipts and retried reply effects. */
 import type { OutboundMessage, Outbox as OutboxPort, ReplyStatus } from '../core/index.ts'
 import type { Commands } from '../infra/commands.ts'
+import { appendTaskSummary, isChinese, type TaskSummary } from './receipts.ts'
 import { checkedImText } from '../infra/text.ts'
 import type { SourceRegistry } from '../sources/registry.ts'
 import { FAILURES_BEFORE_ERROR, Later, type Effects } from './effects.ts'
@@ -11,6 +12,7 @@ export interface OutboxHost {
   readonly effects: Pick<Effects, 'enqueue' | 'cancel' | 'handle' | 'idle'>
   readonly sources: Pick<SourceRegistry, 'instance' | 'channelAllowed' | 'send'>
   readonly commands: Commands
+  taskSummary?(): TaskSummary
   paused(): boolean
 }
 
@@ -45,7 +47,10 @@ export class Outbox implements OutboxPort {
     if (store.receipts.behind(id, FAILURES_BEFORE_ERROR)) throw new Later('An earlier message of this ticket to this conversation waits')
     if (!sources.channelAllowed(receipt.channel)) { store.receipts.settle(receipt, 'channelIgnored'); return }
     // A permanently unreachable target (such as a recalled message or deleted Issue) settles as `channelGone` so its receipt prevents retries.
-    const result = await sources.send(receipt, commands)
+    const text = receipt.channel.source === 'feishu' && receipt.ticketId && receipt.kind === 'reply' && this.host.taskSummary
+      ? appendTaskSummary(receipt.text, this.host.taskSummary(), isChinese(receipt.text)) : receipt.text
+    if (receipt.channel.source === 'feishu') checkedImText(text)
+    const result = await sources.send({ ...receipt, text }, commands)
     if (result === 'waiting') throw new Later('The Source is not installed')
     store.receipts.settle(receipt, result === 'gone' ? 'channelGone' : 'sent')
   }

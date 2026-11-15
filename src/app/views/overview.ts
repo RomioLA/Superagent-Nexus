@@ -6,7 +6,7 @@ import { anyoneAllowed } from '../../policy.ts'
 import type { Store } from '../store.ts'
 import { awaitingEval, dayAgo, newestFirst, ownersOf, snapshot, threadSummary, type ViewHost } from './records.ts'
 import { sourceHealth, type HealthMap } from './sources.ts'
-import { ticketRow, type ExecutorLoad } from './tickets.ts'
+import { ticketRow, ticketStatusCountsOf, type ExecutorLoad } from './tickets.ts'
 import { preview } from './text.ts'
 
 /** Threads whose latest decision since `since` is an undismissed `unavailable` eval and that are neither evaluating nor queued. */
@@ -75,6 +75,7 @@ export function overview(host: ViewHost, health: HealthMap, policyVersionValue: 
     flow: { received, filtered, triggers: received - filtered, judged: judgement.judged, accepted: judgement.accepted,
       evaluating: evaluating.length, dropped: store.read.droppedSince(since) },
     policyVersion: policyVersionValue,
+    status: ticketStatusCountsOf(store),
   }
 }
 export type OverviewView = ReturnType<typeof overview>

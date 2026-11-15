@@ -1,3 +1,4 @@
+import { mkdir, writeFile, readFile } from 'node:fs/promises'
 /** Native route tool integration: transaction, project target, execution receipt and WorkerSlots. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 const { agy, codex, grok } = vi.hoisted(() => ({ agy: vi.fn(), codex: vi.fn(), grok: vi.fn() }))
@@ -7,7 +8,13 @@ vi.mock('../src/app/tools/agy.ts', async original => {
 })
 vi.mock('../src/app/tools/codex.ts', async original => {
   const module = await original<typeof import('../src/app/tools/codex.ts')>()
-  return { ...module, ticketCodexTool: (ticket: Parameters<typeof module.ticketCodexTool>[0]) => ({ ...module.ticketCodexTool(ticket), execute: codex }) }
+  return { ...module, ticketCodexTool: (ticket: Parameters<typeof module.ticketCodexTool>[0]) => {
+    const selected = module.ticketCodexTool(ticket)
+    return { ...selected, execute: async (raw: unknown, signal: AbortSignal) => {
+      selected.schema.parse(raw)
+      return codex(raw, signal)
+    } }
+  } }
 })
 vi.mock('../src/app/tools/grok.ts', async original => {
   const module = await original<typeof import('../src/app/tools/grok.ts')>()
@@ -16,6 +23,7 @@ vi.mock('../src/app/tools/grok.ts', async original => {
 import { feishu, startRuntime, type Host } from './fixtures/host.ts'
 import { key, latestAssignment } from '../src/core/index.ts'
 import { ticketEnvironment } from '../src/app/execution-environment.ts'
+import { evaluationInput } from '../src/app/evaluation.ts'
 
 let host: Host
 beforeEach(async () => {
@@ -95,6 +103,40 @@ it('a required Harness must actually succeed, cannot silently fall back or use 4
   await host.runTool(worker, 'orchestrator_report', { state: 'ready', summary: 'Verified Harness call completed' })
 })
 
+it('binds a Codex Ticket model from its structured HarnessSpec and records requested identity', async () => {
+  const source = feishu('157', 'Use Codex gpt-6-luna for this change')
+  host.runtime.receive(source); await host.runtime.idle()
+  await route([{ kind: 'accept', trigger_id: source.id, title: 'Codex change', worktree_name: 'codex-model',
+    acknowledgement: 'On it', harness: { harness: 'codex', model: 'gpt-6-luna' } }]); await host.runtime.idle()
+  const ticket = host.runtime.store.tickets.list()[0]!, worker = 'worker-' + ticket.id
+  // The structured model reaches the worker as an enforced constraint, not a shared-config write.
+  expect(ticket.execution?.assignment).toContain('(model=gpt-6-luna)')
+  expect(ticket.execution?.assignment).toContain('shared config.toml')
+  expect(ticket.execution?.harness).toMatchObject({ harness: 'codex', model: 'gpt-6-luna' })
+  await host.runTool(worker, 'orchestrator_codex', { task: 'Do the change', mode: 'write' })
+  const run = host.runtime.store.tickets.get(ticket.id)?.execution?.harnessRun
+  expect(run).toMatchObject({ harness: 'codex', model: 'gpt-6-luna', requestedModel: 'gpt-6-luna' })
+  expect(run?.servedModel).toBeUndefined()
+  expect(codex).toHaveBeenCalledTimes(1)
+})
+
+it('derives re-evaluable evidence from a routed Ticket without another model call', async () => {
+  const source = feishu('160', 'Use Codex gpt-6-luna for this change')
+  host.runtime.receive(source); await host.runtime.idle()
+  await route([{ kind: 'accept', trigger_id: source.id, title: 'Codex evidence', worktree_name: 'codex-evidence',
+    acknowledgement: 'On it', harness: { harness: 'codex', model: 'gpt-6-luna' } }]); await host.runtime.idle()
+  const ticket = host.runtime.store.tickets.list()[0]!, worker = 'worker-' + ticket.id
+  await host.runTool(worker, 'orchestrator_codex', { task: 'Do the change', mode: 'write' })
+  const input = evaluationInput(host.runtime.store.tickets.get(ticket.id)!)
+  expect(input.team).toMatchObject({ kind: 'single', members: ['codex'] })
+  expect(input.runs[0]).toMatchObject({ harness: 'codex', status: 'finished', requestedModel: 'gpt-6-luna' })
+  expect(input.dimensions.reliability).toEqual({ finished: 1, failed: 0, unverified: 0 })
+  // The mock reports no served model or cost, so both stay unknown rather than becoming zero.
+  expect(input.unknowns).toContain('served_model:codex')
+  expect(input.unknowns).toContain('cost_usd')
+  expect(input.dimensions.evidence.confidence).toBe('verified')
+})
+
 it('requires the Grok adapter for a Grok Ticket and records its run evidence without fallback', async () => {
   const source = feishu('55', 'Use Grok Build only for this change')
   host.runtime.receive(source); await host.runtime.idle()
@@ -118,7 +160,7 @@ it('requires the Grok adapter for a Grok Ticket and records its run evidence wit
 
   await host.runTool(worker, 'orchestrator_grok', { task: 'Do the change', mode: 'write' })
   expect(host.runtime.store.tickets.get(ticket.id)?.execution?.harnessRun).toMatchObject({
-    harness: 'grok', model: 'grok-4.7-build-fast', version: 'grok 1.0.80',
+    harness: 'grok', model: 'grok-4.7-build-fast', requestedModel: 'grok-4.7-build-fast', version: 'grok 1.0.80',
     models: ['grok-4.7-build-fast'], sessionId: 'session-123', requestId: 'request-456',
     usage: { inputTokens: 120, outputTokens: 32, totalTokens: 152, modelCalls: 1, costUSD: 0.0008 },
     assignmentId: latestAssignment(ticket)!.id,
@@ -272,6 +314,8 @@ it('retains every heterogeneous Harness call for one Ticket instead of overwriti
   await host.runTool(worker, 'orchestrator_codex', { task: 'Review', mode: 'read-only' })
   const runs = host.runtime.store.tickets.get(ticket.id)!.execution!.harnessRuns!
   expect(runs.map(run => [run.harness, run.status])).toEqual([['agy', 'finished'], ['agy', 'failed'], ['codex', 'finished']])
+  expect(runs.slice(0, 2).map(run => run.requestedModel)).toEqual(['gemini-3.8-flash-medium', 'gemini-3.8-flash-medium'])
+  expect(runs[2]!.requestedModel).toBeUndefined()
   expect(runs.every(run => run.assignmentId === assignmentId)).toBe(true)
   // The failed call keeps a bounded, credential-free reason; no cost or tokens are invented for it.
   expect(runs[1]!.error).toBe('failed: Bearer [redacted] denied')
@@ -300,4 +344,132 @@ it('keeps a stored single harnessRun as history and persists the full run list i
   // The list lives in the durable Ticket JSON, so it survives a restart that reopens the store.
   const row = host.runtime.store.db.prepare('SELECT value FROM ticket WHERE id = ?').get(ticket.id) as { value: string }
   expect((JSON.parse(row.value) as { execution: { harnessRuns: unknown[] } }).execution.harnessRuns).toHaveLength(2)
+})
+
+it('continues one historical Ticket with a per-call model and preserves untouched constraints, PR and workspace', async () => {
+  const source = feishu('801', 'Use Grok, read only, forbid 4A, no fallback')
+  host.runtime.receive(source); await host.runtime.idle()
+  await route([{ kind: 'accept', trigger_id: source.id, title: 'Safe continuation', worktree_name: 'safe-continue', acknowledgement: 'Inspect the task.',
+    harness: { harness: 'grok', mode: 'read-only', forbid4a: true, allowFallback: false } }]); await host.runtime.idle()
+  const original = host.runtime.store.tickets.list()[0]!, worker = `worker-${original.id}`
+  await host.runTool(worker, 'orchestrator_grok', { task: 'Inspect current files', mode: 'read-only' })
+  const stored = host.runtime.store.tickets.get(original.id)!
+  stored.assignments.at(-1)!.report = { state: 'failed', summary: '429 quota', at: new Date().toISOString() }
+  host.runtime.store.tickets.save(stored)
+  const change = feishu('802', 'Continue this task using Codex Luna6')
+  host.runtime.receive(change); await host.runtime.idle()
+  await mkdir(original.execution!.directory, { recursive: true })
+  await writeFile(original.execution!.directory + '/retained.txt', 'existing uncommitted work')
+  const oldJob = host.jobs.run(worker)
+  const args = { ticket_id: original.id, trigger_id: change.id, harness: { harness: 'codex', model: 'gpt-6-luna' } }
+  await host.runTool(host.runtime.masterId, 'orchestrator_ticket_continue', args); await host.runtime.idle()
+  const continued = host.runtime.store.tickets.get(original.id)!
+  expect(continued.execution?.directory).toBe(original.execution?.directory)
+  expect(await readFile(original.execution!.directory + '/retained.txt', 'utf8')).toBe('existing uncommitted work')
+  expect(host.jobs.service.kill).toHaveBeenCalledWith(oldJob, worker, 'Explicit human continuation')
+  expect(continued.execution?.harness).toEqual({ harness: 'codex', model: 'gpt-6-luna', mode: 'read-only', forbid4a: true, allowFallback: false })
+  expect(continued.assignments).toHaveLength(2)
+  expect(continued.assignments[0]!.state).toBe('ended')
+  expect(continued.execution?.harnessRuns?.[0]?.harness).toBe('grok')
+  expect(continued.execution?.continuations?.[0]?.before?.harness).toBe('grok')
+  const evidence = await host.runTool(host.runtime.masterId, 'orchestrator_read', { resource: `ticket/${original.id}/evidence` }) as { text: string }
+  expect(evidence.text).toContain('gpt-6-luna')
+  expect(evidence.text).toContain('continuations')
+  expect(host.agents.get(worker)!.cancel).toHaveBeenCalled()
+  await expect(host.runTool(worker, 'orchestrator_codex', { task: 'Unsafe write', mode: 'write' })).rejects.toThrow('read-only')
+  await host.runTool(worker, 'orchestrator_codex', { task: 'Inspect retained workspace', mode: 'read-only' })
+  expect(host.runtime.store.tickets.get(original.id)?.execution?.harnessRuns?.at(-1)?.requestedModel).toBe('gpt-6-luna')
+  await host.runTool(host.runtime.masterId, 'orchestrator_ticket_continue', args); await host.runtime.idle()
+  expect(host.runtime.store.tickets.get(original.id)?.assignments).toHaveLength(2)
+  expect(host.runtime.store.tickets.list()).toHaveLength(1)
+})
+it('records actual Harness failure immediately and sends one factual receipt with remaining task counts', async () => {
+  const source = feishu('811', '请用 Grok 检查文件')
+  host.runtime.receive(source); await host.runtime.idle()
+  await route([{ kind: 'accept', trigger_id: source.id, title: '失败回执', worktree_name: 'failure-visible', acknowledgement: '检查文件。', harness: { harness: 'grok' } }]); await host.runtime.idle()
+  const ticket = host.runtime.store.tickets.list()[0]!
+  grok.mockRejectedValueOnce(new Error('403 permission denied at Grok endpoint'))
+  await expect(host.runTool(`worker-${ticket.id}`, 'orchestrator_grok', { task: 'Inspect current file', mode: 'read-only' })).rejects.toThrow('403')
+  expect(host.runtime.store.tickets.get(ticket.id)?.assignments.at(-1)?.report).toMatchObject({ state: 'failed', summary: expect.stringContaining('permission') })
+  const results = host.runtime.store.db.prepare("SELECT value FROM outbox WHERE value ->> '$.ticketId' = ? AND value ->> '$.purpose' = 'result'").all(ticket.id).map(row => JSON.parse(String(row.value)) as { text: string })
+  expect(results).toHaveLength(1)
+  expect(results[0]?.text).toContain('任务尚未完成')
+})
+it('does not let another sender replace a Ticket resource or silently remove a retained 4A prohibition', async () => {
+  const { ticket } = await host.acceptedTicket(feishu('821', 'Inspect the file'))
+  const current = host.runtime.store.tickets.get(ticket.id)!
+  current.execution!.harness = { harness: 'agy', model: '3.8f', forbid4a: true }; host.runtime.store.tickets.save(current)
+  const other = feishu('822', 'Continue with 4A', { sender_id: 'ou_other' }); host.runtime.store.triggers.save(other)
+  await expect(host.runTool(host.runtime.masterId, 'orchestrator_ticket_continue', { ticket_id: ticket.id, trigger_id: other.id,
+    harness: { harness: 'codex', model: 'gpt-6-luna' } })).rejects.toThrow('does not belong')
+  const change = feishu('823', 'Continue with 4A'); host.runtime.store.triggers.save(change)
+  await expect(host.runTool(host.runtime.masterId, 'orchestrator_ticket_continue', { ticket_id: ticket.id, trigger_id: change.id,
+    harness: { model: '4a' } })).rejects.toThrow('conflicts')
+  expect(host.runtime.store.tickets.get(ticket.id)?.assignments).toHaveLength(1)
+})
+
+it('stores attributable live reviews in existing Tickets and applies them through native candidate advice only', async () => {
+  const context = { taskType: 'development', difficulty: 'complex', conditions: 'same requirements', ruleVersion: 'ac-v1' }
+  const source = feishu('851', 'Two comparable tasks with authorized resources')
+  host.runtime.receive(source); await host.runtime.idle()
+  await route([{ kind: 'accept', trigger_id: source.id, acknowledgement: 'Inspect the two tasks.', tasks: [
+    { title: 'Grok review sample', worktree_name: 'grok-quality', harness: { harness: 'grok' } },
+    { title: 'Codex review sample', worktree_name: 'codex-quality', harness: { harness: 'codex', model: 'gpt-6-luna' } },
+  ] }]); await host.runtime.idle()
+  codex.mockResolvedValueOnce({ summary: 'done', models: ['gpt-6-luna'] })
+  for (const ticket of host.runtime.store.tickets.list()) {
+    const harness = ticket.execution!.harness!.harness as 'grok' | 'codex'
+    await host.runTool(`worker-${ticket.id}`, `orchestrator_${harness}`, { task: 'Inspect and report the result', mode: 'read-only' })
+    await host.runTool(`worker-${ticket.id}`, 'orchestrator_report', { state: 'progress', summary: 'Mock test evidence; fixture mechanism only.' })
+    const review = { id: `review-${ticket.id}`, harness, model: harness === 'grok' ? 'grok-4.7-build-fast' : 'gpt-6-luna', ...context,
+      artifact: `patch-${ticket.id}`, evaluator: 'reviewer', assignmentId: latestAssignment(ticket)!.id, evidenceRefs: [`ticket/${ticket.id}`],
+      verdict: harness === 'grok' ? 'does-not-meet' : 'meets', origin: 'live', calibration: 'same objective criteria', sufficiency: 'explicit reviewer decision', at: '2026-11-15T00:00:00Z' }
+    await expect(host.runTool(host.runtime.masterId, 'orchestrator_ticket_evaluate', { ticket_id: ticket.id, review: { ...review, origin: 'fixture' } })).rejects.toThrow('Fixture')
+    await host.runTool(host.runtime.masterId, 'orchestrator_ticket_evaluate', { ticket_id: ticket.id, review })
+    await expect(host.runTool(host.runtime.masterId, 'orchestrator_ticket_evaluate', { ticket_id: ticket.id, review: { ...review, verdict: 'unknown' } })).rejects.toThrow('immutable')
+  }
+  const result = await host.runTool(host.runtime.masterId, 'orchestrator_rank_candidates', { context, candidates: [
+    { harness: 'grok', model: 'grok-4.7-build-fast', priority: 1, capable: true },
+    { harness: 'codex', model: 'gpt-6-luna', priority: 2, capable: true },
+  ] }) as { selected: { candidate: { harness: string } }; reason: string }
+  expect(result.selected.candidate.harness).toBe('codex')
+  expect(result.reason).toContain('calibrated quality evidence')
+  expect(host.runtime.store.tickets.list()).toHaveLength(2)
+})
+
+it('blocks replacement execution when a Job cancellation was requested but not confirmed', async () => {
+  const { ticket, sessionId } = await host.acceptedTicket(feishu('871', 'Inspect the task'))
+  host.jobs.run(sessionId)
+  host.jobs.service.wait.mockResolvedValueOnce({ status: 'running' } as never)
+  host.jobs.service.kill.mockImplementationOnce(() => 'requested')
+  const request = feishu('872', 'Continue using Codex Luna6'); host.runtime.store.triggers.save(request)
+  await host.runTool(host.runtime.masterId, 'orchestrator_ticket_continue', { ticket_id: ticket.id, trigger_id: request.id,
+    harness: { harness: 'codex', model: 'gpt-6-luna' } })
+  await host.runtime.idle()
+  const current = host.runtime.store.tickets.get(ticket.id)!
+  expect(latestAssignment(current)?.startedAt).toBeUndefined()
+  expect(latestAssignment(current)?.report).toMatchObject({ state: 'failed', summary: expect.stringContaining('did not stop safely') })
+  expect(codex).not.toHaveBeenCalled()
+  host.runtime.engine.retryTicket(ticket.id); await host.runtime.idle()
+  expect(latestAssignment(host.runtime.store.tickets.get(ticket.id)!)?.startedAt).toBeDefined()
+})
+it('keeps a late old-Harness failure on its original Assignment without failing the replacement', async () => {
+  const source = feishu('881', 'Use Grok to inspect this task')
+  host.runtime.receive(source); await host.runtime.idle()
+  await route([{ kind: 'accept', trigger_id: source.id, title: 'Late completion', worktree_name: 'late-completion', acknowledgement: 'Inspect the task.', harness: { harness: 'grok' } }]); await host.runtime.idle()
+  const ticket = host.runtime.store.tickets.list()[0]!, originalId = latestAssignment(ticket)!.id
+  let reject!: (error: Error) => void
+  grok.mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail }))
+  const pending = host.runTool(`worker-${ticket.id}`, 'orchestrator_grok', { task: 'Inspect current workspace', mode: 'read-only' })
+  void pending.catch(() => {})
+  await vi.waitFor(() => expect(reject).toBeDefined())
+  const change = feishu('882', 'Continue with Codex Luna6'); host.runtime.store.triggers.save(change)
+  await host.runTool(host.runtime.masterId, 'orchestrator_ticket_continue', { ticket_id: ticket.id, trigger_id: change.id,
+    harness: { harness: 'codex', model: 'gpt-6-luna' } }); await host.runtime.idle()
+  reject(new Error('Old Grok request cancelled'))
+  await expect(pending).rejects.toThrow('cancelled')
+  const current = host.runtime.store.tickets.get(ticket.id)!
+  expect(current.execution?.harnessRuns?.at(-1)).toMatchObject({ assignmentId: originalId, harness: 'grok', status: 'failed' })
+  expect(latestAssignment(current)?.id).not.toBe(originalId)
+  expect(latestAssignment(current)?.report).toBeUndefined()
 })

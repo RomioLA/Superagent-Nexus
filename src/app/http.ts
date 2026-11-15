@@ -26,7 +26,8 @@ import { overview } from './views/overview.ts'
 import { settingsView } from './views/settings.ts'
 import { sourcesStatus, type SetupState } from './views/sources.ts'
 import { decisionList, search, threadDetail, threadList } from './views/threads.ts'
-import { executorLoad, ticketDetail, ticketList } from './views/tickets.ts'
+import { executorLoad, ticketDetail, ticketList, ticketStatusCountsOf } from './views/tickets.ts'
+import { summarizeCodexQuotaSignals, summarizeRoutingSignals } from './routing.ts'
 
 export interface HttpHost {
   readonly store: Store
@@ -53,6 +54,8 @@ export interface HttpHost {
   checkSetup(): void
   requestPass(): void
   models(): Promise<ModelCatalog>
+  /** Read-only Magpie telemetry for the routing view, shared with the main Session's model resource. */
+  readonly magpie?: () => Promise<unknown>
 }
 /**
  * Represents a client-facing 400 or 404 error raised during management route parsing or lookup.
@@ -106,12 +109,45 @@ export function stateView(runtime: HttpHost) {
   const settings = runtime.store.settings()
   return { setup: setupView(runtime), load: { ...executorLoad(runtime.store, runtime.executor.activeCount()),
     maxWorkers: settings.executor.maxWorkers },
+    status: ticketStatusCountsOf(runtime.store),
     masterId: runtime.masterId, paused: settings.paused, health: runtime.health }
 }
 const views = (runtime: HttpHost): ViewHost => ({ store: runtime.store, sources: runtime.sources, links: runtime.links() })
 const setupState = (runtime: HttpHost): SetupState => ({ deployment: runtime.configured() ? runtime.deployment : undefined,
   problem: runtime.setupProblem, feishuProblem: runtime.feishuProblem })
 export type StateView = ReturnType<typeof stateView>
+/**
+ * The panel's model-routing view: the live model catalog, configured role models, the explainable Magpie channel readings,
+ * Codex account availability as a cheap unknown (the panel does not spawn the Codex CLI on every poll), and an honest quality
+ * statement. It reads the same resource readers and `routing.ts` rules the main Session's `models` resource uses, so the panel
+ * and the Router never keep two routing tables.
+ */
+export async function routingView(runtime: HttpHost) {
+  const catalog = await runtime.models()
+  const settings = runtime.store.settings()
+  const magpie = runtime.magpie ? await runtime.magpie() : { status: 'not-configured' }
+  const routing = summarizeRoutingSignals(magpie)
+  // Codex's account quota needs a CLI read; the panel leaves it unknown rather than spawning it on every poll. The Router
+  // reads it on demand through the `models` resource when a person asks.
+  const codex = summarizeCodexQuotaSignals({ status: 'unknown' })
+  // Quality is read from the versioned reviews stored on executed Tickets, never a fabricated score. Comparable calibrated
+  // reviews only are evidence-backed; everything else stays provisional, and no samples stay explicitly insufficient.
+  const qualityReviews = runtime.store.tickets.list()
+    .flatMap(ticket => (ticket.execution?.qualityReviews ?? []).map(review => ({ ticket_id: ticket.id, ...review })))
+  return {
+    checked_at: routing.checked_at, status: routing.status,
+    roles: { orchestrator: settings.eval.model, worker: settings.executor.model },
+    providers: catalog.groups.map(group => ({ id: group.id, name: group.name, count: group.models.length })),
+    channels: routing.observed_channels, preferred: routing.preferred_channel, unknown: routing.unknown, note: routing.note,
+    codex,
+    quality: qualityReviews.length
+      ? { evidence: 'recorded' as const, samples: qualityReviews.length, reviews: qualityReviews,
+        note: 'Quality evidence is recorded per Ticket; only comparable calibrated reviews are evidence-backed, otherwise provisional. Ranking uses orchestrator_rank_candidates.' }
+      : { evidence: 'insufficient' as const, samples: 0, reviews: [],
+        note: 'No comparable quality-evaluation samples are recorded; model quality cannot be ranked here.' },
+  }
+}
+export type RoutingView = Awaited<ReturnType<typeof routingView>>
 /** Builds a ticket's detail view; `environment` is empty while waiting for setup because it requires the resolved deployment. */
 function ticketPage(runtime: HttpHost, id: string) {
   const detail = ticketDetail(views(runtime), id), ticket = runtime.store.tickets.get(id)
@@ -204,6 +240,7 @@ function routes(runtime: HttpHost): Routes {
     'POST policy-sync/:id': async ({ params }) => ({ policy: await runtime.settings.sync(params.id) }),
     'POST setup/check': () => { runtime.checkSetup(); return { restarting: true } },
     'GET models': () => runtime.models(),
+    'GET models/routing': () => routingView(runtime),
     'GET prompts': ({ query }) => { const { revision, offset } = PromptsQuery.parse(query); return promptsView(runtime, revision, offset) },
     'PUT prompts': async input => {
       const request = z.object({ config: z.unknown(), baseRevision: z.number().int().nonnegative() }).parse(await promptBody(input))

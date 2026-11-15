@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { reportedCodexTokens, ticketCodexTool } from '../src/app/tools/codex.ts'
+import { codexCliArgs, reportedCodexTokens, ticketCodexTool } from '../src/app/tools/codex.ts'
 import type { Ticket } from '../src/core/index.ts'
 describe('Codex is a native Executor tool, not an independent job scheduler', () => {
   it('exposes one worktree-scoped tool with read-only/write defaults', () => {
@@ -10,6 +10,16 @@ describe('Codex is a native Executor tool, not an independent job scheduler', ()
     expect(args).toMatchObject({ mode: 'write' })
     expect(() => tool.schema.parse({ task: 'x', directory: '/private' })).toThrow()
     expect(tool.description).toContain('THIS Ticket worktree')
+  })
+  it('selects each call model through CLI arguments', () => {
+    const args = codexCliArgs({ mode: 'write', model: 'gpt-6-luna' }, '/tmp/w', '/tmp/o')
+    expect(args).toEqual(['exec', '-C', '/tmp/w', '--sandbox', 'workspace-write', '--ephemeral',
+      '--model', 'gpt-6-luna', '-c', 'model_reasoning_effort="medium"', '-o', '/tmp/o', '-'])
+    expect(args.join(' ')).not.toContain('config.toml')
+    expect(codexCliArgs({ mode: 'write' }, '/tmp/w', '/tmp/o')).not.toContain('--model')
+    const other = codexCliArgs({ mode: 'write', model: 'gpt-6.1-sol' }, '/tmp/w', '/tmp/o')
+    expect(other.slice(other.indexOf('--model'), other.indexOf('--model') + 2)).toEqual(['--model', 'gpt-6.1-sol'])
+    expect(other).not.toEqual(args)
   })
   it('does not invent token metrics', () => {
     expect(reportedCodexTokens('tokens used\n15,001\n')).toBe(15001)

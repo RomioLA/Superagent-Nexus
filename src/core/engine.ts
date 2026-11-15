@@ -1,13 +1,14 @@
 /** The domain Engine: the single entry point of the core, and the role interfaces its callers receive. */
 import { UserError } from './errors.ts'
 import { isoTime, liveTicket } from './model.ts'
-import type { ChannelRef, Decision, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
+import type { ChannelRef, Decision, DeployNotice, PolicyEffect, ThreadRef, Ticket, Trigger } from './model.ts'
 import type { AcceptTasksOutcome, Candidate, Repositories } from './ports.ts'
 import type { EngineOptions } from './part.ts'
 import { Assignments, type WorkerReport } from './assignments.ts'
 import { Evals, type Outcome } from './evals.ts'
 import { Intake, type ReceiveResult } from './intake.ts'
 import { Replies, type Reply, type ReplyRequest } from './replies.ts'
+import type { HarnessSpec } from './ports.ts'
 import { Tickets } from './tickets.ts'
 
 export type { EngineOptions } from './part.ts'
@@ -172,6 +173,14 @@ export class Engine {
    * Assignment ends and a new one starts under the same Mandate.
    * @throws UserError when the ticket is unknown, has ended, or is not retryable.
    */
+  continueTicket(ticketId: string, triggerId: string, harness?: Partial<HarnessSpec>): Ticket {
+    return this.repo.atomic(() => {
+      const ticket = this.tickets.continue(ticketId, triggerId, harness)
+      this.evals.withdraw(this.repo.triggers.get(triggerId)!)
+      this.evals.routed(triggerId, ticketId)
+      return ticket
+    })
+  }
   retryTicket(ticketId: string): Ticket { return this.repo.atomic(() => this.tickets.retry(ticketId)) }
 
   // The Executor
@@ -255,6 +264,14 @@ export class Engine {
     this.repo.atomic(() => { this.assignments.interrupted(ticketId, assignmentId) })
   }
 
+  /** Queues a terminal external deployment outcome independently of assignment recovery. */
+  deployOutcome(ticketId: string, notice: DeployNotice): void {
+    this.repo.atomic(() => {
+      const ticket = this.repo.tickets.get(ticketId)
+      if (ticket) this.replies.deployNotice(ticket, notice)
+    })
+  }
+
   // Settings
 
   /**
@@ -271,9 +288,9 @@ export type EngineForSources = Pick<Engine, 'receive' | 'bindThread' | 'threadCl
 /** What the main Session asks of the Engine. */
 export type EngineForMainSession = Pick<Engine, 'candidate' | 'candidateDelivered' | 'decide' | 'acceptTasks' | 'attach' | 'reply' | 'requestStatus' | 'note'>
 /** What people ask of the Engine, through the panel or the main Session. */
-export type EngineForPeople = Pick<Engine, 'stopTicket' | 'retryTicket' | 'reevaluate' | 'unsubscribe' | 'dismiss'>
+export type EngineForPeople = Pick<Engine, 'stopTicket' | 'retryTicket' | 'continueTicket' | 'reevaluate' | 'unsubscribe' | 'dismiss'>
 /** What Settings tells the Engine. */
 export type EngineForSettings = Pick<Engine, 'policyChanged'>
 /** What the Executor tells the Engine, and what its workers ask of it. */
 export type EngineForExecutor = Pick<Engine, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed'
-  | 'assignmentInterrupted' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'reply'>
+  | 'assignmentInterrupted' | 'deployOutcome' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'reply'>

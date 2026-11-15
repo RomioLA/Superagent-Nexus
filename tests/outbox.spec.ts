@@ -40,3 +40,16 @@ it('keeps a message for a Source that is not installed waiting, and sends it onc
   await at(5000)
   expect([h.runtime.outbox.status('waiting'), sent.map(message => message.id)]).toEqual(['sent', ['waiting']])
 })
+
+it('adds task counts at Feishu report delivery, with zero active Workers and unresolved Tickets', async () => {
+  const { ticket, sessionId } = await h.acceptedTicket(feishu('891', '检查任务'))
+  h.agents.get(sessionId)!.status = 'idle'
+  vi.mocked(Commands.prototype.lark).mockClear()
+  h.runtime.outbox.send({ id: 'counted-report', channel: ticket.channels[0]!, ticketId: ticket.id, kind: 'reply', purpose: 'result', text: '检查已结束。' })
+  await h.runtime.sendReplies()
+  const sent = JSON.stringify(vi.mocked(Commands.prototype.lark).mock.calls)
+  expect(sent).toContain('执行中 0')
+  expect(sent).toContain('等待处理 1')
+  expect(sent).toContain('当前仍有工作')
+  expect(sent).not.toContain('全部任务已结束')
+})

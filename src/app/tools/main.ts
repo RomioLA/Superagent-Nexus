@@ -7,6 +7,9 @@ import { UserError, followupOwners, key, reasonText, type Decision, type Decisio
 import { IM_WORDS, NOTE_WORDS, wordCount } from '../../infra/text.ts'
 import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type MasterAssessor } from '../assessment.ts'
 import { ticketCard } from '../cards.ts'
+import { runAsWorker } from '../../infra/environment.ts'
+import { QualityReviewSchema, validateQualityReview } from '../evaluation.ts'
+import { rankRouteCandidates, planResourceFallback, summarizeCodexQuotaSignals, summarizeRoutingSignals } from '../routing.ts'
 import { composeTicketReceipt, isChinese } from '../receipts.ts'
 import { PromptConfigSchema, savePrompts, type Prompts } from '../prompts.ts'
 import { readResource, type MainResourceHost, type ResourceHost } from '../resources.ts'
@@ -23,6 +26,7 @@ const RoutingNoteSchema = z.string().trim()
 export interface MainToolsHost {
   readonly github: { deployment: { repository: string } }
   readonly context: Context
+  workerActive?(ticket: import('../../core/index.ts').Ticket): boolean
   readonly engine: Pick<EngineForMainSession, 'decide' | 'acceptTasks' | 'attach' | 'reply' | 'requestStatus' | 'note'> & EngineForPeople
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'atomic' | 'replyStatus' | 'settings'>
   readonly prompts: Pick<Prompts, 'preview' | 'save'>
@@ -48,11 +52,20 @@ const fromDecision = (decision: Decision) => ({ decision: decision.kind, reason:
 /** The Harness and model an owner explicitly requires; the model supplies it, so no keyword parsing guesses it. */
 const HarnessSpecSchema = z.object({
   harness: z.enum(['dsh', 'agy', 'codex', 'grok']).describe('The Worker backend you judge suitable and authorized from the request and task, not a fixed default; AGY requires agy.'),
-  model: z.enum(['3.8f', '4a']).optional().describe('AGY default: 3.8f. 4a needs explicit authorization.'),
+  mode: z.enum(['read-only', 'write']).optional(),
+  model: z.string().min(1).max(120).optional().describe('AGY 3.8f/4a; Codex alias; Grok pinned.'),
   forbid4a: z.boolean().optional().describe('Never upgrade to 4a.'),
   allowFallback: z.boolean().optional().describe('Only explicit authorization permits fallback.'),
 }).strict().refine(spec => !(spec.model === '4a' && spec.forbid4a), '4a conflicts with forbid4a')
-  .refine(spec => spec.harness === 'agy' || spec.model === undefined, 'Only AGY accepts this model selection')
+  .superRefine((spec, ctx) => {
+    if (spec.model === undefined) return
+    if (spec.harness === 'agy' && !['3.8f', '4a'].includes(spec.model))
+      ctx.addIssue({ code: 'custom', path: ['model'], message: 'AGY accepts only 3.8f or 4a' })
+    if (spec.harness === 'dsh')
+      ctx.addIssue({ code: 'custom', path: ['model'], message: 'DSH does not accept a model selection' })
+    if (spec.harness === 'grok' && spec.model !== 'grok-4.7-build-fast')
+      ctx.addIssue({ code: 'custom', path: ['model'], message: 'Grok is pinned to grok-4.7-build-fast' })
+  })
 const TaskSpecSchema = z.object({
   title: z.string().trim().min(1).max(200).describe('Original subrequest label.'),
   scope: z.string().trim().min(1).max(2000).optional().describe('Narrow scope; original source retains authority.'),
@@ -221,6 +234,77 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
     readTool('Read one page of a resource the resource parameter lists, such as the ticket list or a ticket. Follow next_offset, and next_resource where a page names one.',
       false, (resource, offset, limit, signal) => readResource(resources, resource, offset, limit, undefined, signal)),
     routeTool(host),
+    tool({
+      name: 'orchestrator_ticket_evaluate',
+      description: 'Append a versioned review of existing evidence; no new benchmark. Preserve disagreements; calibration/sufficiency need actual review evidence. No fixtures in live routing.',
+      schema: z.object({ ticket_id: z.string(), review: QualityReviewSchema }).strict(),
+      execute: async ({ ticket_id, review }) => host.store.atomic(() => {
+        const ticket = host.store.tickets.get(ticket_id)
+        if (!ticket?.execution) throw new Error('Ticket has no execution evidence')
+        validateQualityReview(ticket, review)
+        const reviews = ticket.execution.qualityReviews ?? []
+        const existing = reviews.find(item => item.id === review.id)
+        if (existing && JSON.stringify(existing) !== JSON.stringify(review)) throw new Error('Review IDs are immutable; append a superseding review')
+        if (!existing) { ticket.execution.qualityReviews = [...reviews, review]; host.store.tickets.save(ticket) }
+        return { recorded: true, provisional: !review.calibration || !review.sufficiency }
+      }),
+    }),
+    tool({
+      name: 'orchestrator_rank_candidates',
+      description: 'Advise candidates from current resources/comparable reviews. Task and policy determines capability and priority; ticket_id enforces constraints/recovery. Starts no work.',
+      schema: z.object({ ticket_id: z.string().optional(), recovery_note: z.string().min(1).max(500).optional(), context: z.object({ taskType: z.string(), difficulty: z.string(), conditions: z.string(), ruleVersion: z.string() }),
+        candidates: z.array(z.object({ harness: z.enum(['dsh', 'agy', 'codex', 'grok']), model: z.string().optional(), priority: z.number().optional(),
+          capable: z.boolean(), required: z.boolean().optional(), forbidden: z.boolean().optional() }).strict()).max(30),
+        allow4a: z.boolean().optional(), allowFallback: z.boolean().optional(),
+      }).strict(),
+      execute: async (args, signal) => {
+        const ticket = args.ticket_id ? host.store.tickets.get(args.ticket_id) : undefined
+        if (args.ticket_id && !ticket) throw new Error('Unknown Ticket')
+        const reads = await Promise.allSettled([host.resources.magpie?.(), host.resources.codexQuota?.(signal)])
+        const magpie = reads[0].status === 'fulfilled' ? reads[0].value : { status: 'unavailable', error: 'Magpie resource read failed' }
+        const signals = summarizeRoutingSignals(magpie)
+        const codex = summarizeCodexQuotaSignals(reads[1].status === 'fulfilled' ? reads[1].value : { status: 'unknown', error: 'Codex quota read failed' })
+        const required = ticket?.execution?.harness
+        const candidates = args.candidates.map(candidate => {
+          const channel = signals.observed_channels.find(row => row.harness === candidate.harness && row.model === candidate.model)
+          return { ...candidate, ...(required ? { required: candidate.harness === required.harness && (!required.model || candidate.model === required.model) } : {}), ...(candidate.harness === 'codex' && codex
+            ? { reading: { state: codex.availability, evidence: codex.reason } }
+            : channel ? { reading: { state: channel.availability, evidence: channel.reason } }
+            : { unknownReason: 'No current resource reading for this Harness/model' }) }
+        })
+        const reviews = host.store.tickets.list().flatMap(ticket => (ticket.execution?.qualityReviews ?? []).filter(review => {
+          try { validateQualityReview(ticket, review); return true } catch { return false }
+        }))
+        const options = { allow4a: required?.forbid4a ? false : args.allow4a,
+          allowFallback: required ? required.allowFallback === true : args.allowFallback, quality: { context: args.context, reviews } }
+        if (!ticket) return rankRouteCandidates(candidates, options)
+        if (required && !candidates.some(candidate => candidate.required)) throw new Error('Include the current required resource so fallback constraints can be evaluated')
+        const git = ticket.execution ? await runAsWorker(host.context.subprocess, ['git', 'status', '--porcelain'], ticket.execution.directory, signal).catch(() => undefined) : undefined
+        const hasSideEffects = git === undefined || git.length > 0 || !!ticket.follows?.length
+          || !!ticket.execution?.harnessRuns?.some(run => run.mode === 'write' || run.writeEvidence)
+        const recovery = { oldWorkerActive: host.workerActive?.(ticket) ?? true, hasSideEffects, checked: !hasSideEffects || !!args.recovery_note }
+        const fallback = planResourceFallback(candidates, options, recovery)
+        return { ...fallback.decision, fallback: { status: fallback.status, blocker: fallback.blocker, note: fallback.note, recovery } }
+      },
+    }),
+    tool({
+      name: 'orchestrator_ticket_continue',
+      description: 'Explicit owner continuation/model correction, never status. Retains constraints/history/workspace; cancels old execution first. Inspect Git/PR effects.',
+      schema: z.object({ ticket_id: z.string(), trigger_id: z.string(),
+        harness: z.object({ harness: z.enum(['dsh', 'agy', 'codex', 'grok']).optional(), model: z.string().min(1).max(120).optional(),
+          mode: z.enum(['read-only', 'write']).optional(), forbid4a: z.boolean().optional(), allowFallback: z.boolean().optional() }).strict().optional(),
+      }).strict(),
+      execute: async args => {
+        const current = host.store.tickets.get(args.ticket_id)
+        if (current?.execution?.harness || args.harness?.harness) {
+          const merged = { ...current?.execution?.harness, ...args.harness }
+          if (args.harness?.harness && args.harness.harness !== current?.execution?.harness?.harness && args.harness.model === undefined) delete merged.model
+          HarnessSpecSchema.parse(merged)
+        }
+        return routed(host, { reason: 'Continued with retained constraints and native cancellation',
+          ticketId: host.engine.continueTicket(args.ticket_id, args.trigger_id, args.harness).id })
+      },
+    }),
     tool({
       name: 'orchestrator_ticket_retry',
       description: 'Start a new assignment on an explicit human request to retry a ticket whose worker reported failed or blocked, or whose input was not delivered; the stalled one ends.',

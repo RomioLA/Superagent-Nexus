@@ -333,8 +333,11 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/sessions.ts` | Sessions |
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
+| `src/app/codex-quota.ts` | Read-only Codex App Server account quota and rate-limit reader that feeds the routing projection |
 | `src/app/magpie.ts` | Existing scoped Magpie routing telemetry |
 | `src/app/routing.ts` | Lightweight, explainable resource-aware candidate ordering over trustworthy Magpie quota signals; unknown values stay unknown and explicit Harness/model/4A constraints win |
+| `src/app/codex-quota.ts` | Reads account quota from the existing Codex App Server without mixing it with Magpie channels |
+| `src/app/evaluation.ts` | `evaluationInput` separates execution facts and unknown metrics; versioned reviews retain evaluator/context/calibration/sufficiency and disputes. Exact live Harness/served-model evidence is required before comparable reviews influence routing; fixtures remain separate. |
 | `src/app/role-models.ts` | Resolves the Eval and Executor models, and seeds a new Session with its role's model |
 | `src/app/assessment.ts` | The MasterAssessor, the assessment schema and the window `orchestrator_eval` answers |
 | `src/app/execution-environment.ts` | The execution environment: its variables, a Ticket's values, the directory root and the lines of the prompt section, which `src/app/prompts.ts` fills into its template |
@@ -359,6 +362,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/views/settings.ts` | The settings page's view: each block with its revision, each Source's settings with its kind's form, and the execution environment |
 | `src/app/views/overview.ts` | The overview: Tickets that need a person, problems, the last day's flow and the Executor's load |
 | `src/executor/dsh.ts` | The DshExecutor, `WorkerSlots`, `ticketExecution`, `inputMessage` and `mandateInstructions` |
+| `src/executor/deploy.ts` | Reads a ticket's own `DEPLOY_STATE.json` and distinguishes in-flight steps (including `rolling_back`) from terminal outcomes; the Executor retries unreadable state and follows pending lifecycle progress through a durable `deployWatch` effect until progress stalls for 10 minutes, with no total duration cap; terminal outcomes queue one `DeployNotice` per run identity (`run`, falling back to the release path `new`) |
 | `src/executor/background.ts` | A worker's background work in DeepSeek Harness, the shell jobs its Session owns (`ctx.jobs`) and its subagents (`ctx.subagents`): `runningJobs`, `untilQuiet`, `killJobs`, `collectJobs`, `stopSubagents`, `stopBackground`, `until`, and `cancelled`, the workers whose turn a stop of their subagents cancelled |
 | `src/infra/commands.ts` | `Commands`, the CLI transport: `run`; `api` and `pages`, limited to the configured repository and validated; `lark` as the bot; `git`. `CliError` carries the code a command's output reports, such as a GitHub HTTP status, and a command that prints nothing fails with how it ended, never with its arguments; `validItems` skips and counts the malformed items of a list |
 | `src/infra/environment.ts` | The agent's process environment: command shims, the git configuration and credential helper, `runAsWorker`, and the checks of the environment and of a Ticket's directory |
@@ -388,6 +392,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/api.ts` | Calls and polls of the management API, typed by `src/app/api.ts`, and the Decision filters of the Eval status |
 | `src/client/route.ts` | The tabs, the settings groups, the typed routes that `parseRoute` reads, and the route memory with the settings group opened last |
 | `src/client/overview.tsx` | The overview |
+| `src/client/routing.tsx` | The Model routing page: the live catalog, channel availability, quota, quality evidence and the recommendation, read from the same routing view the Router uses |
 | `src/client/source.tsx`, `trigger.tsx`, `eval.tsx`, `execution.tsx` | One file per stage: its status, and its settings where it has some |
 | `src/client/thread.tsx`, `ticket.tsx` | The record pages: a Thread with its timeline, and a Ticket with its authorization, Inputs and Assignments |
 | `src/client/settings.tsx` | The Settings tab: the group navigation and the group on screen |
@@ -422,10 +427,14 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/feishu-task-route-smoke.spec.ts` | Natural requests, long messages, chat, cancellation, queries, continuations and repeated project selection all enter native receive without a side-channel task API |
 | `tests/codex-ticket.spec.ts` | Codex Worker tool schema, worktree target and CLI token reporting |
 | `tests/agy-ticket.spec.ts` | Ticket-scoped AGY arguments, model mapping, process result parsing and failure reporting |
-| `tests/grok-execution.spec.ts` | Mock Grok native limits, cancellation, ordinary retries and file-write evidence |
+| `tests/grok-execution.spec.ts` | Mock Grok native limits that keep partial edits and allow a later Grok call, cancellation, ordinary retries and file-write evidence |
 | `tests/status-reply.spec.ts` | Busy Ticket status answers, source channel, language, permission gates and Outbox deduplication |
 | `tests/magpie.spec.ts` | Existing scoped Magpie routing telemetry |
+| `tests/codex-quota.spec.ts` | The Codex account quota reader and its routing projection |
+| `tests/panel-routing.spec.tsx` | The Model routing page renders the shared routing view: channels, recommendation and the explicit insufficient-quality statement |
 | `tests/routing.spec.ts` | Resource-aware candidate ordering: a known exhausted reading changes the choice, unknown stays neutral, explicit Harness/model/4A constraints win, and the `models` resource carries the explainable routing projection |
+| `tests/codex-quota.spec.ts` | Codex account availability, unknown data and independent resource projection |
+| `tests/evaluation.spec.ts` | Evaluation input derivation: quality kept separate from credential/availability failures, team vs single executor, and unknown metrics never become zero |
 | `tests/grok-ticket.spec.ts` | Grok Build headless arguments, permission profile, model-usage evidence and fail-closed result parsing |
 | `tests/cli-isolation.spec.ts` | Per-Ticket CLI state directories and AGY/Codex/Grok credential symlinks, with private per-Ticket homes |
 | `tests/cli-security.spec.ts` | CLI state path symlink checks, credential-target validation and concurrent credential-link setup |
@@ -433,8 +442,10 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `tests/github-multi-repo.spec.ts` | Repository-scoped GitHub Threads, scope of authorized project repositories, and cross-project pull binding, CI and closure |
 | `tests/feishu-native-engine.spec.ts` | Native Engine two-Ticket admission, duplicate suppression, independent worktrees, retry and cancellation |
 | `tests/native-routing-integration.spec.ts` | Native `orchestrator_route` project selection and split-task routing integration |
+| `tests/batch-summary.spec.ts` | One batch summary when every Ticket of a split request ends: sent once, from the same Tickets and HarnessRun records, and never for a single-Ticket request |
 | `tests/harness-instructions.spec.ts` | Harness instruction text that matches the fallback rule the delegate guard enforces |
 | `tests/notification-integration.spec.ts` | Runtime result receipts and notification deduplication |
+| `tests/deploy-notice.spec.ts` | Deployment observations: in-flight steps stay pending, terminal results distinguish rollback success and failure, timestamps do not filter outcomes, and reads use only the ticket's own directory |
 | `tests/ticket-receipts.spec.ts` | Short ticket numbers, their lookup by number or resource, and ordinary receipts that show number, title and true state |
 | `tests/admission-context.spec.ts`, `tests/feishu-image.spec.ts` | The Thread window of assessments, and Feishu image reads |
 | `tests/assessment.spec.ts` | What the MasterAssessor keeps per Eval, and when it lets go |
@@ -656,3 +667,5 @@ The existing GitHub Source still observes the primary configured repository. For
 AGY runs as a tool in the existing native Ticket Executor. DSH owns the Ticket, worktree, Git delivery and human reporting. Write runs use `accept-edits`, `--sandbox`, and `--add-dir` for the exact Ticket workspace; no permission-bypass flag is used. Each Ticket gets its own AGY config and narrow command grants for Node and Git inspection plus project test entrypoints. Only the existing OAuth token is symlinked from the shared AGY home; the shared config and permissions are not changed. The Node executable and, when needed, the DSH runtime dependency directory are mounted read-only.
 
 Live AGY 3.8F validation confirmed a file edit, Node and Git commands, and the project's Vitest tests in the native command sandbox. A sibling sentinel could not be read or overwritten, and neither the shared nor Ticket OAuth token path was readable by the sandboxed test process. The permission list contains no general command or wildcard grant. Other external dependency directories are not granted automatically.
+
+Explicit model correction uses `orchestrator_ticket_continue`: the same source owner updates only specified constraints; prior assignments, CLI evidence and workspace survive. The native Executor waits for background shutdown and the cancelled Worker to become idle, refusing a failed handoff. Idle Feishu messages are classified before wakeup; status replies use stored lifecycle facts. `orchestrator_ticket_evaluate` stores attributable reviews on the existing Ticket, while `orchestrator_rank_candidates` reads current resources and comparable validated reviews. No scoring database, second queue or fixed sample threshold is introduced. Feishu report counts are rendered from native Ticket/slot state at Outbox delivery and retain the 100-word limit.

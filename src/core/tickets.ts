@@ -4,7 +4,7 @@ import { UserError } from './errors.ts'
 import { latestAssignment, latestReport, liveTicket, readUntil, runningAssignment, sameActor, settled, threadKey, waitsForPerson } from './model.ts'
 import type { Assignment, ChannelRef, Evaluation, Follow, Mandate, PolicyEffect, ThreadRef, Ticket, TicketEndBy, TicketInput, TicketOutcome,
   Trigger, TriggerDisposition } from './model.ts'
-import type { AssessmentOutcome } from './ports.ts'
+import type { AssessmentOutcome, HarnessSpec } from './ports.ts'
 import { EnginePart, type EngineOptions } from './part.ts'
 import type { Replies } from './replies.ts'
 import { canRetry } from './stage.ts'
@@ -172,6 +172,44 @@ export class Tickets extends EnginePart {
   stop(ticketId: string, reason?: string): Ticket {
     this.end(ticketId, 'human', 'stopped', this.now(), reason)
     return this.require(ticketId)
+  }
+  /** Continue the same workspace after explicit owner authorization, stopping the prior assignment through the native executor. */
+  continue(ticketId: string, triggerId: string, patch?: Partial<HarnessSpec>): Ticket {
+    const ticket = this.require(ticketId)
+    const trigger = this.repo.triggers.get(triggerId)
+    if (!trigger) throw new UserError('unknownTrigger')
+    if (!trigger.human || !sameActor(trigger.actor, ticket.mandate.actor)) throw new UserError('notReached')
+    if (!this.options.scope.scope(trigger).listened || this.repo.triggers.disposition(triggerId)?.filtered)
+      throw new UserError('notAdmissible', { reason: 'Source scope no longer allows this message' })
+    if (!this.policy().revalidate(ticket.mandate)) throw new UserError('mandateRevoked')
+    if (ticket.ended?.by === 'human') throw new UserError('ticketStopped')
+    if (!ticket.execution) throw new Error('Ticket has no prepared execution context')
+    // A repeated tool call for one source message cannot cancel/relaunch the replacement worker.
+    if (ticket.execution.continuations?.some(item => item.triggerId === triggerId)) return ticket
+    const before = ticket.execution.harness
+    const after = patch ? { ...before, ...patch } as HarnessSpec : before
+    if (patch?.harness && patch.harness !== before?.harness && patch.model === undefined && after) delete after.model
+    if (!after?.harness) throw new Error('Choose an authorized Harness before continuing')
+    if (after.forbid4a && after.model === '4a') throw new Error('4a conflicts with the retained prohibition')
+    const latest = latestAssignment(ticket)
+    if (latest && latest.state !== 'ended') {
+      this.endAssignment(ticket, latest, 'retried')
+      this.requeueUntaken(ticket, latest)
+      this.options.executor.stop(ticket, latest, 'Explicit human continuation')
+    }
+    if (ticket.attention) this.replies.withdrawAttention(ticket.attention.id)
+    delete ticket.ended; delete ticket.attention; delete ticket.delivery
+    const at = this.now()
+    ticket.execution.harness = after
+    ticket.execution.continuations = [...ticket.execution.continuations ?? [], { triggerId, at, ...(before ? { before } : {}), after }]
+    ticket.updatedAt = at
+    this.repo.tickets.save(ticket)
+    this.attach(ticketId, trigger)
+    const current = this.require(ticketId)
+    const assignment = this.newAssignment(current)
+    this.repo.tickets.save(current)
+    this.options.executor.start(current, assignment)
+    return current
   }
   /**
    * Ends the stalled assignment of a retryable open ticket (`failed`, `blocked`, or failed input delivery) and starts a new one.
@@ -372,6 +410,8 @@ export class Tickets extends EnginePart {
     this.letGo(ticketId, waiting, left)
     this.emit('ticket.ended', { ticketId, by, outcome, ...why })
     for (const assignment of stopping) this.options.executor.stop(ticket, assignment, reason ?? outcome)
+    // A request split into several Tickets only has one result: once the last of them ends, queue the batch summary once.
+    this.replies.batchSummary(ticketId)
   }
   /**
    * Whether a ticket's work has not finished at a close at `at`: its worker took up a person's message the ticket decides and

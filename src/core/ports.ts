@@ -43,8 +43,10 @@ export interface ProjectTarget { repository: string; root?: string; localOnly?: 
 export type HarnessName = 'dsh' | 'agy' | 'codex' | 'grok'
 export interface HarnessSpec {
   harness: HarnessName
-  /** The AGY model the owner allows, when they named one; omitted leaves the Harness default. */
-  model?: '3.8f' | '4a'
+  /** AGY takes '3.8f' | '4a'; Codex takes a model alias such as 'gpt-6-luna'; Grok is pinned by its adapter. */
+  model?: string
+  /** Per-task access restriction; omitted on a correction preserves the prior restriction. */
+  mode?: 'read-only' | 'write'
   /** The owner forbade model=4a, so a 3.8f capacity failure must be reported, never upgraded. */
   forbid4a?: boolean
   /** Whether an unavailable Harness may fall back to another authorized one; omitted means no silent substitution. */
@@ -88,6 +90,8 @@ export interface Assessor {
  * commands, so each method only queues work, which reports back through the Engine's callbacks.
  */
 export interface Executor {
+  /** Existing worker activity, including background work; an absent adapter keeps legacy intake behavior. */
+  active?(ticket: Ticket): boolean
   /** Queue a pending assignment for launch; reports back through `Engine.assignmentStarted` or a `failed` report. */
   start(ticket: Ticket, assignment: Assignment): void
   /**

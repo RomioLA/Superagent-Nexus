@@ -159,6 +159,7 @@ function sourceStatuses(): SourceStatusRow[] {
 }
 const stateView = (): StateView => ({
   setup: server.setup, load: { running: server.setup.problem ? 0 : 2, queued: 0, maxWorkers: server.settings.executor.maxWorkers },
+  status: { executing: server.setup.problem ? 0 : 2, queued: 0, waitingPerson: 2, followUp: 1, open: 5, ended: 1, hasOpen: true },
   masterId: 'master', paused: server.settings.paused,
   // The panel does not read health; the service script does.
   health: {},
@@ -196,6 +197,7 @@ const overviewView = (): ApiResponse<'GET overview'> => {
       ...Object.values(server.settings.policy.sources).some(part => part.allowed.length) ? [] : [{ kind: 'no-allowed' as const }],
       ...server.failing.map(outgoing => ({ kind: 'outgoing' as const, outgoing }))],
     person: server.person, executor: { running: 2, queued: 0, maxWorkers: server.settings.executor.maxWorkers, idle: 1 },
+    status: { executing: 2, queued: 0, waitingPerson: 2, followUp: 1, open: 5, ended: 1, hasOpen: true },
     flow: { received: 12, filtered: 2, triggers: 10, judged: 5, accepted: 1, evaluating: 0,
       dropped: server.dropped.filter(item => item.dropped.at >= dayAgo()).length },
     policyVersion: 'abcdef1234567890',
@@ -372,6 +374,19 @@ const ROUTES: { [K in keyof Api]: Route<K> } = {
   'GET models': { answer: () => ({ default: { provider: 'host', model: 'default' }, routableProviders: [], failures: [],
     groups: [{ id: 'worker-provider', name: 'Worker provider', models: [{ id: 'worker-model', name: 'Worker model',
       reasoning: { efforts: [{ id: 'high', name: 'High' }] } }] }] }) },
+  'GET models/routing': { answer: () => ({
+    checked_at: '2026-09-23T00:00:00Z', status: 'partial',
+    roles: { orchestrator: { provider: 'host', model: 'default' }, worker: { provider: 'worker-provider', model: 'worker-model' } },
+    providers: [{ id: 'worker-provider', name: 'Worker provider', count: 1 }],
+    channels: [{ harness: 'dsh', model: 'worker-model', provider: 'worker-provider', availability: 'available', remaining: 42,
+      selectable: true, reason: '[configured] priority=0' }],
+    preferred: { harness: 'dsh', model: 'worker-model', reason: 'Selected dsh/worker-model by configured priority 0' },
+    unknown: ['grok_quota'],
+    note: 'Magpie covers only configured DSH/Magpie model channels.',
+    codex: { source: 'codex', status: 'unknown', availability: 'unknown', reason: 'Codex account availability is unknown' },
+    quality: { evidence: 'insufficient', samples: 0, reviews: [],
+      note: 'No comparable quality-evaluation samples are recorded; model quality cannot be ranked here.' },
+  }) },
   'GET prompts': { query: ['revision', 'offset'], answer: () => server.prompts },
   'PUT prompts': { body: true, answer: ({ body }) => {
     const { revision } = server.prompts

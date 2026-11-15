@@ -1,4 +1,5 @@
 /** Ordinary user-facing receipts: the ticket's number and title, its true state from native facts, and the result body. */
+import { IM_WORDS, wordCount } from '../infra/text.ts'
 import { ticketHeading, ticketStatusText, type Ticket } from '../core/index.ts'
 export { ticketHeading } from '../core/index.ts'
 
@@ -28,4 +29,23 @@ export function composeTicketReceipt(ticket: Ticket, body: string, chinese: bool
   const status = receiptStatusText(ticket, chinese)
   const label = chinese ? '状态：' : 'Status: '
   return `${heading}\n\n${label}${status}\n\n${body.trim()}`
+}
+
+/** A snapshot from existing executor load and Ticket states, computed when a report is delivered. */
+export interface TaskSummary { running: number; queued: number; waiting: number; hasWork: boolean }
+export function appendTaskSummary(body: string, load: TaskSummary, chinese: boolean): string {
+  const footer = chinese
+    ? `任务统计：执行中 ${load.running}，排队中 ${load.queued}，等待处理 ${load.waiting}。${load.hasWork ? '当前仍有工作。' : '当前全部任务已结束。'}`
+    : `Tasks: ${load.running} running, ${load.queued} queued, ${load.waiting} awaiting handling. ${load.hasWork ? 'Work remains.' : 'All current tasks have ended.'}`
+  const compose = (text: string) => `${text.trimEnd()}\n\n${footer}`
+  if (wordCount(compose(body)) <= IM_WORDS) return compose(body)
+  // Reserve room for factual counts without raising the shared IM limit.
+  const chars = Array.from(body)
+  let low = 0, high = chars.length
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2)
+    if (wordCount(compose(chars.slice(0, middle).join('') + '…')) <= IM_WORDS) low = middle
+    else high = middle - 1
+  }
+  return compose(chars.slice(0, low).join('') + '…')
 }

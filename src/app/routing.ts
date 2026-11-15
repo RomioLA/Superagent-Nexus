@@ -12,6 +12,7 @@
  *  - Among the rest the existing configured priority decides. `unknown` availability never re-orders across priorities;
  *    it is only reported so the reason can say what was not known.
  */
+import { summarizeQuality, type QualityContext, type QualityReview } from './evaluation.ts'
 import type { HarnessName } from '../core/index.ts'
 
 /** Known availability of one candidate from a trustworthy reading; `unknown` means no usable signal was obtained. */
@@ -51,6 +52,8 @@ export interface RouteCandidate {
 
 /** Explicit authorization switches a caller passes; all default to the safe, denying value. */
 export interface RouteOptions {
+  /** Comparable, calibrated evidence only; fixture mode is explicit and never the live default. */
+  quality?: { context: QualityContext; reviews: readonly QualityReview[]; origin?: 'live' | 'fixture' }
   /** Explicit authorization to offer model=4a; otherwise a 4a candidate is never selectable. */
   allow4a?: boolean
   /** Whether an unavailable required candidate may fall back to another authorized one; omitted means no substitution. */
@@ -222,19 +225,30 @@ export function rankRouteCandidates(candidates: readonly RouteCandidate[], optio
   // when no required candidate is itself selectable.
   const pool = required.length ? (requiredSelectable.length ? requiredSelectable : options.allowFallback === true ? selectable : []) : selectable
   const ranked = [...pool].sort(compare)
-  const selected = ranked[0]?.candidate.priority !== undefined ? ranked[0] : undefined
+  const quality = options.quality ? summarizeQuality(options.quality.reviews, options.quality.context, options.quality.origin) : []
+  const standing = (item: CandidateEvaluation) => quality.find(row => row.harness === item.candidate.harness && row.model === item.candidate.model)
+  // Keep unknown candidates in their configured slots; only comparable evidence-backed candidates change places.
+  const slots = ranked.flatMap((item, index) => standing(item)?.status === 'evidence-backed' ? [index] : [])
+  const supported = slots.map(index => ranked[index]!).sort((a, b) => {
+    const verdict = (item: CandidateEvaluation) => standing(item)?.verdict === 'meets' ? 0 : 1
+    return verdict(a) - verdict(b) || compare(a, b)
+  })
+  slots.forEach((index, position) => { ranked[index] = supported[position]! })
+  const selected = ranked[0] && (ranked[0].candidate.priority !== undefined || standing(ranked[0])?.status === 'evidence-backed') ? ranked[0] : undefined
   const unknown = [...new Set(evaluated.flatMap(item => item.unknown))]
 
   const excluded = evaluated.filter(item => !item.selectable)
   const parts: string[] = []
   if (selected) {
     const label = selected.candidate.model ? `${selected.candidate.harness}/${selected.candidate.model}` : selected.candidate.harness
-    parts.push(`Selected ${label} by configured priority ${selected.candidate.priority}${selected.candidate.reading?.state === 'available' ? ' with a known available reading' : ' with availability unknown'}`)
+    parts.push(standing(selected)?.status === 'evidence-backed'
+      ? `Selected ${label} using comparable calibrated quality evidence (${options.quality!.context.ruleVersion}); availability remains independent`
+      : `Selected ${label} by configured priority ${selected.candidate.priority}${selected.candidate.reading?.state === 'available' ? ' with a known available reading' : ' with availability unknown'}`)
   } else if (ranked.length) {
     parts.push('No trustworthy priority: only resource evidence is reported')
   } else if (required.length) {
     const blocked = required.filter(item => !item.selectable).map(item => `${item.candidate.harness}${item.excludedBecause ? ` (${item.excludedBecause})` : ''}`)
-    parts.push(`No authorized replacement: required ${blocked.join(', ')} is not selectable and fallback is not authorized`)
+    parts.push(`No authorized replacement: required ${blocked.join(', ')} is not selectable; ${options.allowFallback === true ? 'no legal available fallback meets the constraints' : 'fallback is not authorized'}`)
   } else if (!selectable.length) {
     parts.push('No selectable candidate: every candidate is forbidden, incapable or known unavailable')
   }
@@ -349,4 +363,59 @@ export function summarizeRoutingSignals(snapshot: unknown): RoutingSignals {
       : null,
     unknown: [...unknown], note: ROUTING_NOTE,
   }
+}
+
+/** A compact, comparable view of exactly what one model-surface refresh read, so a later refresh reports real changes. */
+export interface ModelSurfaceSnapshot {
+  /** Provider/model identities observed in the catalog. */
+  catalog: string[]
+  /** Availability state per observed channel, from a trustworthy reading only. */
+  availability: Record<string, Availability>
+  /** Each source's own status, so a failed read is never reported as "no change". */
+  sources: Record<string, string>
+}
+
+export interface ModelSurfaceDiff {
+  catalog: { added: string[]; removed: string[] }
+  availability: { changed: { channel: string; from: Availability; to: Availability }[] }
+  /** Catalog refresh, resource refresh and capability ranking are kept distinct; a new model has no inherited score. */
+  capability: { new_without_evidence: string[]; note: string }
+  sources: { name: string; status: string; changed: boolean }[]
+  /** Sources that could not be read this refresh; an unreadable source is not evidence of no change. */
+  unknown: string[]
+}
+
+/** Compare two actual model-surface reads; the first refresh (no previous snapshot) reports everything as added. */
+export function diffModelSurface(previous: ModelSurfaceSnapshot | undefined, current: ModelSurfaceSnapshot): ModelSurfaceDiff {
+  const catalogReadable = current.sources.catalog === 'ok'
+  const before = new Set(previous?.catalog ?? [])
+  const after = new Set(current.catalog)
+  const added = catalogReadable ? current.catalog.filter(id => !before.has(id)) : []
+  const removed = catalogReadable ? (previous?.catalog ?? []).filter(id => !after.has(id)) : []
+  const changed: { channel: string; from: Availability; to: Availability }[] = []
+  for (const [channel, state] of Object.entries(current.availability)) {
+    const beforeState = previous?.availability[channel]
+    if (beforeState !== state) changed.push({ channel, from: beforeState ?? 'unknown', to: state })
+  }
+  const sources = Object.entries(current.sources)
+    .map(([name, status]) => ({ name, status, changed: previous?.sources[name] !== status }))
+  const unknown = Object.entries(current.sources).filter(([, status]) => status !== 'ok').map(([name, status]) => `${name}:${status}`)
+  return {
+    catalog: { added, removed },
+    availability: { changed },
+    capability: { new_without_evidence: added,
+      note: 'New models carry no quality evidence and do not inherit another model\'s ranking.' },
+    sources, unknown,
+  }
+}
+
+/** Advice for native continuation: resource fallback never bypasses an active writer or unreviewed side effects. */
+export function planResourceFallback(candidates: readonly RouteCandidate[], options: RouteOptions,
+  recovery: { oldWorkerActive: boolean; hasSideEffects: boolean; checked: boolean }) {
+  const decision = rankRouteCandidates(candidates, options)
+  const blocked = recovery.oldWorkerActive ? 'The previous Worker must reach its native cancellation safe point.'
+    : recovery.hasSideEffects && !recovery.checked ? 'Inspect the existing workspace/Git/PR effects before continuing.'
+    : !decision.selected ? decision.reason : undefined
+  return { decision, status: blocked ? 'blocked' as const : 'ready' as const, ...(blocked ? { blocker: blocked } : {}),
+    note: 'Advice only: reuse the existing Ticket/Session/workspace and native continuation; never repeat external effects. Unknown price/cache/quota values are not estimated.' }
 }

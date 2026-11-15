@@ -114,7 +114,7 @@ it('serves the live Magpie snapshot alongside native defaults, role models and p
   const result = await readResource({
     masterId: 'main',
     settings: {},
-    store: { settings: () => ({ eval: { model: { provider: 'magpie', model: 'deepseek-v4.1-flash' } },
+    store: { tickets: { list: () => [] }, settings: () => ({ eval: { model: { provider: 'magpie', model: 'deepseek-v4.1-flash' } },
       executor: { model: { provider: 'magpie', model: 'deepseek-v4.1-flash' } } }) },
     context: { sessionController: { modelCatalog: async () => ({
       default: { provider: 'magpie', model: 'deepseek-v4.1-flash' },

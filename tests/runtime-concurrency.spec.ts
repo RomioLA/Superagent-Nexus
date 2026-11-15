@@ -12,6 +12,14 @@ import { CHAT, MEMBER, feishu, startRuntime, type Host } from './fixtures/host.t
 let h: Host
 beforeEach(async () => { h = await startRuntime() })
 afterEach(async () => { await h.stop() })
+/** Model-classified work follows the native attach path before it may wake an idle Feishu worker. */
+async function receiveWork(trigger: Trigger) {
+  h.runtime.receive(trigger)
+  if (h.runtime.store.triggers.disposition(trigger.id)?.fanout.length) return
+  const owners = [...new Set(trigger.threads.flatMap(thread => h.runtime.store.threads.get(`${thread.source}:${thread.id}`)?.subscriptions ?? []))]
+  const target = owners.find(id => h.runtime.store.tickets.get(id)?.ended?.by !== 'human')
+  if (target) h.runtime.engine.attach(target, trigger.id)
+}
 const lark = { users: [{ member_id: MEMBER, name: 'Alice' }], has_more: false }
 const linkLookedUp = (messageId: string) =>
   vi.mocked(Commands.prototype.lark).mock.calls.some(([args]) => args.includes('+messages-mget') && args.includes(messageId))
@@ -150,7 +158,7 @@ it('wakes an idle worker for a person\'s message at once, in the slot kept beyon
   h.agents.get(one.sessionId)!.status = 'idle'
   const two = await h.acceptedTicket(feishu('5', '@bot 修二'))
   expect(h.agents.get(two.sessionId)!.status).toBe('running')
-  h.runtime.receive(feishu('2', '一的补充', { mentions: [], root_id: 'om_1', sender_id: 'ou_guest' })); await h.runtime.idle()
+  await receiveWork(feishu('2', '一的补充', { mentions: [], root_id: 'om_1', sender_id: 'ou_guest' })); await h.runtime.idle()
   expect(h.runtime.store.tickets.get(one.ticket.id)!.undelivered).toEqual([])
   expect(h.agents.get(one.sessionId)!.status).toBe('running')
 })
@@ -184,7 +192,7 @@ it('records on the ticket that its worker Session could not be created again', a
     if (id === one.sessionId) throw new Error('The Session store is offline')
     return h.resolveDefault(id)
   })
-  h.runtime.receive(feishu('2', '一的补充', { mentions: [], root_id: 'om_1', sender_id: 'ou_guest' })); await h.runtime.idle()
+  await receiveWork(feishu('2', '一的补充', { mentions: [], root_id: 'om_1', sender_id: 'ou_guest' })); await h.runtime.idle()
   expect(h.runtime.store.tickets.get(one.ticket.id)).toMatchObject({ delivery: { error: expect.stringContaining('The Session store is offline') } })
 })
 
@@ -420,7 +428,7 @@ describe('a worker whose work runs in the background', () => {
     // A person asks for more; the worker acknowledges it, starts the work in the background and its turn ends.
     await new Promise(resolve => setTimeout(resolve, 5))
     const more = feishu('2', '再加个测试', { mentions: [], root_id: 'om_1' })
-    h.runtime.receive(more); await h.runtime.idle()
+    await receiveWork(more); await h.runtime.idle()
     await vi.waitFor(() => expect(ticket().undelivered).toEqual([]))
     await h.runTool(one.sessionId, 'orchestrator_ack', { trigger_id: more.id, text: '收到' })
     h.jobs.run(one.sessionId)
@@ -439,7 +447,7 @@ describe('a worker whose work runs in the background', () => {
     expect(h.runtime.executor.activeCount()).toBe(0)
     // A person asks for more; the worker starts the tests in the background and ends its turn.
     await new Promise(resolve => setTimeout(resolve, 5))
-    h.runtime.receive(feishu('2', '再加个测试', { mentions: [], root_id: 'om_1' })); await h.runtime.idle()
+    await receiveWork(feishu('2', '再加个测试', { mentions: [], root_id: 'om_1' })); await h.runtime.idle()
     await vi.waitFor(() => expect(latestAssignment(ticket())?.deliveredAt! >= latestAssignment(ticket())!.report!.at).toBe(true))
     const job = h.jobs.run(one.sessionId)
     idle(one.sessionId); await h.runtime.idle()
@@ -656,7 +664,7 @@ describe('what a worker read', () => {
   it('sends to Eval a message that woke a ticket and that a retry delivered after a progress report, at a dropped report', async () => {
     const { one, thanks, ticket } = await completed()
     const pass = failing(one.sessionId, '谢谢')
-    h.runtime.receive(thanks); await h.runtime.idle()
+    await receiveWork(thanks); await h.runtime.idle()
     expect(ticket().delivery).toBeDefined()
     await h.runTool(one.sessionId, 'orchestrator_report', { state: 'progress', summary: 'Looking' })
     pass()
@@ -722,7 +730,7 @@ describe('what a worker read', () => {
   it('counts a message that woke a ticket as read by a later dropped report once a step of its worker took it', async () => {
     const { one, thanks } = await completed()
     // The resumed Assignment's message wakes the worker; its next step takes the note that it resumed and the message.
-    h.runtime.receive(thanks); await h.runtime.idle()
+    await receiveWork(thanks); await h.runtime.idle()
     h.step(one.sessionId)
     await later()
     await h.runTool(one.sessionId, 'orchestrator_report', { state: 'dropped', summary: 'Nothing to do' })
@@ -732,7 +740,7 @@ describe('what a worker read', () => {
   it('counts a message a retry delivered to its idle worker as read by the report of the turn it woke', async () => {
     const { one, thanks, ticket } = await completed()
     const pass = failing(one.sessionId, '谢谢')
-    h.runtime.receive(thanks); await h.runtime.idle()
+    await receiveWork(thanks); await h.runtime.idle()
     idle(one.sessionId)
     await vi.waitFor(() => expect(latestAssignment(ticket())?.report?.state).toBe('waiting'))
     pass()
@@ -823,7 +831,7 @@ it('resumes an ended ticket a person wrote to during a pause once it lifts, unde
   const first = await ended('1'), second = await ended('3')
   const followUp = async (id: string, root: string) => {
     await h.runtime.settings.pause(true, 'panel')
-    h.runtime.receive(feishu(id, '再改一下', { mentions: [], root_id: root })); await h.runtime.idle()
+    await receiveWork(feishu(id, '再改一下', { mentions: [], root_id: root })); await h.runtime.idle()
   }
   // While processing is paused, the message waits on the ended ticket; the first pass after the pause resumes it.
   await followUp('2', 'om_1')

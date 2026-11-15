@@ -71,7 +71,7 @@ it('keeps Codex availability separate from Magpie signals and preserves the exis
   }, checkedAt)
   const result = await readResource({
     masterId: 'main', settings: {},
-    store: { settings: () => ({ eval: { model: { provider: 'magpie', model: 'deepseek-v4.1-flash' } },
+    store: { tickets: { list: () => [] }, settings: () => ({ eval: { model: { provider: 'magpie', model: 'deepseek-v4.1-flash' } },
       executor: { model: { provider: 'magpie', model: 'deepseek-v4.1-flash' } } }) },
     context: { sessionController: { modelCatalog: async () => ({
       default: { provider: 'magpie', model: 'deepseek-v4.1-flash' },

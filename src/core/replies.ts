@@ -1,11 +1,26 @@
 /** The Engine's messages to Channels, each by the rule that allows it. */
 import { key } from './ids.ts'
 import { UserError } from './errors.ts'
-import { latestAssignment, liveTicket, sameActor, ticketOutcome } from './model.ts'
-import type { ChannelRef, Decision, Ticket, Trigger } from './model.ts'
+import { latestAssignment, liveTicket, sameActor, threadKey, ticketOutcome } from './model.ts'
+import type { ChannelRef, Decision, DeployNotice, Ticket, Trigger } from './model.ts'
 import type { ReplyStatus } from './ports.ts'
 import { EnginePart } from './part.ts'
 import { ticketHeading, ticketStatusText } from './stage.ts'
+import { IM_WORDS, wordCount } from '../infra/text.ts'
+
+/** Shortens an optional message part against the complete IM text, preserving the fixed content. */
+function fitImPart(value: string, compose: (part: string) => string): string {
+  if (wordCount(compose(value)) <= IM_WORDS) return value
+  const characters = Array.from(value)
+  let low = 0, high = characters.length
+  const prefix = (length: number): string => length ? characters.slice(0, length).join('').trimEnd() + '…' : ''
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2)
+    if (wordCount(compose(prefix(middle))) <= IM_WORDS) low = middle
+    else high = middle - 1
+  }
+  return prefix(low)
+}
 
 /**
  * A message for a Channel, by purpose: an Executor's acknowledgement of a person's request it works on, the answer to a
@@ -151,4 +166,98 @@ export class Replies extends EnginePart {
   }
   /** The conversation a ticket started in: its origin Trigger's Channel, else its first Channel. */
   private sourceChannel(ticket: Ticket): ChannelRef | undefined { return this.source(ticket)?.channel ?? ticket.channels[0] }
+
+  /**
+   * Queues a deployment outcome to the ticket's origin Feishu channel once per deployment, across assignments.
+   * The notice leaves the ticket's report and stage to its resumed worker.
+   */
+  deployNotice(ticket: Ticket, notice: DeployNotice): void {
+    const trigger = this.source(ticket)
+    if (trigger?.source !== 'feishu' || !trigger.channel) return
+    const chinese = /\p{Script=Han}/u.test(trigger.text) && !/[\p{Script=Hiragana}\p{Script=Katakana}]/u.test(trigger.text)
+    const inThread = ['rootId', 'parentId', 'threadId'].some(field => typeof trigger.meta[field] === 'string' && trigger.meta[field] !== '')
+    const summaries = {
+      succeeded: chinese ? '外部部署已完成' : 'The external deployment completed',
+      rolled_back: chinese ? '外部部署失败，已回滚到原版本' : 'The external deployment failed and rolled back to the original version',
+      rollback_failed: chinese ? '外部部署失败，回滚也未成功，需要人工处理' : 'The external deployment failed and rollback also failed; manual intervention is required',
+      aborted: chinese ? '外部部署失败，已中止（未回滚）' : 'The external deployment failed and was aborted (without rollback)',
+    }
+    const summary = summaries[notice.result]
+    const compose = (title: string, detail: string): string => `${ticketHeading({ ...ticket, title }, chinese)}\n\n${summary}`
+      + (detail ? `${chinese ? '：' : ': '}${detail}` : '')
+    const detail = fitImPart(notice.detail, part => compose(ticket.title, part))
+    const title = fitImPart(ticket.title, part => compose(part, detail))
+    this.options.outbox.send({ id: key('deploy-notice', ticket.id, notice.eventId), channel: trigger.channel, kind: 'reply',
+      ticketId: ticket.id, ...(ticket.shortId ? { ticketShortId: ticket.shortId } : {}), ...(inThread ? { replyInThread: true } : {}),
+      text: compose(title, detail) })
+  }
+
+  /**
+   * Queue the one batch summary for a split request once every Ticket it created has ended. A request split into several
+   * independent Tickets has no single result receipt; this reuses the split Decision's `audit.splitTickets`, the Tickets,
+   * their HarnessRun records and the Outbox, and sends one message to the source conversation, at most once per batch.
+   */
+  batchSummary(ticketId: string): void {
+    const ended = this.repo.tickets.get(ticketId)
+    const trigger = ended && this.source(ended)
+    if (!ended?.ended || !trigger) return
+    const split = this.repo.decisions.byThread(threadKey(trigger.threads[0]!))
+      .find(decision => Array.isArray(decision.audit?.splitTickets)
+        && (decision.audit!.splitTickets as unknown[]).includes(ticketId))
+    const ids = split && Array.isArray(split.audit?.splitTickets) ? split.audit!.splitTickets as string[] : []
+    if (!split || ids.length < 2) return
+    const tickets = ids.map(id => this.repo.tickets.get(id)).filter((ticket): ticket is Ticket => !!ticket)
+    // Wait until every Ticket of the batch has ended; the last ending sends the one summary.
+    if (tickets.length !== ids.length || tickets.some(ticket => !ticket.ended)) return
+    const id = key('batch-summary', split.id)
+    if (this.options.outbox.status(id)) return
+    if (!trigger.channel) return
+    const chinese = /\p{Script=Han}/u.test(trigger.text) && !/[\p{Script=Hiragana}\p{Script=Katakana}]/u.test(trigger.text)
+    this.options.outbox.send({ id, channel: trigger.channel, kind: 'reply', text: batchSummaryText(tickets, trigger, chinese) })
+  }
+}
+
+/** One batch summary from the ended Tickets: results, Harness/models, verifiable usage, switches, and people's next steps. */
+function batchSummaryText(tickets: readonly Ticket[], trigger: Trigger, chinese: boolean): string {
+  const label = (ticket: Ticket): string => ticket.shortId ?? ticket.id.slice(0, 8)
+  const outcome = (ticket: Ticket): string => ticket.ended?.outcome ?? latestAssignment(ticket)?.report?.state ?? 'ended'
+  const harness = new Set<string>()
+  let calls = 0, tokens = 0, cost = 0, knownCost = 0, runs = 0
+  const switches: string[] = []
+  for (const ticket of tickets) {
+    const spec = ticket.execution?.harness
+    if (spec) harness.add(`${spec.harness}${spec.model ? '/' + spec.model : ''}`)
+    for (const run of ticket.execution?.harnessRuns ?? []) {
+      runs++
+      calls += run.usage?.modelCalls ?? 0
+      tokens += run.usage?.totalTokens ?? 0
+      if (typeof run.usage?.costUSD === 'number') { cost += run.usage.costUSD; knownCost++ }
+      for (const model of run.models ?? []) harness.add(`${run.harness}/${model}`)
+    }
+    for (const change of ticket.execution?.continuations ?? []) {
+      const before = change.before ? `${change.before.harness}${change.before.model ? '/' + change.before.model : ''}` : '?'
+      const after = change.after ? `${change.after.harness}${change.after.model ? '/' + change.after.model : ''}` : '?'
+      if (before !== after) switches.push(`${before}→${after}`)
+    }
+  }
+  const needsPerson = tickets.filter(ticket => ['blocked', 'failed'].includes(latestAssignment(ticket)?.report?.state ?? '')
+    || ticket.ended?.outcome === 'stopped')
+    .map(ticket => `${label(ticket)} ${latestAssignment(ticket)?.report?.state ?? ticket.ended?.outcome ?? ''}`)
+  const unknownCost = runs - knownCost
+  if (chinese) return [
+    `批次汇总（原请求 ${trigger.id.slice(0, 8)}，共 ${tickets.length} 个工单）`,
+    `工单：${tickets.map(ticket => `${label(ticket)} ${ticket.title}（${outcome(ticket)}）`).join('；')}`,
+    `Harness/模型：${[...harness].join('、') || '未记录'}`,
+    `调用/费用：modelCalls=${calls}，tokens=${tokens}，cost≈$${cost.toFixed(4)}${unknownCost ? `（${unknownCost} 次费用未知）` : ''}`,
+    `模型切换：${switches.length ? switches.join('；') : '无记录'}`,
+    `需人工：${needsPerson.length ? needsPerson.join('；') : '无'}`,
+  ].join('\n')
+  return [
+    `Batch summary (request ${trigger.id.slice(0, 8)}, ${tickets.length} tickets)`,
+    `Tickets: ${tickets.map(ticket => `${label(ticket)} ${ticket.title} (${outcome(ticket)})`).join('; ')}`,
+    `Harness/model: ${[...harness].join(', ') || 'not recorded'}`,
+    `Calls/cost: modelCalls=${calls}, tokens=${tokens}, cost≈$${cost.toFixed(4)}${unknownCost ? ` (${unknownCost} runs with cost unknown)` : ''}`,
+    `Model switches: ${switches.length ? switches.join('; ') : 'not recorded'}`,
+    `Needs a person: ${needsPerson.length ? needsPerson.join('; ') : 'none'}`,
+  ].join('\n')
 }

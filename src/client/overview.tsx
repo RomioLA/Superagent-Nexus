@@ -93,11 +93,16 @@ export function OverviewPage() {
     </Section>
     <Section title={t('term.executor')} action={more({ page: 'execution' })}>
       {/* Pauses surface in `problems` above, so Executor counts render the same in both states; while setup waits, nothing runs. */}
-      {setup?.problem ? <Hint>{t('executorWaitingSetup')}</Hint> : <div className="dt-stats">
-        {stat(t('executingLabel'), `${data.executor.running} / ${data.executor.maxWorkers}`)}
-        {stat(t('queuedLabel'), data.executor.queued)}
-        {stat(t('idleLabel'), data.executor.idle)}
-      </div>}
+      {setup?.problem ? <Hint>{t('executorWaitingSetup')}</Hint> : <>
+        <div className="dt-stats">
+          {stat(t('executingLabel'), `${data.status.executing} / ${data.executor.maxWorkers}`,
+            { page: 'execution', query: { filter: 'executing' } })}
+          {stat(t('queuedLabel'), data.status.queued, { page: 'execution', query: { filter: 'queued' } })}
+          {stat(t('waitingPersonLabel'), data.status.waitingPerson, { page: 'execution', query: { filter: 'person' } })}
+          {stat(t('idleLabel'), data.status.followUp, { page: 'execution', query: { filter: 'idle' } })}
+        </div>
+        <Hint>{data.status.hasOpen ? t('statusHasOpen', { count: data.status.open }) : t('statusAllEnded')}</Hint>
+      </>}
     </Section>
   </>
 }

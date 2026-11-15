@@ -105,7 +105,7 @@ describe('Grok Build is a native Executor CLI tool', () => {
     expect(JSON.stringify(pending)).not.toContain('SENSITIVE_CONTENT')
   })
 
-  it('rejects chat text, incomplete turns, errors and output without Grok model usage', () => {
+  it('rejects chat text, incomplete turns and errors', () => {
     expect(() => parseGrokOutput('I am Grok and I completed the change.')).toThrow('valid JSON')
     expect(() => parseGrokOutput(JSON.stringify({
       text: 'Completed', stopReason: 'max_turns_reached',
@@ -114,18 +114,16 @@ describe('Grok Build is a native Executor CLI tool', () => {
     expect(() => parseGrokOutput(JSON.stringify({
       type: 'error', message: 'login required',
     }))).toThrow('error result')
-    expect(() => parseGrokOutput(JSON.stringify({
-      text: 'Completed', stopReason: 'end_turn',
-      modelUsage: { 'other-provider-model': { modelCalls: 1 } },
-    }))).toThrow('execution is unverified')
-    expect(() => parseGrokOutput(JSON.stringify({
-      text: 'Completed', stopReason: 'end_turn',
-      modelUsage: { 'grok-4.7': { modelCalls: 1 } },
-    }))).toThrow('did not report the requested model grok-4.7-build-fast')
-    expect(() => parseGrokOutput(JSON.stringify({
-      text: 'Completed', stopReason: 'end_turn',
-      modelUsage: { 'grok-4.7-build-fast': { modelCalls: 0 } },
-    }))).toThrow('execution is unverified')
+  })
+
+  it('leaves the served model unknown when Grok does not report it, and keeps a different reported model', () => {
+    // An upstream that omits modelUsage leaves the served model unknown; the requested model is still recorded by the caller.
+    expect(parseGrokOutput(JSON.stringify({ text: 'Done', stopReason: 'end_turn' })).models).toEqual([])
+    expect(parseGrokOutput(JSON.stringify({ text: 'Done', stopReason: 'end_turn',
+      modelUsage: { 'grok-4.7': { modelCalls: 1 } } })).models).toEqual(['grok-4.7'])
+    // A reported model with zero calls is not a served-model claim.
+    expect(parseGrokOutput(JSON.stringify({ text: 'Done', stopReason: 'end_turn',
+      modelUsage: { 'grok-4.7-build-fast': { modelCalls: 0 } } })).models).toEqual([])
   })
 
   it('does not invent missing usage fields', () => {

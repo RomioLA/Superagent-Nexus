@@ -427,6 +427,7 @@ it('stops a ticket on a person\'s instruction for good, and resumes an ended one
   await runTool(other.sessionId, 'orchestrator_report', { state: 'dropped', summary: 'not reproduced' })
   expect(runtime.store.tickets.get(other.ticket.id)!.ended).toBeDefined()
   await receive(feishu('21', '我这边还能复现', { mentions: [], root_id: 'om_20', sender_id: 'ou_guest' }))
+  await route({ kind: 'attach', ticket_id: other.ticket.id, trigger_id: feishu('21', '').id })
   await runtime.pump()
   const resumed = runtime.store.tickets.get(other.ticket.id)!
   expect(resumed.ended).toBeUndefined()
@@ -561,13 +562,18 @@ it('relaunches running assignments after a restart with a recovery note', async 
   expect(runtime.store.tickets.get(ticket.id)!.assignments[1]).toMatchObject({ state: 'running' })
   // The new Assignment's message says only what is new, as the Session holds the first; the launch's own pass delivers the
   // recovery note as it reads.
-  expect(relays(`worker-${ticket.id}`)).toEqual([{ ticket_id: ticket.id, assignment: 2 }, { text: expect.stringContaining('host restarted') }])
+  expect(relays(`worker-${ticket.id}`)).toEqual([expect.objectContaining({ ticket_id: ticket.id, assignment: 2, recovery: expect.stringContaining('existing workspace and PR') }), { text: expect.stringContaining('host restarted') }])
 })
 
 it('projects read models for the management page and removes thread subscriptions from the Web surface', async () => {
   const { ticket, trigger } = await acceptedTicket()
   const threadKeyValue = `feishu:${CHAT}:om_1`
   expect(overviewOf(runtime)).toMatchObject({ person: [], executor: { queued: 0, maxWorkers: 3, idle: 0 }, flow: { received: 0, accepted: 0, judged: 0 } })
+  // The four-category status is one shared rule: the panel overview, GET state and the Router's `status` resource agree.
+  expect(overviewOf(runtime).status).toEqual({ executing: 1, queued: 0, waitingPerson: 0, followUp: 0, open: 1, ended: 0, hasOpen: true })
+  expect((await api('GET', 'state')).body).toMatchObject({ status: { executing: 1, open: 1, hasOpen: true } })
+  expect(await runTool(runtime.masterId, 'orchestrator_read', { resource: 'status' })).toMatchObject({
+    executing: 1, queued: 0, waitingPerson: 0, followUp: 0, open: 1, ended: 0, hasOpen: true })
   expect(ticketList(viewsOf(runtime), 'working', 0, 20).items).toEqual([expect.objectContaining({ id: ticket.id, stage: 'working' })])
   expect(ticketList(viewsOf(runtime), 'open', 0, 20).items).toEqual([expect.objectContaining({ id: ticket.id, stage: 'working', sessionId: `worker-${ticket.id}`, strength: 'explicit' })])
   expect(ticketDetail(viewsOf(runtime), ticket.id)).toMatchObject({ mandate: { strength: 'explicit' }, decision: { kind: 'accept' }, threads: [expect.objectContaining({ key: threadKeyValue, title: '@bot 修一下回归' })], channels: [expect.objectContaining({ source: 'feishu' })] })
@@ -711,7 +717,7 @@ it('retries only a failed, blocked or undelivered ticket with a new assignment, 
   expect(retried.assignments.length).toBeGreaterThan(current.assignments.length)
   expect(retried.assignments.at(-2)!.endedReason).toBe('retried')
   // The worker's Session holds the assignment, so the new one says only that a person retried it.
-  expect(relays(`worker-${ticket.id}`).at(-1)).toEqual({ ticket_id: ticket.id, assignment: 2, note: expect.stringContaining('A person retried this ticket') })
+  expect(relays(`worker-${ticket.id}`).at(-1)).toMatchObject({ ticket_id: ticket.id, assignment: 2, note: expect.stringContaining('A person retried this ticket'), recovery: expect.stringContaining('existing workspace and PR') })
   // A Session someone deleted gets the whole first message again with the next Assignment.
   runtime.store.atomic(() => { runtime.engine.report(ticket.id, { state: 'failed', summary: 'LlmError: offline' }) })
   agents.delete(`worker-${ticket.id}`)
@@ -1256,7 +1262,9 @@ it('resumes several ended tickets on one thread from one message without the lau
   await runTool(first.sessionId, 'orchestrator_trigger_handback', { trigger_id: another.id, reason: 'Another change.' })
   const second = await acceptedTicket(another)
   for (const ticket of [first, second]) await runTool(ticket.sessionId, 'orchestrator_report', { state: 'dropped', summary: 'nothing to do' })
-  await receive(feishu('32', '还有问题', { mentions: [], root_id: 'om_1', sender_id: 'ou_guest' }))
+  await receive(feishu('32', '继续这两个工单', { mentions: [], root_id: 'om_1' }))
+  // One explicit owner request may continue both Tickets; a status question alone would continue neither.
+  for (const ticket of [first, second]) runtime.engine.continueTicket(ticket.ticket.id, feishu('32', '').id)
   await vi.waitFor(() => expect([first, second].map(ticket => runtime.store.tickets.get(ticket.ticket.id)!.ended)).toEqual([undefined, undefined]), { timeout: 3000 })
   await vi.waitFor(() => expect([first, second].map(ticket => runtime.store.tickets.get(ticket.ticket.id)!.assignments.at(-1)!.state)).toEqual(['running', 'running']), { timeout: 3000 })
 })

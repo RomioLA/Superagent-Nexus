@@ -10,6 +10,9 @@ export interface ThreadRef { source: string; id: string }
 /** Write-only address on a thread; the address format belongs to the source. */
 export interface ChannelRef { source: string; thread: string; address: Record<string, string> }
 
+/** An external deployment outcome identified by its stable release path across host restarts. */
+export interface DeployNotice { eventId: string; result: 'succeeded' | 'rolled_back' | 'rollback_failed' | 'aborted'; detail: string }
+
 /** Stable key of a thread across the whole domain. */
 export const threadKey = (ref: ThreadRef): string => `${ref.source}:${ref.id}`
 /**
@@ -348,6 +351,8 @@ export interface HarnessRun {
   harness: 'agy' | 'codex' | 'grok'
   /** The model or alias the caller asked the Harness for; absent when the caller named none. */
   model?: string
+  /** Full model identifier requested from the CLI, when known; distinct from its reported served model. */
+  requestedModel?: string
   /** A model the CLI itself reported as served, only when it named exactly one; otherwise unknown. */
   servedModel?: string
   /** Every model the CLI reported using, when it named them. */
@@ -368,6 +373,13 @@ export interface HarnessRun {
   /** When this record was written (ISO 8601). */
   at?: string
 }
+export interface QualityReview {
+  id: string; harness: import('./ports.ts').HarnessName; model: string
+  taskType: string; difficulty: string; conditions: string; ruleVersion: string; artifact: string
+  evaluator: string; assignmentId: string; evidenceRefs: string[]
+  verdict: 'meets' | 'does-not-meet' | 'unknown'; origin: 'live' | 'fixture'
+  calibration?: string; sufficiency?: string; supersedes?: string; at: string
+}
 export interface Execution {
   name: string
   directory: string
@@ -378,6 +390,9 @@ export interface Execution {
   harnessRun?: HarnessRun
   /** Every actual Harness call for this Ticket in order, newest last; a later call never replaces an earlier one. */
   harnessRuns?: HarnessRun[]
+  /** Explicit human continuations; original assignment, runs and source remain intact. */
+  qualityReviews?: QualityReview[]
+  continuations?: { triggerId: string; at: string; before?: import('./ports.ts').HarnessSpec; after?: import('./ports.ts').HarnessSpec }[]
 }
 
 /** Whether a ticket is open: it has not ended. */

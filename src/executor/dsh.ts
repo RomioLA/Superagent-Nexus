@@ -18,6 +18,7 @@ import { WorktreeNameSchema } from '../app/assessment.ts'
 import { resultRelay } from '../app/notices.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { cancelled, collectJob, killJobs, runningJobs, stopBackground, stopSubagents, until, untilQuiet } from './background.ts'
+import { deployWatchExpired, readDeployObservation } from './deploy.ts'
 
 const now = (): string => new Date().toISOString()
 /** Returns the worker session ID (`worker-<ticketId>`) for a ticket. */
@@ -61,7 +62,7 @@ export interface ExecutorHost {
   readonly context: Context
   /** Where the Executor reports what happened to Assignments and Inputs. */
   readonly engine: Pick<EngineForExecutor, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed' | 'report'
-    | 'assignmentInterrupted'>
+    | 'assignmentInterrupted' | 'deployOutcome'>
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'set' | 'settings' | 'atomic' | 'afterCommit'>
   /** Durable effect queue through which launches and input deliveries run. */
   readonly effects: Pick<Effects, 'enqueue' | 'handle'>
@@ -106,9 +107,11 @@ export function harnessInstructions(harness: HarnessSpec): string {
       ? 'Harness required by the owner: the AGY native CLI via orchestrator_agy'
         + (harness.model ? ` (model=${harness.model})` : '') + '; do not substitute Codex or DSH-native coding, and never report another Harness\'s work as AGY\'s.'
       : harness.harness === 'codex'
-        ? 'Harness required by the owner: Codex via orchestrator_codex; do not substitute AGY, Grok or DSH-native coding.'
-        : 'Harness required by the owner: Grok Build via orchestrator_grok using the grok-4.7-build-fast model; never report another Harness or model as Grok.'
+        ? 'Harness required by the owner: Codex via orchestrator_codex' + (harness.model ? ` (model=${harness.model})` : '')
+          + '; orchestrator_codex applies the bound Ticket model automatically using official per-call --model; pass only task, mode, reasoning. Never launch Codex via shell or change the shared config.toml; do not substitute AGY, Grok or DSH-native coding.'
+        : 'Harness required by the owner: Grok Build via orchestrator_grok using the grok-4.7-build-fast model; never report another Harness or model as Grok. If an orchestrator_grok call returns status limit_reached (max_turns_reached), keep its partial changes, inspect the workspace, and continue the remaining work with another orchestrator_grok call in this Ticket; a model turn limit alone does not fail the Ticket.'
   const parts = [line]
+  if (harness.mode === 'read-only') parts.push('This Ticket is read-only. Do not write files or perform external mutations.')
   if (harness.forbid4a) parts.push('Do not use model=4a for any reason; if the required model is unavailable, report blocked rather than upgrading to 4a.')
   parts.push(fallback ? 'A documented fallback is allowed if the preferred Harness is unavailable.'
     : 'Do not fall back to a different Harness on failure; report the failure instead.')
@@ -243,13 +246,15 @@ export class DshExecutor implements Executor {
   private readonly settling = new Map<string, AbortController>()
   /** The stops of tickets' background work that run, by ticket, which a launch or a delivery of the ticket waits for. */
   private readonly stopping = new Map<string, Promise<void>>()
+  /** A failed explicit handoff cannot release a replacement writer into the same workspace. */
+  private readonly handoffFailures = new Map<string, unknown>()
   /** The jobs workers left to a person when they handed off, by ticket, and the collecting of their ends. */
   private readonly left = new Map<string, { jobs: Set<string>; collect: AbortController }>()
   /** When a person's message typed into a worker's Session last started a turn, by ticket. */
   private readonly personal = new Map<string, string>()
   /** The timers of workers that go on after a passing failure, which dispose clears. */
   private readonly timers = new Set<ReturnType<typeof setTimeout>>()
-  /** Registers the `launch` and `delivery` effect handlers; both are held (concurrency limit 0) while processing is paused. */
+  /** Registers launch and delivery handlers held while paused, and a watcher for in-flight external deployments. */
   constructor(private readonly host: ExecutorHost) {
     this.slots = new WorkerSlots(() => host.store.tickets.open().filter(ticket => this.running(ticket)).map(ticket => ticket.id),
       () => host.store.settings().executor.maxWorkers)
@@ -258,6 +263,7 @@ export class DshExecutor implements Executor {
       retry: [5000, 300_000] })
     // Failed input deliveries are recorded on the ticket itself rather than reported through the `delivery` effect health entry (`quiet: true`).
     host.effects.handle('delivery', payload => this.deliverQueued(payload.ticketId), { limit: () => host.paused() ? 0 : 4, quiet: true })
+    host.effects.handle('deployWatch', payload => this.watchDeployQueued(payload), { quiet: true, retry: [5000, 60_000] })
   }
   /** Populates a newly accepted ticket's `execution` attributes (worktree name, workspace directory, and assignment text). */
   prepare(ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>): Ticket {
@@ -395,7 +401,23 @@ export class DshExecutor implements Executor {
   }
   /** Stop what a ticket's worker runs in the background (see `stopBackground`). */
   private stopWork(ticketId: string, reason: string, keepInbox = false): void {
-    this.track(ticketId, stopBackground(this.host.context, workerSessionId(ticketId), reason, keepInbox))
+    const stop = stopBackground(this.host.context, workerSessionId(ticketId), reason, keepInbox)
+    if (reason !== 'Explicit human continuation' && !this.handoffFailures.has(ticketId)) { this.track(ticketId, stop); return }
+    this.handoffFailures.delete(ticketId)
+    const safe = stop.then(async () => {
+      const agent = this.host.context.agents.get(workerSessionId(ticketId) as SessionId)
+      if (agent) {
+        // Settled Jobs can wake their parent while being killed; cancel that final turn too.
+        agent.cancel({ kind: 'user' }, { keepInbox: false })
+        const idle = await until(agent.whenIdle(), this.host.lifetime, 30_000)
+        if (idle === false || agent.status !== 'idle') throw new Error('Previous Worker cancellation was not confirmed')
+      }
+      if (runningJobs(this.host.context, workerSessionId(ticketId)).length) throw new Error('Previous background Jobs are still running')
+      const subagents = this.host.context.get('subagents') as { listChildren(id: string): Promise<readonly { id: string }[]> } | undefined
+      if (subagents && (await subagents.listChildren(workerSessionId(ticketId))).some(child => this.host.context.agents.get(child.id as SessionId)))
+        throw new Error('Previous subagents are still live')
+    }).catch(error => { this.handoffFailures.set(ticketId, error); throw error })
+    this.track(ticketId, safe)
   }
   /** A stop of a ticket's background work, which a launch or a delivery of the ticket waits for while it runs. */
   private track(ticketId: string, stop: Promise<void>): void {
@@ -408,6 +430,7 @@ export class DshExecutor implements Executor {
   private async stopped(ticketId: string): Promise<void> {
     const stopping = this.stopping.get(ticketId)
     if (stopping) await until(stopping, this.host.lifetime)
+    if (this.handoffFailures.has(ticketId)) throw new Error('Previous execution did not stop safely; the replacement is blocked')
   }
   /**
    * On a host stop, for a bounded time: stop each loaded worker's background work, keeping its inbox; then end the collecting
@@ -428,6 +451,7 @@ export class DshExecutor implements Executor {
   /** Number of open tickets whose worker holds a worker slot: its turn runs, or its shell jobs or subagents still run after its turn ended. */
   activeCount(): number { return this.host.store.tickets.open().filter(ticket => this.running(ticket)).length }
   /** Whether a ticket's worker holds a worker slot: its turn runs, or its shell jobs or subagents do after its turn ended. */
+  active(ticket: Ticket): boolean { return this.running(ticket) }
   private running(ticket: Ticket): boolean {
     if (!runningAssignment(ticket)) return false
     return this.host.context.agents.get(workerSessionId(ticket.id) as SessionId)?.status === 'running' || this.settling.has(ticket.id)
@@ -483,7 +507,7 @@ export class DshExecutor implements Executor {
     const card = told || !source ? undefined : await this.triggerCard(ticket, source.id)
     if (!current()) return
     const batch = told ? [] : batchOf(this.host, ticket).map(batchLine)
-    const text = told ? JSON.stringify({ ticket_id: ticket.id, assignment: ticket.assignments.length, ...retried })
+    const text = told ? JSON.stringify({ ticket_id: ticket.id, assignment: ticket.assignments.length, ...(ticket.execution?.harness ? { harness: harnessInstructions(ticket.execution.harness) } : {}), recovery: 'Reuse the existing workspace and PR. Inspect current Git changes and external side effects before continuing; do not overwrite or repeat them.', ...retried })
       : JSON.stringify({ ticket_id: ticket.id, title: ticket.title, ...(brief ? { assignment: brief } : {}),
         ...(read ? { assignment_chars: chars, assignment_read: read } : {}), ...(card ? { trigger: card } : {}),
         ...(batch.length ? { batch } : {}), ...retried })
@@ -556,9 +580,31 @@ export class DshExecutor implements Executor {
         this.host.context.agents.get(workerSessionId(ticket.id) as SessionId)?.cancel({ kind: 'user' }, { keepInbox: true })
         this.stopWork(ticket.id, 'dsh-superagent restarted', true)
         this.host.engine.assignmentInterrupted(ticket.id, running.id)
+        this.noticeDeployment(ticket)
       }
       else if (latest?.state === 'pending' && !waitsForPerson(ticket)) this.start(ticket, latest)
     }
+  }
+  /** Queues a settled deployment notice or watches the ticket's in-flight deployment. */
+  private noticeDeployment(ticket: Ticket): void {
+    const observation = readDeployObservation(ticket.execution?.directory)
+    if (observation.phase === 'settled') {
+      try { this.host.engine.deployOutcome(ticket.id, observation.notice) }
+      catch {
+        // Resume can retry the terminal observation through the existing durable effect.
+        this.host.effects.enqueue('deployWatch', ticket.id, { ticketId: ticket.id })
+      }
+    }
+    else if (observation.phase === 'pending' || observation.phase === 'unreadable')
+      this.host.effects.enqueue('deployWatch', ticket.id, { ticketId: ticket.id })
+  }
+  private async watchDeployQueued({ ticketId }: { ticketId: string }): Promise<void> {
+    const ticket = this.host.store.tickets.get(ticketId)
+    const observation = readDeployObservation(ticket?.execution?.directory)
+    if (observation.phase === 'settled') this.host.engine.deployOutcome(ticketId, observation.notice)
+    else if (observation.phase === 'unreadable') throw new Later('The external deployment state is unreadable')
+    else if (observation.phase === 'pending' && !deployWatchExpired(observation, Date.now()))
+      throw new Later('The external deployment is still running')
   }
   /** Runs background worker event handling and updates the `worker` health entry on failure or recovery. */
   private background(work: Promise<void>): Promise<void> {

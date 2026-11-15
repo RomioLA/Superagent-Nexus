@@ -197,6 +197,7 @@ it('tells the main Session of a follow-up to an ended ticket once the ticket res
   h.deliveries.mockClear()
   const message = followup('2', '再改一下标题')
   h.runtime.receive(message); await h.runtime.idle()
+  h.runtime.engine.attach(ticket.id, message.id)
   expect(notices(h)).toEqual([])
   await h.runtime.settings.pause(false, 'panel')
   await h.runtime.pump(); await h.runtime.idle()

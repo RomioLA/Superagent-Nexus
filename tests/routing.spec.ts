@@ -1,6 +1,8 @@
+import type { QualityReview } from '../src/app/evaluation.ts'
+import { planResourceFallback } from '../src/app/routing.ts'
 /** P1-S7 lightweight resource-aware routing: trustworthy signals decide, unknown stays unknown, explicit constraints win. */
 import { expect, it } from 'vitest'
-import { availabilityFromWindows, rankRouteCandidates, summarizeRoutingSignals, type RouteCandidate } from '../src/app/routing.ts'
+import { availabilityFromWindows, diffModelSurface, rankRouteCandidates, summarizeRoutingSignals, type RouteCandidate } from '../src/app/routing.ts'
 import { readResource } from '../src/app/resources.ts'
 
 const candidate = (overrides: Partial<RouteCandidate> & Pick<RouteCandidate, 'harness' | 'priority'>): RouteCandidate =>
@@ -176,7 +178,7 @@ it('serves the routing projection from the existing models resource alongside th
   }
   const result = await readResource({
     masterId: 'main', settings: {},
-    store: { settings: () => ({ eval: { model: { provider: 'magpie', model: 'deepseek-v4.1-flash' } },
+    store: { tickets: { list: () => [] }, settings: () => ({ eval: { model: { provider: 'magpie', model: 'deepseek-v4.1-flash' } },
       executor: { model: { provider: 'magpie', model: 'deepseek-v4.1-flash' } } }) },
     context: { sessionController: { modelCatalog: async () => ({
       default: { provider: 'magpie', model: 'deepseek-v4.1-flash' },
@@ -186,4 +188,96 @@ it('serves the routing projection from the existing models resource alongside th
   } as never, 'models', 0, undefined) as Record<string, any>
   expect(result.magpie).toEqual(snapshot)
   expect(result.routing).toMatchObject({ source: 'magpie', preferred_channel: null })
+  // The models resource now reports a real refresh diff, whose first read establishes the baseline.
+  expect(result.refresh).toMatchObject({ first: true })
+})
+
+it('keeps catalog baseline across a failed read while refreshing other sources, then diffs recovery from that baseline', async () => {
+  const catalog = (models: string[], failures: string[] = []) => ({ default: { provider: 'p', model: models[0] ?? '' },
+    groups: models.length ? [{ id: 'p', name: 'Provider', models: models.map(id => ({ id })) }] : [], failures })
+  const reads = [catalog(['a']), catalog(['partial'], ['provider read failed']), catalog(['a', 'b'])]
+  const magpie = (status: string, remaining: number) => ({ status,
+    account_quotas: [{ account_ref: 'ref-a', state: 'ok', windows: [{ remaining }] }],
+    request_usage: [{ served_model: 'model-a', account_ref: 'ref-a' }] })
+  const magpieReads = [magpie('ok', 10), magpie('partial', 0), magpie('ok', 10)]
+  const codexReads = [{ status: 'available' }, { status: 'rate-limited' }, { status: 'available' }]
+  const pages = new Map<string, string>()
+  const host = {
+    masterId: 'main', settings: {}, pages,
+    store: { tickets: { list: () => [] }, settings: () => ({ eval: { model: { provider: 'p', model: 'a' } },
+      executor: { model: { provider: 'p', model: 'a' } } }) },
+    context: { sessionController: { modelCatalog: async () => reads.shift()! } },
+    magpie: async () => magpieReads.shift()!, codexQuota: async () => codexReads.shift()!,
+  } as never
+  const refresh = async () => await readResource(host, 'models', 0, undefined) as { refresh: any }
+
+  const first = await refresh()
+  expect(first.refresh).toMatchObject({ first: true, catalog: { added: ['p/a'], removed: [] } })
+  const successfulBaseline = JSON.parse(pages.get('main:model-surface')!)
+  const failed = await refresh()
+  expect(failed.refresh).toMatchObject({ catalog: { added: [], removed: [] },
+    availability: { changed: [{ channel: 'dsh:model-a', from: 'available', to: 'exhausted' }] },
+    unknown: expect.arrayContaining(['catalog:failed', 'magpie:partial']) })
+  expect(failed.refresh.sources).toContainEqual({ name: 'codex', status: 'rate-limited', changed: true })
+  const failedSnapshot = JSON.parse(pages.get('main:model-surface')!)
+  expect(failedSnapshot.catalog).toEqual(successfulBaseline.catalog)
+  expect(failedSnapshot.sources).toMatchObject({ catalog: 'failed', magpie: 'partial', codex: 'rate-limited' })
+  expect(failedSnapshot.availability['dsh:model-a']).toBe('exhausted')
+
+  const recovered = await refresh()
+  expect(recovered.refresh).toMatchObject({ first: false, catalog: { added: ['p/b'], removed: [] } })
+  const recoveredSnapshot = JSON.parse(pages.get('main:model-surface')!)
+  expect(recoveredSnapshot.catalog).toEqual(['p/a', 'p/b'])
+})
+
+it('reports real model-surface changes and never turns an unreadable source into "no change"', () => {
+  const first = diffModelSurface(undefined, { catalog: ['p/a'], availability: { 'dsh:a': 'available' }, sources: { catalog: 'ok', magpie: 'ok' } })
+  expect(first.catalog).toEqual({ added: ['p/a'], removed: [] })
+  const next = diffModelSurface(
+    { catalog: ['p/a'], availability: { 'dsh:a': 'available' }, sources: { catalog: 'ok', magpie: 'ok' } },
+    { catalog: ['p/a', 'p/b'], availability: { 'dsh:a': 'exhausted' }, sources: { catalog: 'ok', magpie: 'failed' } })
+  expect(next.catalog).toEqual({ added: ['p/b'], removed: [] })
+  expect(next.availability.changed).toEqual([{ channel: 'dsh:a', from: 'available', to: 'exhausted' }])
+  // A newly catalogued model has no inherited quality evidence.
+  expect(next.capability.new_without_evidence).toEqual(['p/b'])
+  expect(next.sources).toContainEqual({ name: 'magpie', status: 'failed', changed: true })
+  expect(next.unknown).toContain('magpie:failed')
+})
+
+const qualityContext = { taskType: 'development', difficulty: 'complex', conditions: 'same constraints', ruleVersion: 'ac-v1' }
+const qualityReviews: QualityReview[] = ['grok', 'codex'].map((harness, index) => ({ id: `review-${index}`, harness: harness as 'grok' | 'codex',
+  model: harness === 'grok' ? 'grok-4.7-build-fast' : 'gpt-6-luna', ...qualityContext, artifact: `artifact-${index}`,
+  evaluator: 'calibrated-reviewer', assignmentId: `a${index}`, evidenceRefs: [`ticket/t${index}`], verdict: index ? 'meets' : 'does-not-meet', origin: 'fixture',
+  calibration: 'same anchored AC criteria', sufficiency: 'reviewer inspected comparable results', at: '2026-11-15T00:00:00Z' }))
+const qualityCandidates: RouteCandidate[] = [
+  { harness: 'grok', model: 'grok-4.7-build-fast', priority: 1, capable: true },
+  { harness: 'codex', model: 'gpt-6-luna', priority: 2, capable: true },
+]
+it('adjusts comparable quality order while quota exhaustion/restoration leaves history intact', () => {
+  const options = { quality: { context: qualityContext, reviews: qualityReviews, origin: 'fixture' as const } }
+  expect(rankRouteCandidates(qualityCandidates, options).selected?.candidate.harness).toBe('codex')
+  const exhausted = qualityCandidates.map(row => row.harness === 'codex' ? { ...row, reading: { state: 'exhausted' as const, evidence: 'reported 429 quota' } } : row)
+  expect(rankRouteCandidates(exhausted, options).selected?.candidate.harness).toBe('grok')
+  expect(rankRouteCandidates(qualityCandidates, options).selected?.candidate.harness).toBe('codex')
+  expect(qualityReviews[1]?.verdict).toBe('meets')
+})
+it('keeps fixtures, uncalibrated reviews, different difficulty/model/Harness out of live quality ranking', () => {
+  expect(rankRouteCandidates(qualityCandidates, { quality: { context: qualityContext, reviews: qualityReviews } }).selected?.candidate.harness).toBe('grok')
+  const renamed = qualityCandidates.map(row => row.harness === 'codex' ? { ...row, model: 'new-model' } : row)
+  expect(rankRouteCandidates(renamed, { quality: { context: qualityContext, reviews: qualityReviews, origin: 'fixture' } }).selected?.candidate.harness).toBe('grok')
+  const changed = { ...qualityContext, difficulty: 'simple' }
+  expect(rankRouteCandidates(qualityCandidates, { quality: { context: changed, reviews: qualityReviews, origin: 'fixture' } }).selected?.candidate.harness).toBe('grok')
+})
+it('blocks illegal fallback and unreviewed existing side effects instead of selecting a prohibited high-cost model', () => {
+  const candidates: RouteCandidate[] = [
+    { harness: 'grok', model: 'grok-4.7-build-fast', required: true, capable: true, priority: 1, reading: { state: 'rate-limited', evidence: '429' } },
+    { harness: 'agy', model: '4a', capable: true, priority: 2 },
+    { harness: 'codex', model: 'gpt-6-luna', capable: true, priority: 3 },
+  ]
+  const options = { allowFallback: true, allow4a: false }
+  expect(planResourceFallback(candidates, options, { oldWorkerActive: true, hasSideEffects: true, checked: false }).status).toBe('blocked')
+  expect(planResourceFallback(candidates, options, { oldWorkerActive: false, hasSideEffects: true, checked: false }).blocker).toContain('workspace/Git/PR')
+  const safe = planResourceFallback(candidates, options, { oldWorkerActive: false, hasSideEffects: true, checked: true })
+  expect(safe.status).toBe('ready'); expect(safe.decision.selected?.candidate.harness).toBe('codex')
+  expect(planResourceFallback(candidates.slice(0, 2), options, { oldWorkerActive: false, hasSideEffects: false, checked: true }).status).toBe('blocked')
 })
