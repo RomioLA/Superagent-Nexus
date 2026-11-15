@@ -9,7 +9,8 @@ import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type MasterAssess
 import { ticketCard } from '../cards.ts'
 import { runAsWorker } from '../../infra/environment.ts'
 import { QualityReviewSchema, validateQualityReview } from '../evaluation.ts'
-import { rankRouteCandidates, planResourceFallback, summarizeCodexQuotaSignals, summarizeRoutingSignals } from '../routing.ts'
+import { rankRouteCandidates, planResourceFallback, summarizeCodexQuotaSignals, summarizeRoutingSignals, availabilityReadingFor, harnessAcceptBlocker } from '../routing.ts'
+import { isRouteAuthorized, readSelection, type Selection } from '../models.ts'
 import { composeTicketReceipt, isChinese } from '../receipts.ts'
 import { PromptConfigSchema, savePrompts, type Prompts } from '../prompts.ts'
 import { readResource, type MainResourceHost, type ResourceHost } from '../resources.ts'
@@ -28,7 +29,7 @@ export interface MainToolsHost {
   readonly context: Context
   workerActive?(ticket: import('../../core/index.ts').Ticket): boolean
   readonly engine: Pick<EngineForMainSession, 'decide' | 'acceptTasks' | 'attach' | 'reply' | 'requestStatus' | 'note'> & EngineForPeople
-  readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'atomic' | 'replyStatus' | 'settings'>
+  readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'atomic' | 'replyStatus' | 'settings' | 'get'>
   readonly prompts: Pick<Prompts, 'preview' | 'save'>
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry'>
   readonly settings: Pick<Settings, 'view' | 'block' | 'save' | 'pause' | 'sync'>
@@ -128,11 +129,12 @@ function invalid(item: RouteItem): string | undefined {
   return undefined
 }
 type Routed = { decision?: DecisionKind; reason: string; ticketId?: string | undefined; ticketIds?: readonly string[]; triggerIds?: readonly string[] }
+type AvailabilityInput = { magpie?: unknown; authorization: Selection }
 /**
  * Carry out one routing decision as its Engine command, in a transaction of its own. `decided` holds the Triggers that this
  * call's earlier items decided, with their batches.
  */
-function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string, string>): Routed | { refused: string } {
+function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string, string>, availability: AvailabilityInput | undefined): Routed | { refused: string } {
   const trigger = host.store.triggers.get(item.trigger_id)
   const target = (id?: string | null) => {
     if (!trigger?.meta.projectRequired) return undefined
@@ -153,6 +155,19 @@ function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string
   switch (item.kind) {
     case 'accept': {
       if (item.tasks && item.tasks.length >= 2) {
+        if (availability) {
+          for (const task of item.tasks) {
+            const spec = task.harness ?? item.harness
+            if (!spec) continue
+            // For DSH the actual logical route is the configured executor model unless the task names one; other Harnesses use
+            // their own reader. Checking this model's channel (not "any account anywhere") is what the gate must enforce.
+            const model = spec.harness === 'dsh' ? (spec.model ?? host.store.settings().executor.model?.model) : spec.model
+            if (!isRouteAuthorized(availability.authorization, spec.harness, model))
+              return { refused: `Task "${task.title}" not accepted: ${spec.harness}${model ? `/${model}` : ''} is disabled in the model authorization panel` }
+            const blocked = harnessAcceptBlocker(spec, availabilityReadingFor({ magpie: availability.magpie }, spec.harness, model))
+            if (blocked) return { refused: `Task "${task.title}" not accepted: ${blocked}` }
+          }
+        }
         const accepted = host.engine.acceptTasks(item.trigger_id, {
           tasks: item.tasks.map((task, index) => ({ title: task.title, name: task.worktree_name,
             ...(task.scope ? { scope: task.scope } : {}),
@@ -167,6 +182,13 @@ function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string
         if (!accepted.ticketIds.length) return { refused: 'No Tickets were created' }
         return { decision: 'accept', reason: `Accepted as ${accepted.ticketIds.length} independent Tickets`,
           ticketIds: accepted.ticketIds, triggerIds: [item.trigger_id] }
+      }
+      if (availability && item.harness) {
+        const model = item.harness.harness === 'dsh' ? (item.harness.model ?? host.store.settings().executor.model?.model) : item.harness.model
+        if (!isRouteAuthorized(availability.authorization, item.harness.harness, model))
+          return { refused: `${item.harness.harness}${model ? `/${model}` : ''} is disabled in the model authorization panel` }
+        const blocked = harnessAcceptBlocker(item.harness, availabilityReadingFor({ magpie: availability.magpie }, item.harness.harness, model))
+        if (blocked) return { refused: blocked }
       }
       const before = host.store.triggers.disposition(item.trigger_id)?.decisionId
       const decision = host.engine.decide(item.trigger_id, { kind: 'accept', title: item.title!, scope: item.title!, reason: { code: 'explicitRouted' },
@@ -202,14 +224,31 @@ function routeTool(host: MainToolsHost): Tool {
     name: 'orchestrator_route',
     description: 'Route candidates, one item each by the card\'s trigger_id, in one call: accept an explicit request as a new ticket, attach a trigger to an existing ticket, stop a ticket on a person\'s stop message, or ignore a candidate that needs no ticket or stop, as dispatch says. Items run in order and each is answered on its own; a refused item leaves the others. An inferred candidate may be ignored here; accepting one goes through orchestrator_eval_decide.',
     schema: z.object({ decisions: z.array(RouteItemSchema).min(1).max(20) }).strict(),
-    execute: async ({ decisions }) => {
+    execute: async ({ decisions }, signal) => {
+      // Read only the resource status the dispatch decision can check cheaply: a KNOWN exhausted/rate-limited Magpie/DSH
+      // channel is refused so the Router picks an authorized available candidate instead of silently running an unusable one.
+      // Codex quota needs a CLI read, so it stays unknown at accept time (the Router reads it on demand via
+      // orchestrator_rank_candidates); Grok/AGY expose no quota reader and never block.
+      const accepts = decisions.filter(item => item.kind === 'accept')
+      const chosen = accepts.flatMap(item => [
+        ...(item.harness ? [item.harness.harness] : []),
+        ...(item.tasks ?? []).map(task => task.harness?.harness ?? item.harness?.harness),
+      ])
+      const safeRead = async (fn?: (signal?: AbortSignal) => Promise<unknown>): Promise<unknown> => {
+        if (!fn) return undefined
+        try { return await fn(signal) } catch { return undefined }
+      }
+      const availability = accepts.length ? {
+        magpie: chosen.includes('dsh') ? await safeRead(host.resources.magpie) : undefined,
+        authorization: readSelection(host.store),
+      } satisfies AvailabilityInput : undefined
       const decided = new Map<string, string>()
       const results = decisions.map(item => {
         const head = { trigger_id: item.trigger_id, kind: item.kind }
         const problem = invalid(item)
         if (problem) return { ...head, refused: problem }
         try {
-          const result = route(host, item, decided)
+          const result = route(host, item, decided, availability)
           if ('refused' in result) return { ...head, ...result }
           for (const id of result.triggerIds ?? []) if (!decided.has(id)) decided.set(id, item.trigger_id)
           const ticket = result.ticketId ? host.store.tickets.get(result.ticketId) : undefined
@@ -363,7 +402,16 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
       description: 'Record the decision of an assessment, as admission describes it, after orchestrator_eval with the same trigger_id.',
       schema: z.object({ trigger_id: z.string().min(1), ...AssessmentSchema.shape }).strict(),
       execute: async ({ trigger_id, ...result }, signal) => {
-        const decided = await host.assessor.decide(trigger_id, AssessmentSchema.parse(result), signal)
+        const assessment = AssessmentSchema.parse(result)
+        // An inferred acceptance runs on the default DSH route (its assessment carries no Harness), so it must obey the same
+        // authorization set as explicit dispatch — reuse the one rule instead of a second copy. Scan and inference never widen it.
+        if (assessment.decision === 'accept') {
+          const model = host.store.settings().executor.model?.model
+          if (!isRouteAuthorized(readSelection(host.store), 'dsh', model)) {
+            return { refused: `The default DSH route${model ? ` (${model})` : ''} is disabled in the model authorization panel; enable it or route an authorized Harness explicitly with orchestrator_route.` }
+          }
+        }
+        const decided = await host.assessor.decide(trigger_id, assessment, signal)
         return routed(host, { decision: decided.state as DecisionKind, reason: decided.reason, ticketId: decided.ticket_id })
       },
     }),

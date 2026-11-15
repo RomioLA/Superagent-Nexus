@@ -12,8 +12,9 @@ import { threadTitle } from './views/records.ts'
 import { ticketStatusCountsOf } from './views/tickets.ts'
 import { transcriptEntry } from './context.ts'
 import { builtInParts, defaultPrompts } from './prompts.ts'
-import { diffModelSurface, summarizeCodexQuotaSignals, summarizeRoutingSignals, type ModelSurfaceSnapshot } from './routing.ts'
+import { diffModelSurface, summarizeCodexQuotaSignals, summarizeHarnessAvailability, summarizeRoutingSignals, type ModelSurfaceSnapshot } from './routing.ts'
 import { evaluationInput } from './evaluation.ts'
+import { selectionView } from './models.ts'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Commands } from '../infra/commands.ts'
 import type { PromptVersion, Prompts } from './prompts.ts'
@@ -222,6 +223,10 @@ const ROUTES: readonly Route[] = [
     return { default: catalog.default, roles, failures: catalog.failures,
       providers: catalog.groups.map(group => ({ id: group.id, name: group.name, count: group.models.length, read: `models/${group.id}` })),
       magpie, codex_quota: codexQuota, routing, codex_routing: summarizeCodexQuotaSignals(codexQuota),
+      // The same per-Harness availability the dispatch gate uses, so the Router reads one consistent view.
+      harnesses: summarizeHarnessAvailability({ magpie, codex: codexQuota }),
+      // The user's explicit enabled-route set the dispatch gate enforces (null = every route is authorized).
+      authorization: typeof host.store.get === 'function' ? selectionView(host.store) : { explicit: false, enabled: null },
       quality_reviews: host.store.tickets.list().flatMap(ticket => (ticket.execution?.qualityReviews ?? []).map(review => ({ ticket_id: ticket.id, ...review }))),
       quality_status: 'Provisional unless exact live identity, comparable context, calibrated review and sufficiency evidence exist; use orchestrator_rank_candidates.',
       refresh: { first: previous === undefined, ...refresh } }

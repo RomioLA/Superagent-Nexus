@@ -19,6 +19,13 @@ import type { HarnessName } from '../core/index.ts'
 export type Availability = 'available' | 'exhausted' | 'rate-limited' | 'unknown'
 
 /**
+ * The logical model id used everywhere for authorization and channel matching. A role model can be provider-qualified
+ * (e.g. `auto/deepseek-v4.1-flash` while the observed served model is `deepseek-v4.1-flash`); comparing the last path
+ * segment keeps a checked box and the real dispatch on the same id instead of rejecting a name mismatch.
+ */
+export const logicalModelId = (model?: string): string | undefined => model ? model.split('/').at(-1) : undefined
+
+/**
  * A normalized availability reading for one candidate. `remaining` and `resetsAt` are present only when the source named
  * them; an absent value is never filled with a guess or a zero.
  */
@@ -272,6 +279,8 @@ export interface RoutingChannel {
   selectable: boolean
   excluded_because?: CandidateEvaluation['excludedBecause']
   reason: string
+  /** Per-account detail when several Magpie accounts serve this one logical model; top-level availability is the aggregate. */
+  accounts?: { account_ref?: string; availability: Availability; remaining?: number; resets_at?: string }[]
 }
 
 /** The explainable resource projection the Router reads; it states what is known and what is still unknown. */
@@ -311,29 +320,65 @@ export function summarizeRoutingSignals(snapshot: unknown): RoutingSignals {
       : { state: 'unknown', evidence: `quota card state=${text(card.state) ?? 'unknown'}` })
   }
 
-  // Build candidates from the model channels actually observed for these keys; unknown account linkage stays unknown.
-  const candidates: RouteCandidate[] = []
-  const meta = new Map<RouteCandidate, { provider?: string; account_ref?: string }>()
+  // Fold per-account observations into one logical channel per (model, provider): several Magpie accounts that serve the
+  // same model become one candidate row (their per-account quota stays as detail) instead of duplicate rows.
+  interface ChannelGroup { model: string; provider?: string; accounts: { account_ref?: string; reading?: AvailabilityReading }[] }
+  const groups = new Map<string, ChannelGroup>()
   const usage = Array.isArray(data.request_usage) ? data.request_usage : []
-  usage.forEach(group => {
-    if (!isRecord(group)) return
+  for (const group of usage) {
+    if (!isRecord(group)) continue
     const model = text(group.served_model) ?? text(group.requested_model)
-    if (!model) return
+    if (!model) continue
+    const provider = text(group.provider)
     const ref = text(group.account_ref)
+    const key = `${model}\u0000${provider ?? ''}`
+    let entry = groups.get(key)
+    if (!entry) { entry = { model, ...(provider ? { provider } : {}), accounts: [] }; groups.set(key, entry) }
     const reading = ref ? byAccount.get(ref) : undefined
+    entry.accounts.push({ ...(ref ? { account_ref: ref } : {}), ...(reading ? { reading } : {}) })
+  }
+  // A group with one account keeps that account's exact reading (remaining/resets_at/evidence). Several accounts aggregate:
+  // available when any account is available; unknown when any account has no trustworthy reading (partial exhaustion must NOT
+  // be reported as a fully exhausted channel — an unknown account may still serve); only exhausted/rate-limited when every
+  // account is known and none is available.
+  const aggregateReading = (accounts: ChannelGroup['accounts']): AvailabilityReading | undefined => {
+    if (accounts.length === 1) return accounts[0]!.reading
+    const states = accounts.map(account => account.reading?.state ?? 'unknown')
+    if (states.includes('available'))
+      return { state: 'available', evidence: `at least one of ${accounts.length} Magpie accounts is available` }
+    if (states.includes('unknown'))
+      return { state: 'unknown', evidence: `${states.filter(state => state === 'unknown').length} of ${accounts.length} Magpie accounts have no trustworthy reading` }
+    if (states.every(state => state === 'rate-limited')) return { state: 'rate-limited', evidence: 'every Magpie account is rate-limited' }
+    return { state: 'exhausted', evidence: 'every Magpie account is exhausted' }
+  }
+  const candidates: RouteCandidate[] = []
+  const meta = new Map<RouteCandidate, { provider?: string; account_ref?: string; accounts: ChannelGroup['accounts'] }>()
+  for (const entry of groups.values()) {
+    const reading = aggregateReading(entry.accounts)
+    const linked = entry.accounts.some(account => account.account_ref)
     const candidate: RouteCandidate = {
-      harness: 'dsh', model, capable: true,
-      ...(reading ? { reading } : { unknownReason: ref ? 'no matching quota snapshot for this account' : 'account not linked to a quota snapshot' }),
+      harness: 'dsh', model: entry.model, capable: true,
+      ...(reading ? { reading } : { unknownReason: linked ? 'no matching quota snapshot for this account' : 'account not linked to a quota snapshot' }),
     }
-    meta.set(candidate, { ...(text(group.provider) ? { provider: text(group.provider) } : {}), ...(ref ? { account_ref: ref } : {}) })
+    meta.set(candidate, {
+      ...(entry.provider ? { provider: entry.provider } : {}),
+      ...(entry.accounts.length === 1 && entry.accounts[0]!.account_ref ? { account_ref: entry.accounts[0]!.account_ref } : {}),
+      accounts: entry.accounts,
+    })
     candidates.push(candidate)
-  })
+  }
 
   const decision = rankRouteCandidates(candidates)
   // Every observed channel is shown, including one excluded as exhausted, so the Router sees the real evidence and why.
   const observedChannels: RoutingChannel[] = decision.evaluated.map(item => {
     const reading = item.candidate.reading
     const channel = meta.get(item.candidate)
+    const accounts = channel?.accounts.map(account => ({
+      ...(account.account_ref ? { account_ref: account.account_ref } : {}),
+      availability: account.reading?.state ?? ('unknown' as Availability),
+      ...(account.reading?.remaining !== undefined ? { remaining: account.reading.remaining } : {}),
+      ...(account.reading?.resetsAt ? { resets_at: account.reading.resetsAt } : {}),
+    }))
     return {
       harness: item.candidate.harness, model: item.candidate.model!,
       ...(item.candidate.priority !== undefined ? { priority: item.candidate.priority } : {}),
@@ -344,6 +389,7 @@ export function summarizeRoutingSignals(snapshot: unknown): RoutingSignals {
       ...(reading?.resetsAt ? { resets_at: reading.resetsAt } : {}),
       selectable: item.selectable, ...(item.excludedBecause ? { excluded_because: item.excludedBecause } : {}),
       reason: item.reasons.join('; '),
+      ...(accounts && accounts.length > 1 ? { accounts } : {}),
     }
   })
 
@@ -363,6 +409,62 @@ export function summarizeRoutingSignals(snapshot: unknown): RoutingSignals {
       : null,
     unknown: [...unknown], note: ROUTING_NOTE,
   }
+}
+
+/** Aggregate several observed readings without turning a partially-unknown set into a false "exhausted". */
+function combineAvailabilityStates(states: readonly Availability[], count: number, what: string): AvailabilityReading {
+  if (!count) return { state: 'unknown', evidence: `no ${what} reading` }
+  if (states.includes('available')) return { state: 'available', evidence: `at least one of ${count} ${what} is available` }
+  if (states.includes('unknown'))
+    return { state: 'unknown', evidence: `${states.filter(state => state === 'unknown').length} of ${count} ${what} have no trustworthy reading` }
+  if (states.every(state => state === 'rate-limited')) return { state: 'rate-limited', evidence: `every ${what} is rate-limited` }
+  return { state: 'exhausted', evidence: `every ${what} is exhausted` }
+}
+
+/**
+ * Normalize each Harness's known availability from the readers that actually exist, for the panel's overview. Magpie
+ * channels describe DSH; Codex has an independent quota reader; Grok and AGY expose no readable quota, so they stay explicitly
+ * unknown rather than being assumed healthy. This is a Harness-level summary; dispatch must use `availabilityReadingFor` so a
+ * specific model is checked against its own logical channel rather than "any account somewhere in the Harness".
+ */
+export function summarizeHarnessAvailability(input: { magpie?: unknown; codex?: unknown }): Record<HarnessName, AvailabilityReading> {
+  const routing = summarizeRoutingSignals(input.magpie)
+  const dshChannels = routing.observed_channels.filter(channel => channel.harness === 'dsh')
+  const codex = summarizeCodexQuotaSignals(input.codex ?? { status: 'unknown' })
+  return {
+    dsh: combineAvailabilityStates(dshChannels.map(channel => channel.availability), dshChannels.length, 'Magpie channel'),
+    codex: { state: codex.availability, evidence: codex.reason },
+    grok: { state: 'unknown', evidence: 'Grok quota is not readable; availability is unknown' },
+    agy: { state: 'unknown', evidence: 'AGY quota is not readable; availability is unknown' },
+  }
+}
+
+/**
+ * The availability of the specific logical route being dispatched: for DSH/Magpie, only the channel(s) of the selected model
+ * (never "some account in the Harness is available"); other Harnesses use their reader. Unknown stays unknown.
+ */
+export function availabilityReadingFor(input: { magpie?: unknown; codex?: unknown }, harness: HarnessName,
+  model?: string): AvailabilityReading {
+  if (harness !== 'dsh') return summarizeHarnessAvailability(input)[harness]
+  const channels = summarizeRoutingSignals(input.magpie).observed_channels
+    .filter(channel => channel.harness === 'dsh' && (model === undefined || logicalModelId(channel.model) === logicalModelId(model)))
+  if (!channels.length) return { state: 'unknown', evidence: model ? `no Magpie channel for ${model}` : 'no Magpie channel reading' }
+  return combineAvailabilityStates(channels.map(channel => channel.availability), channels.length, model ? `Magpie channel for ${model}` : 'Magpie channel')
+}
+
+/**
+ * Why the Harness a router chose must not be accepted right now: only a KNOWN exhausted or rate-limited reading blocks it.
+ * Unknown availability never blocks, and a person's explicit Harness/model is preserved — the caller reports the blocker so
+ * the Router can choose an authorized available resource instead of this code silently substituting one.
+ */
+export function harnessAcceptBlocker(spec: { harness: HarnessName; model?: string; forbid4a?: boolean; allowFallback?: boolean },
+  reading: AvailabilityReading): string | undefined {
+  const candidate: RouteCandidate = { harness: spec.harness, ...(spec.model ? { model: spec.model } : {}), capable: true, required: true, reading }
+  const evaluation = rankRouteCandidates([candidate], { allowFallback: spec.allowFallback === true }).evaluated[0]!
+  if (evaluation.excludedBecause === 'exhausted' || evaluation.excludedBecause === 'rate-limited')
+    return `Chosen ${spec.harness}${spec.model ? `/${spec.model}` : ''} is known ${evaluation.excludedBecause}: ${evaluation.reasons.join('; ')}.`
+      + ' Choose an authorized available resource or call orchestrator_rank_candidates.'
+  return undefined
 }
 
 /** A compact, comparable view of exactly what one model-surface refresh read, so a later refresh reports real changes. */
