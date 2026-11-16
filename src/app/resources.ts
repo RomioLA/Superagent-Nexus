@@ -1,6 +1,6 @@
 /** Serves paginated context resources to orchestrator_read so large bodies stay out of model prompts until requested. */
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import { UserError, key, latestReport, reached, runningAssignment, threadKey, type Ticket, type Trigger } from '../core/index.ts'
+import { UserError, key, latestReport, reached, runningAssignment, threadKey, type HarnessName, type Ticket, type Trigger } from '../core/index.ts'
 import { batchOf, inputMessage, triggerMessage, workerSessionId } from '../executor/dsh.ts'
 import { readGithub } from '../sources/github-read.ts'
 import { feishuReferences, feishuRead } from '../sources/feishu-read.ts'
@@ -12,9 +12,9 @@ import { threadTitle } from './views/records.ts'
 import { ticketStatusCountsOf } from './views/tickets.ts'
 import { transcriptEntry } from './context.ts'
 import { builtInParts, defaultPrompts } from './prompts.ts'
-import { diffModelSurface, summarizeCodexQuotaSignals, summarizeHarnessAvailability, summarizeRoutingSignals, type ModelSurfaceSnapshot } from './routing.ts'
+import { diffModelSurface, harnessDispatchable, summarizeCodexQuotaSignals, summarizeHarnessAvailability, summarizeRoutingSignals, type HarnessModelSource, type ModelSurfaceSnapshot } from './routing.ts'
 import { evaluationInput } from './evaluation.ts'
-import { selectionView } from './models.ts'
+import { isRouteAuthorized, readSelection, selectionView } from './models.ts'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Commands } from '../infra/commands.ts'
 import type { PromptVersion, Prompts } from './prompts.ts'
@@ -60,6 +60,22 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
 ]
 export const resourceGrammar = (executor: boolean): string => RESOURCES.filter(resource => !executor || resource.executor)
   .map(resource => `${resource.name}: ${resource.holds}`).join('; ')
+
+/** The authorizable Worker model pool the Router may pick from: dispatchable external models from the last scan plus the configured DSH route, each with the user's authorization. Availability is not fabricated here. */
+function authorizedModelPool(host: ResourceHost): { harness: HarnessName; provider: string; model: string; authorized: boolean }[] {
+  const readable = typeof host.store.get === 'function'
+  const scan = readable ? host.store.get(KV.models.scan) : undefined
+  const selection = readable ? readSelection(host.store) : undefined
+  const sources = (scan?.harnessModels ?? []) as HarnessModelSource[]
+  const external = sources.filter(source => source.status === 'ok').flatMap(source => source.models
+    .filter(model => harnessDispatchable(source.harness as HarnessName, model))
+    .map(model => ({ harness: source.harness as HarnessName, provider: source.provider, model,
+      authorized: isRouteAuthorized(selection, source.harness as HarnessName, model) })))
+  const route = host.store.settings().executor.model
+  const configured = route?.model ? [{ harness: 'dsh' as HarnessName, provider: route.provider ?? 'dsh', model: route.model,
+    authorized: isRouteAuthorized(selection, 'dsh', route.model) }] : []
+  return [...configured, ...external]
+}
 
 export interface ResourceHost {
   readonly store: Pick<Store, 'get' | 'settings' | 'triggers' | 'tickets' | 'threads' | 'read' | 'decisions' | 'replyStatus'>
@@ -227,6 +243,7 @@ const ROUTES: readonly Route[] = [
       harnesses: summarizeHarnessAvailability({ magpie, codex: codexQuota }),
       // The user's explicit enabled-route set the dispatch gate enforces (null = every route is authorized).
       authorization: typeof host.store.get === 'function' ? selectionView(host.store) : { explicit: false, enabled: null },
+      authorized_models: authorizedModelPool(host),
       quality_reviews: host.store.tickets.list().flatMap(ticket => (ticket.execution?.qualityReviews ?? []).map(review => ({ ticket_id: ticket.id, ...review }))),
       quality_status: 'Provisional unless exact live identity, comparable context, calibrated review and sufficiency evidence exist; use orchestrator_rank_candidates.',
       refresh: { first: previous === undefined, ...refresh } }

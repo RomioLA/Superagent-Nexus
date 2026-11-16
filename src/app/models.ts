@@ -17,8 +17,19 @@ import { agyCliPath, codexCliPath, sharedCodexHome, sharedGrokHome } from './too
 /** The user's explicit enabled routes (`enabled` = `harness/model` or a whole-harness `harness` key), or `undefined` = all. */
 export type Selection = ReadonlySet<string> | undefined
 
-/** Key of one logical route: `harness/model` (normalized to the bare model id) or a whole-harness `harness` key. */
-export const routeKey = (harness: HarnessName, model?: string): string => model ? `${harness}/${logicalModelId(model)}` : harness
+/** The key under which a model is authorized. AGY is authorized as a family: the gemini-3.8-flash-* reasoning tiers share `3.8f`, and gemini-4-argon-* shares `4a`. Other Harnesses keep the bare logical model id. */
+export const authorizationModelKey = (harness: HarnessName, model?: string): string | undefined => {
+  if (!model) return undefined
+  if (harness === 'agy') {
+    if (model === '4a' || /^gemini-4-argon-/.test(model)) return '4a'
+    if (model === '3.8f' || /^gemini-3\.8-flash-/.test(model)) return '3.8f'
+    return logicalModelId(model)
+  }
+  return logicalModelId(model)
+}
+
+/** Key of one logical route: `harness/model` (normalized, with AGY families collapsed) or a whole-harness `harness` key. */
+export const routeKey = (harness: HarnessName, model?: string): string => model ? `${harness}/${authorizationModelKey(harness, model)}` : harness
 
 /** Read the persisted authorization; `undefined` means no explicit choice was saved, so every route stays authorized. */
 export function readSelection(store: Pick<Store, 'get'>): Selection {

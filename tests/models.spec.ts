@@ -179,3 +179,36 @@ it('counts external Harness model changes and never reports a failed source as r
   expect(failed.diff.catalog.removed).not.toContain('grok:grok:grok-4.7')
   expect(failed.diff.catalog.removed).not.toContain('grok:grok:grok-4.8')
 })
+
+it('collapses AGY authorization to the family key the executor actually runs', () => {
+  expect(routeKey('agy', 'gemini-3.8-flash-high')).toBe('agy/3.8f')
+  expect(routeKey('agy', '3.8f')).toBe('agy/3.8f')
+  expect(routeKey('agy', 'gemini-4-argon-medium')).toBe('agy/4a')
+  expect(routeKey('agy', '4a')).toBe('agy/4a')
+  const store = fakeStore(); saveSelection(store as never, ['agy/3.8f'])
+  const selection = readSelection(store as never)
+  expect(isRouteAuthorized(selection, 'agy', 'gemini-3.8-flash-low')).toBe(true)
+  expect(isRouteAuthorized(selection, 'agy', 'gemini-3.8-flash-medium')).toBe(true)
+  expect(isRouteAuthorized(selection, 'agy', 'gemini-4-argon-high')).toBe(false)
+})
+
+it('exposes per-model authorization and route keys on discovered external models', async () => {
+  const store = fakeStore({ provider: 'p', model: 'm1' })
+  const groups = [{ id: 'p', name: 'Provider', models: [{ id: 'm1' }] }]
+  saveSelection(store as never, ['codex/gpt-6-astra', 'agy/3.8f'])
+  const runtime = { store, models: async () => ({ default: { provider: 'p', model: 'm1' }, groups, failures: [] }),
+    magpie: async () => ({ status: 'not-configured' }), codexQuota: async () => ({ status: 'unknown' }),
+    harnessModels: async () => [
+      { harness: 'codex', provider: 'codex', status: 'ok', source: 'codex models_cache', models: ['gpt-6-astra', 'gpt-5.6-sol'] },
+      { harness: 'grok', provider: 'grok', status: 'ok', source: 'grok models_cache', models: ['grok-4.7-build-fast', 'grok-4.7'] },
+      { harness: 'agy', provider: 'agy', status: 'ok', source: 'agy models', models: ['gemini-3.8-flash-high', 'claude-sonnet-4-6'] },
+    ] } as never
+  const result = await scanView(runtime)
+  const row = (harness: string, model: string) => result.discovered.find(item => item.harness === harness && item.model === model)!
+  expect(row('codex', 'gpt-6-astra')).toMatchObject({ dispatchable: true, authorized: true, route_key: 'codex/gpt-6-astra' })
+  expect(row('codex', 'gpt-5.6-sol')).toMatchObject({ dispatchable: true, authorized: false, route_key: 'codex/gpt-5.6-sol' })
+  expect(row('agy', 'gemini-3.8-flash-high')).toMatchObject({ dispatchable: true, authorized: true, route_key: 'agy/3.8f' })
+  expect(row('agy', 'claude-sonnet-4-6')).toMatchObject({ dispatchable: false, authorized: false })
+  expect(row('grok', 'grok-4.7-build-fast')).toMatchObject({ dispatchable: true, authorized: false })
+  for (const item of result.discovered) expect(typeof item.route_key).toBe('string')
+})

@@ -23,6 +23,16 @@ function Row({ label, children }: { label: string; children: ReactNode }) {
   return <div className="dt-lv"><span className="dt-lv-label">{label}</span><span className="dt-lv-value">{children}</span></div>
 }
 
+/** One Codex quota window rendered from only the fields the reader actually returned. */
+type CodexWindow = { remaining_percent?: number; window_duration_mins?: number; resets_at?: string }
+function codexWindow(window: CodexWindow): string {
+  const parts: string[] = []
+  if (window.remaining_percent !== undefined) parts.push(`${Math.round(window.remaining_percent)}%`)
+  if (window.window_duration_mins !== undefined) parts.push(`${window.window_duration_mins}min`)
+  if (window.resets_at) parts.push(window.resets_at)
+  return parts.join(' · ') || '—'
+}
+
 export function ModelsPage() {
   const { t, call } = usePanel()
   const { data, error, reload } = usePoll(() => call('GET models/routing'), [], 30_000)
@@ -33,17 +43,27 @@ export function ModelsPage() {
 
   const auth = data.authorization
   const enabled = (key: string): boolean => !auth.explicit || (auth.enabled ?? []).includes(key)
-  const channelKey = (channel: Channel): string => channel.harness === 'dsh' ? `dsh/${channel.model}` : channel.harness
+  const channelKey = (channel: Channel): string => `dsh/${channel.model}`
+  // External Harness models are authorized per concrete executable model, under the canonical route key the dispatch gate uses.
+  const modelSwitches = data.discovered.filter(item => item.dispatchable && item.harness !== 'dsh')
   const allKeys = (): string[] => {
     const keys = new Set<string>()
     for (const channel of data.channels) keys.add(channelKey(channel))
-    // DSH is authorized per model (via channel keys above); a bare `dsh` key would re-authorize every model, so never add it.
-    for (const harness of data.harnesses) if (harness.harness !== 'dsh') keys.add(harness.harness)
+    for (const item of modelSwitches) keys.add(item.route_key)
     return [...keys]
+  }
+  /** Expand a legacy whole-Harness key into the concrete model keys it used to cover, so per-model disabling takes effect. */
+  const normalized = (): Set<string> => {
+    const next = auth.explicit ? new Set(auth.enabled ?? []) : new Set(allKeys())
+    for (const harness of ['codex', 'grok', 'agy'] as const) {
+      if (!next.delete(harness)) continue
+      for (const item of modelSwitches) if (item.harness === harness) next.add(item.route_key)
+    }
+    return next
   }
   /** Toggle one logical route; saving an explicit set is what makes the Router stop auto-selecting it. */
   const toggle = async (key: string): Promise<void> => {
-    const next = auth.explicit ? new Set(auth.enabled ?? []) : new Set(allKeys())
+    const next = normalized()
     if (next.has(key)) next.delete(key); else next.add(key)
     try { setActionError(undefined); await call('PUT models/selection', { body: { enabled: [...next] } }); await reload() }
     catch (failure) { setActionError(failure instanceof Error ? failure : new Error(String(failure))) }
@@ -74,7 +94,7 @@ export function ModelsPage() {
       <Hint>{t('modelDiscoveredHint')}</Hint>
       {data.discovered.length ? <table className="dt-table">
         <thead><tr>
-          <th>{t('modelColumnProvider')}</th><th>{t('modelColumnModel')}</th><th>{t('modelColumnSource')}</th><th>{t('modelColumnState')}</th><th>{t('modelColumnAvailability')}</th><th>{t('modelColumnReason')}</th>
+          <th>{t('modelColumnProvider')}</th><th>{t('modelColumnModel')}</th><th>{t('modelColumnSource')}</th><th>{t('modelColumnState')}</th><th>{t('modelColumnAvailability')}</th><th>{t('modelColumnAuthorized')}</th><th>{t('modelColumnReason')}</th>
         </tr></thead>
         <tbody>{data.discovered.map(item => <tr key={`${item.harness}/${item.provider}/${item.model}`}>
           <td>{item.provider}</td>
@@ -83,9 +103,13 @@ export function ModelsPage() {
           <td>{item.state === 'executable' ? t('modelStateExecutable')
             : item.state === 'availability-unknown' ? t('modelStateAvailabilityUnknown') : t('modelStateDiscovered')}</td>
           <td>{item.availability}</td>
+          <td>{item.dispatchable && item.harness !== 'dsh'
+            ? <Switch checked={enabled(item.route_key)} onChange={() => void toggle(item.route_key)} label={item.route_key} />
+            : <span className="dt-hint">{item.dispatchable ? t('modelAuthViaChannel') : t('modelNotAuthorizable')}</span>}</td>
           <td className="dt-hint">{item.reason}</td>
         </tr>)}</tbody>
       </table> : <Hint>{t('modelNoDiscovered')}</Hint>}
+      {data.discovered.some(item => item.harness === 'agy' && item.dispatchable) && <Hint>{t('modelAgyFamilyHint')}</Hint>}
     </Section>
     <Section title={t('modelHarnessAvailability')} count={data.harnesses.length}>
       <Hint>{t('modelScanCodexHint')}</Hint>
@@ -103,7 +127,7 @@ export function ModelsPage() {
           <td>{harness.harness === 'dsh'
             ? <span className="dt-hint">{t('modelAuthorizationHint')}</span>
             : harness.installed
-              ? <Switch checked={enabled(harness.harness)} onChange={() => void toggle(harness.harness)} label={harness.harness} />
+              ? <span className="dt-hint">{`${modelSwitches.filter(item => item.harness === harness.harness && enabled(item.route_key)).length}/${modelSwitches.filter(item => item.harness === harness.harness).length}`}</span>
               : <span className="dt-hint">{t('modelToolNotInstalled')}</span>}</td>
           <td className="dt-hint">{harness.evidence ?? '—'}</td>
         </tr>)}</tbody>
@@ -154,6 +178,9 @@ export function ModelsPage() {
       <div className="dt-lvs">
         <Row label={t('modelCodexStatus')}>{data.codex.status}</Row>
         <Row label={t('modelColumnReason')}>{data.codex.reason}</Row>
+        {data.codex.checked_at && <Row label={t('modelCheckedAt', { at: data.codex.checked_at })}>{data.codex.source}</Row>}
+        {data.codex.primary && <Row label={t('modelCodexPrimary')}>{codexWindow(data.codex.primary)}</Row>}
+        {data.codex.secondary && <Row label={t('modelCodexSecondary')}>{codexWindow(data.codex.secondary)}</Row>}
       </div>
     </Section>
     <Section title={t('modelQuality')}>
