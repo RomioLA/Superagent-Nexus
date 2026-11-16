@@ -43,6 +43,15 @@ const fromPerson = (input?: TicketInput): boolean => input?.kind === 'trigger' ?
  * DshExecutor catches it to mark the ticket failed immediately rather than retrying automatically, because an existing directory counts as prepared and an automatic retry would treat whatever a failed prepare command left behind in the directory as a prepared workspace.
  */
 class PrepareFailed extends Error {}
+/**
+ * The DSH catalog route a Ticket's worker session must run, or undefined to keep the configured default. Only a DSH ticket
+ * that named a catalog model is re-seated; external Harness tickets run their own CLI and keep the DSH session default.
+ */
+function ticketWorkerModel(ticket: Ticket, configured?: { provider: string; model: string } | null): { provider: string; model: string } | undefined {
+  const harness = ticket.execution?.harness
+  if (!harness || harness.harness !== 'dsh' || !harness.model) return undefined
+  return { provider: harness.provider ?? configured?.provider ?? 'magpie-worker', model: harness.model }
+}
 const PASSING = new RegExp(['ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'EPIPE', 'UND_ERR', 'socket hang up', 'fetch failed',
   'network error', 'overloaded', 'rate limit', '\\b(?:408|429|50[0-4])\\b'].join('|'), 'i')
 /**
@@ -346,7 +355,8 @@ export class DshExecutor implements Executor {
         try {
           // Recreate the worker session if it was externally deleted.
           if (!this.host.context.agents.get(sessionId as SessionId)) {
-            await this.host.sessions.ensure(sessionId, ticket.execution?.directory ?? '', ticket.title, 'worker')
+            await this.host.sessions.ensure(sessionId, ticket.execution?.directory ?? '', ticket.title, 'worker',
+              ticketWorkerModel(ticket, this.host.store.settings().executor.model))
           }
           if (input) await this.deliverInput(ticket, assignment, input)
         } catch (error) {
@@ -503,7 +513,8 @@ export class DshExecutor implements Executor {
     }
     if (!current()) return
     const sessionId = workerSessionId(ticket.id)
-    const agent = await this.host.sessions.ensure(sessionId, workspace, ticket.title, 'worker')
+    const agent = await this.host.sessions.ensure(sessionId, workspace, ticket.title, 'worker',
+      ticketWorkerModel(ticket, this.host.store.settings().executor.model))
     if (!current()) return
     // The background work of the Assignment this one replaces stops first, so its end does not clear this one's message.
     await this.stopped(ticket.id)

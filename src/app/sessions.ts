@@ -13,7 +13,8 @@ import { AgentDelivery, messageId } from './delivery.ts'
 import type { Effects } from './effects.ts'
 import type { Variable } from './execution-environment.ts'
 import { RetryHealth } from './retry-health.ts'
-import { initializeRoleModel } from './role-models.ts'
+import { seedRoleModel } from './role-models.ts'
+import type { RoleModel } from '../policy.ts'
 import { bundledSkills } from './skill-files.ts'
 import { SKILL_PREFIX, type PromptVersion, type Prompts } from './prompts.ts'
 import type { Store } from './store.ts'
@@ -135,8 +136,8 @@ export class Sessions {
       if (status === 'idle' && !this.host.closing()) { this.retryHealth.clear(agent.id); this.updateModelHealth() }
     })
   }
-  /** Resolves or creates session `id` in workspace `cwd`, initializes its role model, decorates it with prompts/skills/tools, sets `danger-full-access` permissions, and renames it to `title`. */
-  async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker'): Promise<Agent> {
+  /** Resolves or creates session `id` in workspace `cwd`, seats its role or explicit Ticket model, decorates it with prompts/skills/tools, sets `danger-full-access` permissions, and renames it to `title`. */
+  async ensure(id: string, cwd: string, title: string, role: 'orchestrator' | 'worker', model?: RoleModel): Promise<Agent> {
     const ctx = this.ctx
     let result = await ctx.sessionController.resolveAgent(id as SessionId)
     if ('error' in result && result.error.code === 'session/not-found') {
@@ -148,7 +149,9 @@ export class Sessions {
     }
     if ('error' in result) throw result.error
     const settings = this.host.store.settings()
-    await initializeRoleModel(ctx, result.agent, role === 'orchestrator' ? settings.eval.model : settings.executor.model)
+    // An explicit Ticket model is seated and force-re-applied on continuation; otherwise the configured role default seeds a
+    // brand-new session only, leaving durable selections intact.
+    await seedRoleModel(ctx, result.agent, model ?? (role === 'orchestrator' ? settings.eval.model : settings.executor.model), model !== undefined)
     await this.decorate(result.agent)
     ctx.permissionPresets.set(result.agent.session, 'danger-full-access')
     await ctx.sessionController.rename({ sessionId: id as SessionId, title })

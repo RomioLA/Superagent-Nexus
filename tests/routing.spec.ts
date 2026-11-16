@@ -166,7 +166,7 @@ it('reports a not-configured Magpie source as unknown rather than healthy', () =
   expect(routing.unknown).toEqual(expect.arrayContaining(['cost_usd', 'cache_hit_rate', 'agy_quota', 'grok_quota', 'codex_quota']))
 })
 
-it('marks only the configured DSH executor model as a dispatchable channel and shows the rest as discovered only', () => {
+it('marks every catalog model of a loaded provider as a dispatchable DSH route and only the configured one as a channel', () => {
   const routing = summarizeRoutingSignals({
     status: 'ok',
     account_quotas: [{ account_ref: 'ref-a', state: 'ok', windows: [{ remaining: 9 }] }],
@@ -179,17 +179,19 @@ it('marks only the configured DSH executor model as a dispatchable channel and s
       { id: 'cold', name: 'Cold provider', models: [{ id: 'cold-model' }] },
     ],
   }
-  // Only the configured DSH executor model is a real, dispatchable channel; a matching Magpie reading is kept.
+  // Only the configured DSH executor model is a selectable availability channel; a matching Magpie reading is kept.
   const observed = discoverModelSurface(catalog, routing, { provider: 'magpie', model: 'used-model' })
   expect(observed.channels.map(channel => channel.model)).toEqual(['used-model'])
   expect(observed.channels[0]).toMatchObject({ availability: 'available' })
-  expect(observed.discovered.find(item => item.model === 'configured-model')).toMatchObject({ dispatchable: false, state: 'discovered' })
+  // Another model of the same loaded provider is a resolvable DSH route, so it is dispatchable with unknown quota.
+  expect(observed.discovered.find(item => item.model === 'configured-model')).toMatchObject({ dispatchable: true, state: 'availability-unknown' })
+  // A model of a provider that did not load stays discovered-only.
   expect(observed.discovered.find(item => item.model === 'cold-model')).toMatchObject({ dispatchable: false, state: 'discovered' })
   // A configured route known only from the catalog becomes the one channel with unknown availability.
   const fromCatalog = discoverModelSurface(catalog, routing, { provider: 'magpie', model: 'configured-model' })
   expect(fromCatalog.channels.map(channel => channel.model)).toEqual(['configured-model'])
   expect(fromCatalog.channels[0]).toMatchObject({ availability: 'unknown', selectable: true })
-  expect(fromCatalog.discovered.find(item => item.model === 'used-model')).toMatchObject({ dispatchable: false, state: 'discovered', availability: 'available' })
+  expect(fromCatalog.discovered.find(item => item.model === 'used-model')).toMatchObject({ dispatchable: true, state: 'executable', availability: 'available' })
   expect(fromCatalog.discovered.find(item => item.model === 'configured-model')).toMatchObject({ dispatchable: true, state: 'availability-unknown' })
 })
 
@@ -436,5 +438,7 @@ it('attributes dispatchability and availability per provider for the same DSH mo
   const surface = discoverModelSurface(catalog, routing, { provider: 'magpie', model: 'shared-model' })
   const rows = surface.discovered.filter(item => item.harness === 'dsh' && item.model === 'shared-model')
   expect(rows.find(row => row.provider === 'magpie')).toMatchObject({ dispatchable: true, availability: 'available' })
-  expect(rows.find(row => row.provider === 'magpie-worker')).toMatchObject({ dispatchable: false, state: 'discovered', availability: 'unknown' })
+  // The sibling provider serves the same model independently: it is dispatchable in its own right, quota unknown, not a copy
+  // of the configured provider's reading.
+  expect(rows.find(row => row.provider === 'magpie-worker')).toMatchObject({ dispatchable: true, state: 'availability-unknown', availability: 'unknown' })
 })

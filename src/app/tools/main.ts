@@ -2,7 +2,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
-import { UserError, followupOwners, key, reasonText, type Decision, type DecisionKind, type EngineForMainSession, type EngineForPeople }
+import { UserError, followupOwners, key, reasonText, type Decision, type DecisionKind, type EngineForMainSession, type EngineForPeople, type HarnessSpec }
   from '../../core/index.ts'
 import { IM_WORDS, NOTE_WORDS, wordCount } from '../../infra/text.ts'
 import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type MasterAssessor } from '../assessment.ts'
@@ -54,7 +54,8 @@ const fromDecision = (decision: Decision) => ({ decision: decision.kind, reason:
 const HarnessSpecSchema = z.object({
   harness: z.enum(['dsh', 'agy', 'codex', 'grok']).describe('The Worker backend you judge suitable and authorized from the request and task, not a fixed default; AGY requires agy.'),
   mode: z.enum(['read-only', 'write']).optional(),
-  model: z.string().min(1).max(120).optional().describe('AGY 3.8f/4a; Codex alias; Grok pinned.'),
+  model: z.string().min(1).max(120).optional().describe('AGY 3.8f/4a; Codex id; Grok pin.'),
+  provider: z.string().optional(),
   forbid4a: z.boolean().optional().describe('Never upgrade to 4a.'),
   allowFallback: z.boolean().optional().describe('Only explicit authorization permits fallback.'),
 }).strict().refine(spec => !(spec.model === '4a' && spec.forbid4a), '4a conflicts with forbid4a')
@@ -62,8 +63,10 @@ const HarnessSpecSchema = z.object({
     if (spec.model === undefined) return
     if (spec.harness === 'agy' && !['3.8f', '4a'].includes(spec.model))
       ctx.addIssue({ code: 'custom', path: ['model'], message: 'AGY accepts only 3.8f or 4a' })
-    if (spec.harness === 'dsh')
-      ctx.addIssue({ code: 'custom', path: ['model'], message: 'DSH does not accept a model selection' })
+    if (spec.harness !== 'dsh' && spec.provider !== undefined)
+      ctx.addIssue({ code: 'custom', path: ['provider'], message: 'Only DSH selects a catalog provider' })
+    if (spec.harness === 'dsh' && spec.provider === undefined)
+      ctx.addIssue({ code: 'custom', path: ['provider'], message: 'A DSH model must name the catalog provider that owns it' })
     if (spec.harness === 'grok' && spec.model !== 'grok-4.7-build-fast')
       ctx.addIssue({ code: 'custom', path: ['model'], message: 'Grok is pinned to grok-4.7-build-fast' })
   }).meta({ id: 'RouteHarness' })
@@ -161,6 +164,17 @@ function liveQualityReviews(host: MainToolsHost) {
   }))
 }
 /**
+ * The concrete route a Harness spec dispatches. DSH carries its own catalog provider+model when named and otherwise the
+ * configured executor route, so the gate checks the exact model the Worker will run; Grok is pinned by its adapter.
+ */
+function dispatchRoute(host: MainToolsHost, spec: HarnessSpec): { model?: string; provider?: string } {
+  if (spec.harness === 'dsh') {
+    const configured = host.store.settings().executor.model
+    return spec.model ? { model: spec.model, provider: spec.provider } : { model: configured?.model, provider: configured?.provider }
+  }
+  return { model: spec.harness === 'grok' ? 'grok-4.7-build-fast' : spec.model }
+}
+/**
  * Carry out one routing decision as its Engine command, in a transaction of its own. `decided` holds the Triggers that this
  * call's earlier items decided, with their batches.
  */
@@ -189,11 +203,10 @@ function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string
           for (const task of item.tasks) {
             const spec = task.harness ?? item.harness
             if (!spec) continue
-            // For DSH the actual logical route is the configured executor model unless the task names one; other Harnesses use
-            // their own reader. Checking this model's channel (not "any account anywhere") is what the gate must enforce.
-            const model = spec.harness === 'dsh' ? host.store.settings().executor.model?.model
-              : spec.harness === 'grok' ? 'grok-4.7-build-fast' : spec.model
-            if (!isRouteAuthorized(availability.authorization, spec.harness, model))
+            // Check the exact route the Worker will run — a named DSH catalog model is a real independent route, not the
+            // configured default — so the gate enforces this model's authorization and its own availability.
+            const { model, provider } = dispatchRoute(host, spec)
+            if (!isRouteAuthorized(availability.authorization, spec.harness, model, provider))
               return { refused: `Task "${task.title}" not accepted: ${spec.harness}${model ? `/${model}` : ''} is disabled in the model authorization panel` }
             const blocked = harnessAcceptBlocker(spec, availabilityReadingFor(availability, spec.harness, model))
             if (blocked) return { refused: `Task "${task.title}" not accepted: ${blocked}` }
@@ -220,10 +233,9 @@ function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string
         const automatic = item.auto_route
         // Priority is used only when the Router configured it; candidate input order is never reported as priority.
         const candidates = automatic.candidates.map(({ spec, priority, capable, required, forbidden }) => {
-          const model = spec.harness === 'dsh' ? host.store.settings().executor.model?.model
-            : spec.harness === 'grok' ? 'grok-4.7-build-fast' : spec.model
+          const { model, provider } = dispatchRoute(host, spec)
           return { harness: spec.harness, model, priority, capable, required,
-            forbidden: forbidden || !isRouteAuthorized(availability.authorization, spec.harness, model)
+            forbidden: forbidden || !isRouteAuthorized(availability.authorization, spec.harness, model, provider)
               || (automatic.forbid4a === true && model === '4a'),
             reading: availabilityReadingFor(availability, spec.harness, model) }
         })
@@ -241,9 +253,8 @@ function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string
           : `router-auto: selected ${label} by resource availability then candidate order; no configured priority or comparable reviews`
       }
       if (availability && harness) {
-        const model = harness.harness === 'dsh' ? host.store.settings().executor.model?.model
-          : harness.harness === 'grok' ? 'grok-4.7-build-fast' : harness.model
-        if (!isRouteAuthorized(availability.authorization, harness.harness, model))
+        const { model, provider } = dispatchRoute(host, harness)
+        if (!isRouteAuthorized(availability.authorization, harness.harness, model, provider))
           return { refused: `${harness.harness}${model ? `/${model}` : ''} is disabled in the model authorization panel` }
         const blocked = harnessAcceptBlocker(harness, availabilityReadingFor(availability, harness.harness, model))
         if (blocked) return { refused: blocked }
@@ -467,8 +478,9 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
         // An inferred acceptance runs on the default DSH route (its assessment carries no Harness), so it must obey the same
         // authorization set as explicit dispatch — reuse the one rule instead of a second copy. Scan and inference never widen it.
         if (assessment.decision === 'accept') {
-          const model = host.store.settings().executor.model?.model
-          if (!isRouteAuthorized(readSelection(host.store), 'dsh', model)) {
+          const route = host.store.settings().executor.model
+          const model = route?.model
+          if (!isRouteAuthorized(readSelection(host.store), 'dsh', model, route?.provider)) {
             return { refused: `The default DSH route${model ? ` (${model})` : ''} is disabled in the model authorization panel; enable it or route an authorized Harness explicitly with orchestrator_route.` }
           }
         }

@@ -45,6 +45,8 @@ export const KV = {
       harnessModels?: { harness: string; provider: string; source: string; status: string; fetched_at?: string; models: readonly string[]; hiddenModels?: readonly string[]; error?: string }[]
       /** The last scan's raw Codex quota snapshot, so the poll can show it without re-spawning the CLI. */
       codexQuota?: unknown
+      /** Every resolvable DSH route the last scan read, per provider, so the candidate pool offers models the panel authorizes. */
+      dshCatalog?: { provider: string; model: string }[]
       snapshot: { catalog: string[]; availability: Record<string, string>; sources: Record<string, string> }
     }>('models-scan'),
   },

@@ -77,6 +77,12 @@ it('keeps a single explicit model authoritative over automatic alternatives', as
   expect(ticket.execution?.harness).toEqual({ harness: 'agy', model: '3.8f', forbid4a: true, allowFallback: false })
   expect(result.reason).toContain('user-specified')
 })
+it('accepts a DSH catalog provider+model as a first-class per-Ticket route', async () => {
+  const spec = { harness: 'dsh', provider: 'magpie-worker', model: 'auto/deepseek-v4.1-flash' }
+  const { ticket } = await acceptAutomatic('863', {}, spec)
+  // The provider is stored with the model so dispatch and authorization keep the two providers' same-name models distinct.
+  expect(ticket.execution?.harness).toEqual(spec)
+})
 it('does not infer user intent from a legacy single Harness parameter', async () => {
   const source = feishu('876', 'Implement the requested change')
   host.runtime.receive(source); await host.runtime.idle()

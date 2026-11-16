@@ -43,9 +43,9 @@ export function ModelsPage() {
 
   const auth = data.authorization
   const enabled = (key: string): boolean => !auth.explicit || (auth.enabled ?? []).includes(key)
-  const channelKey = (channel: Channel): string => `dsh/${channel.model}`
-  // External Harness models are authorized per concrete executable model, under the canonical route key the dispatch gate uses.
-  const modelSwitches = data.discovered.filter(item => item.dispatchable && item.harness !== 'dsh')
+  const channelKey = (channel: Channel): string => channel.provider ? `dsh/${channel.provider}/${channel.model}` : `dsh/${channel.model}`
+  // Every executable model — including a DSH catalog route — is authorized per concrete route key the dispatch gate uses.
+  const modelSwitches = data.discovered.filter(item => item.dispatchable)
   const allKeys = (): string[] => {
     const keys = new Set<string>()
     for (const channel of data.channels) keys.add(channelKey(channel))
@@ -55,9 +55,9 @@ export function ModelsPage() {
   /** Expand a legacy whole-Harness key into the concrete model keys it used to cover, so per-model disabling takes effect. */
   const normalized = (): Set<string> => {
     const next = auth.explicit ? new Set(auth.enabled ?? []) : new Set(allKeys())
-    for (const harness of ['codex', 'grok', 'agy'] as const) {
+    for (const harness of ['dsh', 'codex', 'grok', 'agy'] as const) {
       if (!next.delete(harness)) continue
-      for (const item of modelSwitches) if (item.harness === harness) next.add(item.route_key)
+      for (const key of allKeys()) if (key.startsWith(`${harness}/`)) next.add(key)
     }
     return next
   }
@@ -103,9 +103,9 @@ export function ModelsPage() {
           <td>{item.state === 'executable' ? t('modelStateExecutable')
             : item.state === 'availability-unknown' ? t('modelStateAvailabilityUnknown') : t('modelStateDiscovered')}</td>
           <td>{item.availability}</td>
-          <td>{item.dispatchable && item.harness !== 'dsh'
+          <td>{item.dispatchable
             ? <Switch checked={enabled(item.route_key)} onChange={() => void toggle(item.route_key)} label={item.route_key} />
-            : <span className="dt-hint">{item.dispatchable ? t('modelAuthViaChannel') : t('modelNotAuthorizable')}</span>}</td>
+            : <span className="dt-hint">{t('modelNotAuthorizable')}</span>}</td>
           <td className="dt-hint">{item.reason}</td>
         </tr>)}</tbody>
       </table> : <Hint>{t('modelNoDiscovered')}</Hint>}

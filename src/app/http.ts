@@ -166,8 +166,9 @@ export async function routingView(runtime: HttpHost) {
     checked_at: routing.checked_at, status: routing.status,
     roles: { orchestrator: settings.eval.model, worker: settings.executor.model },
     providers: catalog.groups.map(group => ({ id: group.id, name: group.name, count: group.models.length })),
-    channels: surface.channels.map(channel => ({ ...channel, authorized: isRouteAuthorized(selection, channel.harness, channel.model) })),
-    discovered: surface.discovered.map(item => ({ ...item, route_key: routeKey(item.harness, item.model), authorized: isRouteAuthorized(selection, item.harness, item.model) })),
+    channels: surface.channels.map(channel => ({ ...channel, authorized: isRouteAuthorized(selection, channel.harness, channel.model, channel.provider) })),
+    discovered: surface.discovered.map(item => ({ ...item, route_key: routeKey(item.harness, item.model, item.provider),
+      authorized: isRouteAuthorized(selection, item.harness, item.model, item.provider) })),
     preferred: routing.preferred_channel, unknown: routing.unknown, note: routing.note,
     harnesses: harnessRows({ magpie, codex: scan?.harnesses.codex as unknown as AvailabilityReading | undefined,
       codexSource: scan ? `codex (scan ${scan.fetchedAt})` : undefined, tools }),
@@ -218,14 +219,20 @@ export async function scanView(runtime: HttpHost) {
   const fetchedAt = new Date().toISOString()
   const providers = catalog.groups.map(group => ({ id: group.id, name: group.name, count: group.models.length }))
   const tools = discoverTools()
-  runtime.store.set(KV.models.scan, { fetchedAt, providers, harnesses, snapshot, harnessModels, codexQuota: codexRaw })
+  // Every catalog model of a loaded provider is a real DSH dispatch route; record it so the Router's candidate pool can
+  // offer the same models the panel authorizes, per provider.
+  const dshCatalog = catalog.groups
+    .filter(group => catalog.routableProviders === undefined || catalog.routableProviders.includes(group.id))
+    .flatMap(group => group.models.map(model => ({ provider: group.id, model: model.id })))
+  runtime.store.set(KV.models.scan, { fetchedAt, providers, harnesses, snapshot, harnessModels, codexQuota: codexRaw, dshCatalog })
   const selection = readSelection(runtime.store)
   return { fetched_at: fetchedAt, first: previous === undefined, diff, providers,
     harnesses: harnessRows({ magpie, codex: harnesses.codex, codexSource: 'codex', tools }),
     tools,
     harness_models: harnessModels,
-    channels: surface.channels.map(channel => ({ ...channel, authorized: isRouteAuthorized(selection, channel.harness, channel.model) })),
-    discovered: surface.discovered.map(item => ({ ...item, route_key: routeKey(item.harness, item.model), authorized: isRouteAuthorized(selection, item.harness, item.model) })) }
+    channels: surface.channels.map(channel => ({ ...channel, authorized: isRouteAuthorized(selection, channel.harness, channel.model, channel.provider) })),
+    discovered: surface.discovered.map(item => ({ ...item, route_key: routeKey(item.harness, item.model, item.provider),
+      authorized: isRouteAuthorized(selection, item.harness, item.model, item.provider) })) }
 }
 export type ScanView = Awaited<ReturnType<typeof scanView>>
 /** Builds a ticket's detail view; `environment` is empty while waiting for setup because it requires the resolved deployment. */

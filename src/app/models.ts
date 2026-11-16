@@ -29,7 +29,8 @@ export const authorizationModelKey = (harness: HarnessName, model?: string): str
 }
 
 /** Key of one logical route: `harness/model` (normalized, with AGY families collapsed) or a whole-harness `harness` key. */
-export const routeKey = (harness: HarnessName, model?: string): string => model ? `${harness}/${authorizationModelKey(harness, model)}` : harness
+export const routeKey = (harness: HarnessName, model?: string, provider?: string): string =>
+  model ? `${harness}/${harness === 'dsh' && provider ? `${provider}/` : ''}${authorizationModelKey(harness, model)}` : harness
 
 /** Read the persisted authorization; `undefined` means no explicit choice was saved, so every route stays authorized. */
 export function readSelection(store: Pick<Store, 'get'>): Selection {
@@ -37,10 +38,17 @@ export function readSelection(store: Pick<Store, 'get'>): Selection {
   return value ? new Set(value.enabled) : undefined
 }
 
-/** Whether the exact logical route is inside the user's authorized set (an empty saved set authorizes nothing). */
-export function isRouteAuthorized(selection: Selection, harness: HarnessName, model?: string): boolean {
+/**
+ * Whether the exact logical route is inside the user's authorized set (an empty saved set authorizes nothing). A DSH route
+ * may be named by provider (`dsh/<provider>/<model>`) so same-name models stay independent; the provider-less
+ * `dsh/<model>` key a saved set from before per-provider authorization still covers every provider that serves it.
+ */
+export function isRouteAuthorized(selection: Selection, harness: HarnessName, model?: string, provider?: string): boolean {
   if (!selection) return true
-  return selection.has(routeKey(harness, model)) || selection.has(harness)
+  if (selection.has(harness)) return true
+  if (!model) return false
+  if (selection.has(routeKey(harness, model, provider))) return true
+  return harness === 'dsh' && provider !== undefined && selection.has(routeKey(harness, model))
 }
 
 /** Persist an explicit set of enabled routes (deduplicated and sorted) and return what was stored. */

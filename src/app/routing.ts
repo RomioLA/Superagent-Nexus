@@ -431,6 +431,8 @@ export interface ModelDiscovery {
   harness: HarnessName
   provider: string
   model: string
+  /** The provider-owned catalog id carrying any adapter prefix (for example `auto/deepseek-v4.1-flash`), which dispatch passes verbatim to the live resolver. */
+  catalog_model?: string
   /** Whether this model can actually be dispatched by its harness right now. */
   dispatchable: boolean
   availability: Availability
@@ -492,21 +494,27 @@ export function discoverModelSurface(catalog: ModelCatalogInput | undefined, rou
   const observedFor = (model: string): RoutingChannel | undefined =>
     routing.observed_channels.find(channel => channel.harness === 'dsh' && modelKey(channel.model) === model)
   for (const group of catalog?.groups ?? []) {
+    const routable = catalog?.routableProviders === undefined || catalog.routableProviders.includes(group.id)
     for (const entry of group.models) {
       const model = modelKey(entry.id)
-      const dispatchable = isDispatchRoute(group.id, entry.id)
+      // A catalog model of a loaded provider is resolvable by the DSH executor, so it is a dispatch candidate in its own
+      // right, exactly as a Codex/Grok/AGY model is; only an unloaded provider's rows stay discovered-only.
+      const dispatchable = routable
+      const configured = isDispatchRoute(group.id, entry.id)
       // Only the configured DSH provider inherits a Magpie reading; a sibling provider that shares the model stays unknown.
       const observed = routeProvider === undefined || group.id === routeProvider ? observedFor(model) : undefined
       const availability = observed?.availability ?? ('unknown' as Availability)
-      if (dispatchable && !channels.has(model)) {
-        channels.set(model, { harness: 'dsh', model, provider: group.name, availability,
+      if (configured && !channels.has(model)) {
+        channels.set(model, { harness: 'dsh', model, provider: group.id, availability,
           selectable: availability !== 'exhausted' && availability !== 'rate-limited',
           reason: `[configured executor] ${group.name} lists the DSH dispatch route; no availability reading yet` })
       }
       const reason = !dispatchable
-        ? observed ? observed.reason : `[catalog] ${group.name} lists this model; it is not the configured DSH dispatch route`
-        : observed ? observed.reason : `[catalog] ${group.name} lists the DSH dispatch route; no availability reading yet`
-      add({ harness: 'dsh', provider: group.id, model, dispatchable, availability,
+        ? `[catalog] ${group.name} lists this model, but its provider did not load, so the dsh executor cannot resolve it`
+        : configured
+          ? observed ? observed.reason : `[catalog] ${group.name} lists the configured DSH dispatch route; no availability reading yet`
+          : observed?.reason ?? `[catalog] ${group.name} lists this model; the dsh executor can resolve it, quota ${availability}`
+      add({ harness: 'dsh', provider: group.id, model, catalog_model: entry.id, dispatchable, availability,
         state: discoveryState(dispatchable, availability), reason, source: 'catalog' })
     }
   }

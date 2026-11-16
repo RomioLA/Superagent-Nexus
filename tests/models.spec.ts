@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs'
 import { expect, it } from 'vitest'
 import { routingView, scanView } from '../src/app/http.ts'
 import { discoverTools, isRouteAuthorized, readSelection, routeKey, saveSelection, selectionView } from '../src/app/models.ts'
+import { KV } from '../src/kv.ts'
 import { codexCliPath } from '../src/app/tools/cli-isolation.ts'
 
 /** Minimal KV-shaped fake so the authorization helpers can be tested without a full SQLite store. */
@@ -53,6 +54,19 @@ it('normalizes a provider-qualified role model to the served logical id so a che
   expect(isRouteAuthorized(selection, 'dsh', 'deepseek-v4.1-flash')).toBe(true)
 })
 
+it('keys a DSH catalog route by provider so the same model name under two providers is authorized independently', () => {
+  const store = fakeStore()
+  // A provider-scoped saved set authorizes only that provider's copy of a shared model name.
+  saveSelection(store as never, ['dsh/magpie-worker/grok-4.7'])
+  const selection = readSelection(store as never)
+  expect(routeKey('dsh', 'grok/grok-4.7', 'magpie-worker')).toBe('dsh/magpie-worker/grok-4.7')
+  expect(routeKey('dsh', 'grok/grok-4.7', 'magpie')).toBe('dsh/magpie/grok-4.7')
+  expect(isRouteAuthorized(selection, 'dsh', 'grok/grok-4.7', 'magpie-worker')).toBe(true)
+  expect(isRouteAuthorized(selection, 'dsh', 'grok/grok-4.7', 'magpie')).toBe(false)
+  // A whole-Harness key still authorizes every DSH provider route.
+  expect(isRouteAuthorized(new Set(['dsh']), 'dsh', 'grok/grok-4.7', 'magpie')).toBe(true)
+})
+
 it('reports detected tools without ever promoting an unsupported interface (Cursor) to callable', () => {
   const tools = discoverTools('/nonexistent-dsh-tool-path')
   expect(tools.map(tool => tool.name)).toEqual(['grok', 'codex', 'agy', 'cursor'])
@@ -68,7 +82,7 @@ it.skipIf(!existsSync(codexCliPath()))('detects the Codex CLI the executor and q
   expect(codex.installed).toBe(true)
 })
 
-it('a scan shows every catalog model as discovered but only the configured DSH executor model as a dispatchable channel', async () => {
+it('a scan shows every catalog model of a loaded provider as a dispatchable DSH route, with only the configured one as a channel', async () => {
   const store = fakeStore({ provider: 'p', model: 'm1' })
   const groups = [{ id: 'p', name: 'Provider', models: [{ id: 'm1' }, { id: 'm2' }] }]
   const runtime = { store, models: async () => ({ default: { provider: 'p', model: 'm1' }, routableProviders: ['p'], groups, failures: [] }),
@@ -76,12 +90,14 @@ it('a scan shows every catalog model as discovered but only the configured DSH e
       request_usage: [{ served_model: 'm1', provider: 'p', account_ref: 'r' }] }),
     codexQuota: async () => ({ status: 'unknown' }) } as never
   const result = await scanView(runtime)
-  // Only the configured executor model is a real, selectable channel; its Magpie reading is kept.
+  // Only the configured executor model is a selectable availability channel; its Magpie reading is kept.
   expect(result.channels.map(channel => channel.model)).toEqual(['m1'])
   expect(result.channels.find(channel => channel.model === 'm1')).toMatchObject({ availability: 'available', selectable: true })
   expect(result.discovered.find(item => item.model === 'm1')).toMatchObject({ dispatchable: true, state: 'executable' })
-  // m2 is catalogued but is not the DSH dispatch route, so it is discovered-only rather than a channel.
-  expect(result.discovered.find(item => item.model === 'm2')).toMatchObject({ dispatchable: false, state: 'discovered' })
+  // m2 has no reading, but a model of a loaded provider is a resolvable DSH route, so it is dispatchable with unknown quota.
+  expect(result.discovered.find(item => item.model === 'm2')).toMatchObject({ dispatchable: true, state: 'availability-unknown', availability: 'unknown', catalog_model: 'm2' })
+  // The scan records every resolvable provider+model route so the Router's candidate pool can offer them, not just the default.
+  expect((store.get(KV.models.scan) as { dshCatalog?: unknown } | undefined)?.dshCatalog).toEqual([{ provider: 'p', model: 'm1' }, { provider: 'p', model: 'm2' }])
 })
 
 it('never exposes a non-routable provider model as a usable channel', async () => {

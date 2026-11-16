@@ -61,8 +61,13 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
 export const resourceGrammar = (executor: boolean): string => RESOURCES.filter(resource => !executor || resource.executor)
   .map(resource => `${resource.name}: ${resource.holds}`).join('; ')
 
-/** The authorizable Worker model pool the Router may pick from: dispatchable external models from the last scan plus the configured DSH route, each with the user's authorization. Availability is not fabricated here. */
-function authorizedModelPool(host: ResourceHost): { harness: HarnessName; provider: string; model: string; authorized: boolean }[] {
+/**
+ * The authorizable Worker model pool the Router may pick from: every resolvable DSH catalog route read on the last scan
+ * (per provider, so same-name models stay independent) plus dispatchable external models, each with the user's
+ * authorization. Availability is not fabricated here; an unknown route stays in the pool to be scored, not assumed healthy.
+ */
+function authorizedModelPool(host: ResourceHost, catalog?: { groups: readonly { id: string; models: readonly { id: string }[] }[];
+  routableProviders?: readonly string[] }): { harness: HarnessName; provider: string; model: string; authorized: boolean }[] {
   const readable = typeof host.store.get === 'function'
   const scan = readable ? host.store.get(KV.models.scan) : undefined
   const selection = readable ? readSelection(host.store) : undefined
@@ -72,9 +77,18 @@ function authorizedModelPool(host: ResourceHost): { harness: HarnessName; provid
     .map(model => ({ harness: source.harness as HarnessName, provider: source.provider, model,
       authorized: isRouteAuthorized(selection, source.harness as HarnessName, model) })))
   const route = host.store.settings().executor.model
-  const configured = route?.model ? [{ harness: 'dsh' as HarnessName, provider: route.provider ?? 'dsh', model: route.model,
-    authorized: isRouteAuthorized(selection, 'dsh', route.model) }] : []
-  return [...configured, ...external]
+  // Prefer the live catalog so the pool does not wait for a scan; fall back to the last scan's recorded routes.
+  const live = catalog ? catalog.groups
+    .filter(group => catalog.routableProviders === undefined || catalog.routableProviders.includes(group.id))
+    .flatMap(group => group.models.map(model => ({ provider: group.id, model: model.id }))) : []
+  const routes = live.length ? live : (scan?.dshCatalog ?? [])
+  const dsh = routes.map(entry => ({ harness: 'dsh' as HarnessName, provider: entry.provider,
+    model: entry.model, authorized: isRouteAuthorized(selection, 'dsh', entry.model, entry.provider) }))
+  // Before a scan or for a configured route absent from the catalog, keep the configured DSH route as one candidate.
+  const configured = route?.model && !dsh.some(entry => entry.provider === (route.provider ?? 'dsh') && entry.model === route.model)
+    ? [{ harness: 'dsh' as HarnessName, provider: route.provider ?? 'dsh', model: route.model,
+      authorized: isRouteAuthorized(selection, 'dsh', route.model, route.provider) }] : []
+  return [...dsh, ...configured, ...external]
 }
 
 export interface ResourceHost {
@@ -243,7 +257,7 @@ const ROUTES: readonly Route[] = [
       harnesses: summarizeHarnessAvailability({ magpie, codex: codexQuota }),
       // The user's explicit enabled-route set the dispatch gate enforces (null = every route is authorized).
       authorization: typeof host.store.get === 'function' ? selectionView(host.store) : { explicit: false, enabled: null },
-      authorized_models: authorizedModelPool(host),
+      authorized_models: authorizedModelPool(host, catalog),
       quality_reviews: host.store.tickets.list().flatMap(ticket => (ticket.execution?.qualityReviews ?? []).map(review => ({ ticket_id: ticket.id, ...review }))),
       quality_status: 'Provisional unless exact live identity, comparable context, calibrated review and sufficiency evidence exist; use orchestrator_rank_candidates.',
       refresh: { first: previous === undefined, ...refresh } }
