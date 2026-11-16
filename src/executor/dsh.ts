@@ -63,7 +63,7 @@ export interface ExecutorHost {
   readonly context: Context
   /** Where the Executor reports what happened to Assignments and Inputs. */
   readonly engine: Pick<EngineForExecutor, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed' | 'report'
-    | 'assignmentInterrupted' | 'deployOutcome'>
+    | 'assignmentInterrupted' | 'deployOutcome' | 'reply'>
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'set' | 'settings' | 'atomic' | 'afterCommit'>
   /** Durable effect queue through which launches and input deliveries run. */
   readonly effects: Pick<Effects, 'enqueue' | 'handle'>
@@ -465,10 +465,23 @@ export class DshExecutor implements Executor {
     if (!ticket || !liveTicket(ticket) || latestAssignment(ticket)?.id !== assignmentId) return
     this.failed(ticketId, String(error))
   }
-  /** Records a `failed` report on the ticket and relays the failure to the main Session in one transaction. */
+  /** Records a terminal execution failure, queues its safe Feishu result, and relays it in one transaction. */
   private failed(ticketId: string, summary: string): void {
     this.host.store.atomic(() => {
+      const previous = this.host.store.tickets.get(ticketId)
+      // Repeated error events for a stalled assignment must retain its report time and result receipt ID.
+      if (previous && latestAssignment(previous)?.report?.state === 'failed' && waitsForPerson(previous)) return
       const updated = this.host.engine.report(ticketId, { state: 'failed', summary })
+      const source = sourceTrigger(this.host, updated)
+      if (updated.mandate.strength === 'explicit' && source?.source === 'feishu' && source.channel) {
+        const chinese = /\p{Script=Han}/u.test(source.text) && !/[\p{Script=Hiragana}\p{Script=Katakana}]/u.test(source.text)
+        const number = updated.shortId ?? updated.id.slice(0, 8)
+        // Never copy the raw exception (which may contain credentials or internal paths) to the conversation.
+        const text = chinese
+          ? `工单 ${number}：执行失败（Worker 执行异常）。自动处理已停止，需要人工检查后重试。`
+          : `Ticket ${number}: failed (Worker execution error). Automatic processing stopped; manual review is required before retrying.`
+        this.host.engine.reply({ purpose: 'result', ticketId, text })
+      }
       this.relay(resultRelay(updated, 'failed', summary))
     })
   }
