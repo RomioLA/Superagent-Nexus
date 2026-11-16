@@ -34,7 +34,9 @@ let host: Host
 beforeEach(async () => {
   magpie.mockReset().mockResolvedValue({ status: 'not-configured' })
   codexQuota.mockReset().mockResolvedValue({ status: 'unknown' })
-  host = await startRuntime(); agy.mockReset().mockResolvedValue({ status: 'finished', harness: 'antigravity', requested_model: 'gemini-3.8-flash-medium' })
+  host = await startRuntime()
+  { const seeded = host.runtime.store.settings(); host.runtime.store.saveSettings({ ...seeded, executor: { ...seeded.executor, directWorkers: false } }) }
+  agy.mockReset().mockResolvedValue({ status: 'finished', harness: 'antigravity', requested_model: 'gemini-3.8-flash-medium' })
   codex.mockReset().mockResolvedValue({ status: 'finished', summary: 'done' })
   grok.mockReset().mockResolvedValue({
     status: 'finished', summary: 'done', requested_model: 'grok-4.7-build-fast', models: ['grok-4.7-build-fast'],

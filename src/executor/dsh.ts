@@ -19,6 +19,9 @@ import { WorktreeNameSchema } from '../app/assessment.ts'
 import { resultRelay } from '../app/notices.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { cancelled, collectJob, killJobs, runningJobs, stopBackground, stopSubagents, until, untilQuiet } from './background.ts'
+import { buildDirectTask, directHarnessOf, reportOutcome } from './direct.ts'
+import { runDirectWorker, type DirectRunResult } from './direct-runner.ts'
+import { recordHarnessRun } from '../app/harness-evidence.ts'
 import { deployWatchExpired, readDeployObservation } from './deploy.ts'
 
 const now = (): string => new Date().toISOString()
@@ -249,6 +252,13 @@ export class DshExecutor implements Executor {
   private readonly transient = new Map<string, number>()
   /** Assignment IDs currently waiting on a transient-failure backoff timer before resuming their worker turn. */
   private readonly resuming = new Set<string>()
+
+  /** Abort controllers of external-Harness direct Worker processes that run now, by ticket. */
+  private readonly directAborts = new Map<string, AbortController>()
+  /** Tickets whose external-Harness direct Worker loop currently runs. */
+  private readonly directRunning = new Set<string>()
+  /** Tickets for which a new direct Worker pass was requested while one already runs. */
+  private readonly directPending = new Set<string>()
   /**
    * The looks at background work of workers that went idle, by ticket, which hold their slots; a look ends when its worker
    * runs again or its Assignment ends.
@@ -336,6 +346,13 @@ export class DshExecutor implements Executor {
     const first = this.host.store.tickets.get(ticketId)
     const target = first && liveTicket(first) ? runningAssignment(first) : undefined
     if (!first || !target || !first.undelivered.length) return
+    // An external-Harness ticket has no DSH Session: run (or wake) its direct Worker loop for the waiting Inputs.
+    if (this.directWorkerOf(first)) {
+      if (this.directRunning.has(ticketId)) { this.directPending.add(ticketId); return }
+      this.slots.reserve(ticketId, 'wake')
+      try { await this.directLoop(ticketId, target.id) } finally { this.slots.free(ticketId) }
+      return
+    }
     let woken = false
     try {
       for (;;) {
@@ -406,6 +423,7 @@ export class DshExecutor implements Executor {
     const sessionId = workerSessionId(ticket.id)
     this.host.store.afterCommit(() => {
       this.settling.get(ticket.id)?.abort()
+      this.directAborts.get(ticket.id)?.abort(); this.directPending.delete(ticket.id)
       if (!ownTurn) this.host.context.agents.get(sessionId as SessionId)?.cancel({ kind: 'user' }, { keepInbox: false })
       // Its shell jobs and subagents stop with it, also those of a worker that ends its own turn.
       this.stopWork(ticket.id, reason)
@@ -453,6 +471,7 @@ export class DshExecutor implements Executor {
     const agents = this.host.store.tickets.list().map(ticket => this.host.context.agents.get(workerSessionId(ticket.id) as SessionId))
       .filter((agent): agent is Agent => agent !== undefined)
     const stop = async () => {
+      for (const controller of this.directAborts.values()) controller.abort()
       await Promise.allSettled(agents.map(agent => stopBackground(this.host.context, agent.id, 'dsh-superagent stopped', true)))
       for (const { collect } of this.left.values()) collect.abort()
       const running = agents.filter(agent => agent.status !== 'idle')
@@ -467,6 +486,7 @@ export class DshExecutor implements Executor {
   active(ticket: Ticket): boolean { return this.running(ticket) }
   private running(ticket: Ticket): boolean {
     if (!runningAssignment(ticket)) return false
+    if (this.directRunning.has(ticket.id) || this.directAborts.has(ticket.id)) return true
     return this.host.context.agents.get(workerSessionId(ticket.id) as SessionId)?.status === 'running' || this.settling.has(ticket.id)
   }
   /** Marks a ticket failed after its launch fails; the ticket waits until new human input or an explicit retry arrives. */
@@ -512,6 +532,8 @@ export class DshExecutor implements Executor {
       if (!current()) return
     }
     if (!current()) return
+    // An external Harness runs the CLI directly as the Worker: no intermediate DSH (DeepSeek) model Session is created.
+    if (this.directWorkerOf(ticket)) { await this.runDirect(ticket, assignment); return }
     const sessionId = workerSessionId(ticket.id)
     const agent = await this.host.sessions.ensure(sessionId, workspace, ticket.title, 'worker',
       ticketWorkerModel(ticket, this.host.store.settings().executor.model))
@@ -543,6 +565,73 @@ export class DshExecutor implements Executor {
       () => { if (!current()) throw new Error('Launch authorization changed before worker delivery') },
       () => { this.host.engine.assignmentStarted(ticket.id, assignment.id) })
     this.host.engine.assignmentStarted(ticket.id, assignment.id)
+  }
+  /**
+   * Runs an external-Harness Ticket's Assignment by launching the selected CLI directly as the Worker in the ticket
+   * worktree with the full Ticket context. No intermediate DSH (DeepSeek) model Session is created.
+   */
+  /** The external Harness that runs this Ticket's Worker directly, when the direct-Worker rollout is enabled. */
+  private directWorkerOf(ticket: Ticket): HarnessSpec | undefined {
+    return this.host.store.settings().executor.directWorkers ? directHarnessOf(ticket) : undefined
+  }
+  private async runDirect(ticket: Ticket, assignment: Assignment): Promise<void> {
+    this.host.engine.assignmentStarted(ticket.id, assignment.id)
+    await this.directLoop(ticket.id, assignment.id)
+  }
+  /**
+   * Runs the external Harness for a ticket's running Assignment and, while it reports progress, waits for further inputs.
+   * Re-reads ticket state each pass so a stop, an end, or a replacement Assignment ends the loop. Every Input waiting at a
+   * pass is delivered to that pass and marked read. A concurrent request for another pass (a person's follow-up) is
+   * coalesced into the next iteration instead of starting a second process.
+   */
+  private async directLoop(ticketId: string, assignmentId: string): Promise<void> {
+    if (this.directRunning.has(ticketId)) { this.directPending.add(ticketId); return }
+    this.directRunning.add(ticketId)
+    try {
+      for (;;) {
+        this.directPending.delete(ticketId)
+        const ticket = this.host.store.tickets.get(ticketId)
+        if (!ticket || !liveTicket(ticket) || runningAssignment(ticket)?.id !== assignmentId) return
+        const harness = directHarnessOf(ticket)
+        const directory = ticket.execution?.directory
+        if (!harness || !directory) return
+        const name = harness.harness as 'agy' | 'codex' | 'grok'
+        const mode = harness.mode ?? 'write'
+        const args = { mode, ...(harness.model ? { model: harness.model } : {}) }
+        const pending = [...ticket.undelivered]
+        const task = buildDirectTask(ticket, this.host.store)
+        const controller = new AbortController()
+        const onAbort = (): void => controller.abort()
+        this.host.lifetime.addEventListener('abort', onAbort, { once: true })
+        this.directAborts.set(ticketId, controller)
+        let result: DirectRunResult
+        try {
+          result = await runDirectWorker(ticket, directory, task, harness, controller.signal)
+        } catch (error) {
+          if (controller.signal.aborted || this.host.closing()) return
+          recordHarnessRun(this.host.store, ticketId, name, args, undefined, 'failed', error, assignmentId)
+          this.failed(ticketId, `${name}: ${error instanceof Error ? error.message : String(error)}`)
+          return
+        } finally {
+          this.host.lifetime.removeEventListener('abort', onAbort)
+          if (this.directAborts.get(ticketId) === controller) this.directAborts.delete(ticketId)
+        }
+        recordHarnessRun(this.host.store, ticketId, name, args, result,
+          result.status === 'finished' ? 'finished' : result.status === 'failed' ? 'failed' : 'unverified', undefined, assignmentId)
+        if (controller.signal.aborted || this.host.closing()) return
+        if (pending.length) { this.host.engine.inputsDelivered(ticketId, assignmentId, pending); this.host.engine.inputsRead(ticketId, pending) }
+        const outcome = reportOutcome(result, mode)
+        this.host.engine.report(ticketId, { state: outcome.state, summary: outcome.summary })
+        if (outcome.state !== 'progress' && outcome.state !== 'waiting') return
+        this.host.engine.turnEnded(ticketId, assignmentId)
+        const after = this.host.store.tickets.get(ticketId)
+        if (!after || !liveTicket(after) || runningAssignment(after)?.id !== assignmentId) return
+        if (!after.undelivered.length && !this.directPending.has(ticketId)) return
+      }
+    } finally {
+      this.directRunning.delete(ticketId)
+      this.directPending.delete(ticketId)
+    }
   }
   /** Returns the stored ticket for `agent` when it is a worker session, or undefined otherwise. */
   private ticketOf(agent: Agent): Ticket | undefined {
@@ -665,6 +754,13 @@ export class DshExecutor implements Executor {
     for (const ticket of this.host.store.tickets.open().sort((a, b) => a.createdAt.localeCompare(b.createdAt))) {
       const running = runningAssignment(ticket), latest = latestAssignment(ticket)
       if (running) {
+        // An external-Harness direct Worker has no DSH Session to stop; its running Assignment is restarted with a recovery
+        // note, so it continues in the same worktree from its rebuilt context.
+        if (this.directWorkerOf(ticket)) {
+          this.host.engine.assignmentInterrupted(ticket.id, running.id)
+          this.noticeDeployment(ticket)
+          continue
+        }
         // A restart within this process left DSH's Sessions, jobs and subagents running: they stop first. The inbox keeps an
         // Input that was handed over but not yet taken.
         this.host.context.agents.get(workerSessionId(ticket.id) as SessionId)?.cancel({ kind: 'user' }, { keepInbox: true })

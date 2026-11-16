@@ -94,6 +94,8 @@ export const ExecutorConfigSchema = z.object({
   directory: z.string().trim().refine(path => path === '' || path.startsWith('/'), 'An absolute path, or empty for <stateDir>/work').default(''),
   prepare: z.string().max(LIMITS.prepareCommand).default(''),
   blockedCommands: z.array(CommandNameSchema).default([]),
+  /** Whether an external Harness (Codex/Grok/AGY) runs as the Ticket Worker directly, without an intermediate DSH model Session. */
+  directWorkers: z.boolean().default(true),
 }).strict()
 export const SourceInstanceSchema = z.object({ enabled: z.boolean().default(true), config: z.record(z.string(), z.unknown()).default({}) }).strict()
 export const SettingsSchema = z.object({
