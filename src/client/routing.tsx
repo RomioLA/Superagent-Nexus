@@ -74,14 +74,16 @@ export function ModelsPage() {
       <Hint>{t('modelDiscoveredHint')}</Hint>
       {data.discovered.length ? <table className="dt-table">
         <thead><tr>
-          <th>{t('modelColumnProvider')}</th><th>{t('modelColumnModel')}</th><th>{t('modelColumnState')}</th><th>{t('modelColumnAvailability')}</th>
+          <th>{t('modelColumnProvider')}</th><th>{t('modelColumnModel')}</th><th>{t('modelColumnSource')}</th><th>{t('modelColumnState')}</th><th>{t('modelColumnAvailability')}</th><th>{t('modelColumnReason')}</th>
         </tr></thead>
         <tbody>{data.discovered.map(item => <tr key={`${item.harness}/${item.provider}/${item.model}`}>
           <td>{item.provider}</td>
           <td className="dt-mono">{item.harness}/{item.model}</td>
+          <td className="dt-hint">{item.source}</td>
           <td>{item.state === 'executable' ? t('modelStateExecutable')
             : item.state === 'availability-unknown' ? t('modelStateAvailabilityUnknown') : t('modelStateDiscovered')}</td>
           <td>{item.availability}</td>
+          <td className="dt-hint">{item.reason}</td>
         </tr>)}</tbody>
       </table> : <Hint>{t('modelNoDiscovered')}</Hint>}
     </Section>

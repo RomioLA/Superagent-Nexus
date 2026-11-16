@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs'
 import { expect, it } from 'vitest'
-import { scanView } from '../src/app/http.ts'
+import { routingView, scanView } from '../src/app/http.ts'
 import { discoverTools, isRouteAuthorized, readSelection, routeKey, saveSelection, selectionView } from '../src/app/models.ts'
 import { codexCliPath } from '../src/app/tools/cli-isolation.ts'
 
@@ -8,7 +8,8 @@ import { codexCliPath } from '../src/app/tools/cli-isolation.ts'
 function fakeStore(executorModel: { provider: string; model: string } | null = null) {
   const map = new Map<string, unknown>()
   const settings = { executor: { model: executorModel }, eval: { model: null } }
-  return { get: (key: string) => map.get(key), set: (key: string, value: unknown) => { map.set(key, value) }, settings: () => settings }
+  return { get: (key: string) => map.get(key), set: (key: string, value: unknown) => { map.set(key, value) }, settings: () => settings,
+    tickets: { list: () => [] } }
 }
 
 it('authorizes every route until the user saves an explicit set', () => {
@@ -115,5 +116,66 @@ it('a scan detects a newly added catalog model and reports detected tools', asyn
   groups = [{ id: 'p', name: 'Provider', models: [{ id: 'm1' }, { id: 'm2' }] }]
   const second = await scanView(runtime)
   expect(second.first).toBe(false)
-  expect(second.diff.catalog.added).toContain('p/m2')
+  expect(second.diff.catalog.added).toContain('dsh:p:m2')
+})
+
+it('adds real Codex, Grok and AGY models to discovery with their source, never as channels', async () => {
+  const store = fakeStore({ provider: 'p', model: 'm1' })
+  const groups = [{ id: 'p', name: 'Provider', models: [{ id: 'm1' }] }]
+  const runtime = { store, models: async () => ({ default: { provider: 'p', model: 'm1' }, groups, failures: [] }),
+    magpie: async () => ({ status: 'not-configured' }), codexQuota: async () => ({ status: 'unknown' }),
+    harnessModels: async () => [
+      { harness: 'codex', provider: 'codex', status: 'ok', source: 'codex models_cache (t)', models: ['gpt-6-astra', 'gpt-5.6-sol'] },
+      { harness: 'grok', provider: 'grok', status: 'ok', source: 'grok models_cache (t)', models: ['grok-4.7-build-fast', 'grok-4.7'] },
+      { harness: 'agy', provider: 'agy', status: 'ok', source: 'agy models', models: ['gemini-3.8-flash-high', 'claude-sonnet-4-6'] },
+    ] } as never
+  const result = await scanView(runtime)
+  expect(result.discovered.find(item => item.harness === 'codex' && item.model === 'gpt-6-astra'))
+    .toMatchObject({ dispatchable: true, availability: 'unknown', state: 'availability-unknown', source: 'codex models_cache (t)' })
+  expect(result.discovered.find(item => item.harness === 'grok' && item.model === 'grok-4.7-build-fast')).toMatchObject({ dispatchable: true })
+  expect(result.discovered.find(item => item.harness === 'grok' && item.model === 'grok-4.7')).toMatchObject({ dispatchable: false, state: 'discovered' })
+  expect(result.discovered.find(item => item.harness === 'agy' && item.model === 'gemini-3.8-flash-high')).toMatchObject({ dispatchable: true })
+  expect(result.discovered.find(item => item.harness === 'agy' && item.model === 'claude-sonnet-4-6')).toMatchObject({ dispatchable: false })
+  expect(result.channels.every(channel => channel.harness === 'dsh')).toBe(true)
+  expect(selectionView(store as never)).toEqual({ explicit: false, enabled: null })
+})
+
+it('shows the last scan Harness model lists from cache without re-reading the CLIs', async () => {
+  const store = fakeStore({ provider: 'p', model: 'm1' })
+  store.set('models-scan', { fetchedAt: 't', providers: [], harnesses: {}, snapshot: { catalog: [], availability: {}, sources: {} },
+    harnessModels: [{ harness: 'grok', provider: 'grok', status: 'ok', source: 'grok models_cache (t)', models: ['grok-4.7'] }] })
+  const runtime = { store, models: async () => ({ default: { provider: 'p', model: 'm1' },
+    groups: [{ id: 'p', name: 'Provider', models: [{ id: 'm1' }] }], failures: [] }),
+    magpie: async () => ({ status: 'not-configured' }) } as never
+  const view = await routingView(runtime)
+  expect(view.discovered.find(item => item.harness === 'grok' && item.model === 'grok-4.7'))
+    .toMatchObject({ dispatchable: false, state: 'discovered', source: 'grok models_cache (t)' })
+})
+
+it('treats Codex hidden or internal models as discovered-only, not dispatch candidates', async () => {
+  const store = fakeStore({ provider: 'p', model: 'm1' })
+  const groups = [{ id: 'p', name: 'Provider', models: [{ id: 'm1' }] }]
+  const runtime = { store, models: async () => ({ default: { provider: 'p', model: 'm1' }, groups, failures: [] }),
+    magpie: async () => ({ status: 'not-configured' }), codexQuota: async () => ({ status: 'unknown' }),
+    harnessModels: async () => [{ harness: 'codex', provider: 'codex', status: 'ok', source: 'codex models_cache',
+      models: ['gpt-6.1-sol', 'gpt-reserve', 'codex-auto-review'], hiddenModels: ['gpt-reserve', 'codex-auto-review'] }] } as never
+  const result = await scanView(runtime)
+  expect(result.discovered.find(item => item.model === 'gpt-6.1-sol')).toMatchObject({ dispatchable: true, availability: 'unknown' })
+  expect(result.discovered.find(item => item.model === 'gpt-reserve')).toMatchObject({ dispatchable: false, state: 'discovered' })
+  expect(result.discovered.find(item => item.model === 'codex-auto-review')).toMatchObject({ dispatchable: false, state: 'discovered' })
+})
+
+it('counts external Harness model changes and never reports a failed source as removed', async () => {
+  const store = fakeStore({ provider: 'p', model: 'm1' })
+  const groups = [{ id: 'p', name: 'Provider', models: [{ id: 'm1' }] }]
+  const withSources = (sources: unknown) => ({ store,
+    models: async () => ({ default: { provider: 'p', model: 'm1' }, groups, failures: [] }),
+    magpie: async () => ({ status: 'not-configured' }), codexQuota: async () => ({ status: 'unknown' }),
+    harnessModels: async () => sources } as never)
+  await scanView(withSources([{ harness: 'grok', provider: 'grok', status: 'ok', source: 'grok models_cache', models: ['grok-4.7'] }]))
+  const second = await scanView(withSources([{ harness: 'grok', provider: 'grok', status: 'ok', source: 'grok models_cache', models: ['grok-4.7', 'grok-4.8'] }]))
+  expect(second.diff.catalog.added).toContain('grok:grok:grok-4.8')
+  const failed = await scanView(withSources([{ harness: 'grok', provider: 'grok', status: 'failed', source: 'grok models_cache', models: [], error: 'boom' }]))
+  expect(failed.diff.catalog.removed).not.toContain('grok:grok:grok-4.7')
+  expect(failed.diff.catalog.removed).not.toContain('grok:grok:grok-4.8')
 })

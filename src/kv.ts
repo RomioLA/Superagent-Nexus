@@ -41,6 +41,8 @@ export const KV = {
       fetchedAt: string
       providers: { id: string; name: string; count: number }[]
       harnesses: Record<string, { state: string; evidence?: string; remaining?: number; resetsAt?: string }>
+      /** Real per-Harness model lists read on the last scan; the panel poll shows them without re-reading CLIs. */
+      harnessModels?: { harness: string; provider: string; source: string; status: string; fetched_at?: string; models: readonly string[]; hiddenModels?: readonly string[]; error?: string }[]
       snapshot: { catalog: string[]; availability: Record<string, string>; sources: Record<string, string> }
     }>('models-scan'),
   },

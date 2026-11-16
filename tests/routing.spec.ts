@@ -408,3 +408,33 @@ it('blocks acceptance only for a known exhausted or rate-limited chosen route', 
   // A bare allowFallback boolean does not let an already exhausted chosen route be accepted.
   expect(harnessAcceptBlocker({ harness: 'dsh', allowFallback: true }, exhausted)).toContain('exhausted')
 })
+
+it('keys discovered models by harness+provider+model so same-name models from different providers stay separate', () => {
+  const routing = summarizeRoutingSignals({ status: 'not-configured' })
+  const catalog = { groups: [
+    { id: 'magpie', name: 'magpie', models: [{ id: 'auto/gpt-5.6-sol' }] },
+    { id: 'magpie-worker', name: 'magpie-worker', models: [{ id: 'auto/gpt-5.6-sol' }] },
+  ] }
+  const surface = discoverModelSurface(catalog, routing, null, [
+    { harness: 'codex', provider: 'codex', status: 'ok', source: 'codex models_cache', models: ['gpt-5.6-sol'] },
+  ])
+  const dsh = surface.discovered.filter(item => item.harness === 'dsh' && item.model === 'gpt-5.6-sol')
+  expect(dsh.map(item => item.provider).sort()).toEqual(['magpie', 'magpie-worker'])
+  expect(surface.discovered.find(item => item.harness === 'codex')).toMatchObject({ model: 'gpt-5.6-sol', dispatchable: true })
+})
+
+it('attributes dispatchability and availability per provider for the same DSH model', () => {
+  const routing = summarizeRoutingSignals({
+    status: 'ok',
+    account_quotas: [{ provider: 'deepseek', account_ref: 'r', state: 'ok', windows: [{ remaining: 5 }] }],
+    request_usage: [{ provider: 'deepseek', served_model: 'shared-model', account_ref: 'r' }],
+  })
+  const catalog = { routableProviders: ['magpie', 'magpie-worker'], groups: [
+    { id: 'magpie', name: 'Magpie', models: [{ id: 'shared-model' }] },
+    { id: 'magpie-worker', name: 'Magpie Worker', models: [{ id: 'shared-model' }] },
+  ] }
+  const surface = discoverModelSurface(catalog, routing, { provider: 'magpie', model: 'shared-model' })
+  const rows = surface.discovered.filter(item => item.harness === 'dsh' && item.model === 'shared-model')
+  expect(rows.find(row => row.provider === 'magpie')).toMatchObject({ dispatchable: true, availability: 'available' })
+  expect(rows.find(row => row.provider === 'magpie-worker')).toMatchObject({ dispatchable: false, state: 'discovered', availability: 'unknown' })
+})

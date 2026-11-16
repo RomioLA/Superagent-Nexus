@@ -437,10 +437,31 @@ export interface ModelDiscovery {
   /** `executable` (dispatchable, known availability), `availability-unknown` (dispatchable, no reading) or `discovered`. */
   state: 'executable' | 'availability-unknown' | 'discovered'
   reason: string
+  /** Source of this model discovery (catalog, dsh route, magpie channel, external harness data). */
+  source: string
 }
 
 const discoveryState = (dispatchable: boolean, availability: Availability): ModelDiscovery['state'] =>
   !dispatchable ? 'discovered' : availability === 'unknown' ? 'availability-unknown' : 'executable'
+
+export interface HarnessModelSource {
+  harness: HarnessName
+  provider: string
+  source: string
+  status: 'ok' | 'failed' | 'not-installed'
+  fetched_at?: string
+  models: readonly string[]
+  /** Models whose own metadata marks them hidden or internal, so cached presence is not a dispatch capability. */
+  hiddenModels?: readonly string[]
+  error?: string
+}
+
+export function harnessDispatchable(harness: HarnessName, model: string): boolean {
+  return harness === 'codex' ? true
+    : harness === 'grok' ? model === 'grok-4.7-build-fast'
+      : harness === 'agy' ? /^gemini-3\.8-flash-(low|medium|high)$/.test(model)
+        : false
+}
 
 /**
  * Merge the model catalog with the Magpie routing projection. Real DSH dispatch uses only the configured
@@ -451,7 +472,7 @@ const discoveryState = (dispatchable: boolean, availability: Availability): Mode
  * reported separately per Harness.
  */
 export function discoverModelSurface(catalog: ModelCatalogInput | undefined, routing: RoutingSignals,
-  dshRoute?: { provider?: string; model?: string } | null): {
+  dshRoute?: { provider?: string; model?: string } | null, harnessModels: readonly HarnessModelSource[] = []): {
   channels: RoutingChannel[]
   discovered: ModelDiscovery[]
 } {
@@ -463,31 +484,19 @@ export function discoverModelSurface(catalog: ModelCatalogInput | undefined, rou
     && (routeProvider === undefined || provider === undefined || provider === routeProvider)
   const channels = new Map<string, RoutingChannel>()
   const discovered = new Map<string, ModelDiscovery>()
-  if (routeModel !== undefined) {
-    const observedRoute = routing.observed_channels.find(channel => channel.harness === 'dsh'
-      && modelKey(channel.model) === routeModel
-      && (routeProvider === undefined || channel.provider === undefined || channel.provider === routeProvider))
-    const availability = observedRoute?.availability ?? ('unknown' as Availability)
-    if (observedRoute) channels.set(routeModel, observedRoute)
-    else channels.set(routeModel, { harness: 'dsh', model: dshRoute!.model!,
-      ...(routeProvider ? { provider: routeProvider } : {}), availability: 'unknown', selectable: true,
-      reason: '[configured executor] the configured DSH dispatch route; no availability reading yet' })
-    discovered.set(routeModel, { harness: 'dsh', provider: routeProvider ?? observedRoute?.provider ?? 'dsh',
-      model: dshRoute!.model!, dispatchable: true, availability, state: discoveryState(true, availability),
-      reason: observedRoute?.reason ?? '[configured executor] the configured DSH dispatch route; no availability reading yet' })
-  }
-  for (const channel of routing.observed_channels) {
-    const key = modelKey(channel.model)
-    if (discovered.has(key)) continue
-    const dispatchable = isDispatchRoute(channel.provider, channel.model)
-    discovered.set(key, { harness: channel.harness, provider: channel.provider ?? channel.harness, model: channel.model,
-      dispatchable, availability: channel.availability, state: discoveryState(dispatchable, channel.availability), reason: channel.reason })
-  }
+  const add = (row: ModelDiscovery): void => { discovered.set(`${row.harness}\u0000${row.provider}\u0000${row.model}`, row) }
+  // Provider identity is the catalog provider id; matching by model alone would blur two providers that share a model.
+  const rowFor = (harness: string, model: string, provider?: string): ModelDiscovery | undefined =>
+    [...discovered.values()].find(row => row.harness === harness && row.model === model
+      && (provider === undefined || row.provider === provider))
+  const observedFor = (model: string): RoutingChannel | undefined =>
+    routing.observed_channels.find(channel => channel.harness === 'dsh' && modelKey(channel.model) === model)
   for (const group of catalog?.groups ?? []) {
     for (const entry of group.models) {
       const model = modelKey(entry.id)
       const dispatchable = isDispatchRoute(group.id, entry.id)
-      const observed = routing.observed_channels.find(channel => channel.harness === 'dsh' && modelKey(channel.model) === model)
+      // Only the configured DSH provider inherits a Magpie reading; a sibling provider that shares the model stays unknown.
+      const observed = routeProvider === undefined || group.id === routeProvider ? observedFor(model) : undefined
       const availability = observed?.availability ?? ('unknown' as Availability)
       if (dispatchable && !channels.has(model)) {
         channels.set(model, { harness: 'dsh', model, provider: group.name, availability,
@@ -497,8 +506,53 @@ export function discoverModelSurface(catalog: ModelCatalogInput | undefined, rou
       const reason = !dispatchable
         ? observed ? observed.reason : `[catalog] ${group.name} lists this model; it is not the configured DSH dispatch route`
         : observed ? observed.reason : `[catalog] ${group.name} lists the DSH dispatch route; no availability reading yet`
-      discovered.set(model, { harness: 'dsh', provider: group.name, model, dispatchable, availability,
-        state: discoveryState(dispatchable, availability), reason })
+      add({ harness: 'dsh', provider: group.id, model, dispatchable, availability,
+        state: discoveryState(dispatchable, availability), reason, source: 'catalog' })
+    }
+  }
+  if (routeModel !== undefined) {
+    const observedRoute = routing.observed_channels.find(channel => channel.harness === 'dsh'
+      && modelKey(channel.model) === routeModel
+      && (routeProvider === undefined || channel.provider === undefined || channel.provider === routeProvider))
+    const availability = observedRoute?.availability ?? ('unknown' as Availability)
+    if (!channels.has(routeModel)) {
+      if (observedRoute) channels.set(routeModel, observedRoute)
+      else channels.set(routeModel, { harness: 'dsh', model: dshRoute!.model!,
+        ...(routeProvider ? { provider: routeProvider } : {}), availability: 'unknown', selectable: true,
+        reason: '[configured executor] the configured DSH dispatch route; no availability reading yet' })
+    }
+    const existing = rowFor('dsh', routeModel, routeProvider)
+    if (existing) { existing.dispatchable = true; existing.state = discoveryState(true, existing.availability) }
+    else add({ harness: 'dsh', provider: routeProvider ?? observedRoute?.provider ?? 'dsh', model: dshRoute!.model!,
+      dispatchable: true, availability, state: discoveryState(true, availability), source: 'executor',
+      reason: observedRoute?.reason ?? '[configured executor] the configured DSH dispatch route; no availability reading yet' })
+  }
+  for (const channel of routing.observed_channels) {
+    const dispatchable = isDispatchRoute(channel.provider, channel.model)
+    // Magpie reports the upstream vendor, not the DSH provider id, so a DSH channel merges into the configured provider row.
+    const existing = channel.harness === 'dsh'
+      ? rowFor('dsh', modelKey(channel.model), routeProvider) ?? rowFor('dsh', modelKey(channel.model))
+      : rowFor(channel.harness, channel.model, channel.provider)
+    if (existing) {
+      if (dispatchable) existing.dispatchable = true
+      existing.availability = channel.availability
+      existing.state = discoveryState(existing.dispatchable, channel.availability)
+      existing.reason = channel.reason
+    } else add({ harness: channel.harness, provider: channel.provider ?? channel.harness, model: channel.model,
+      dispatchable, availability: channel.availability, state: discoveryState(dispatchable, channel.availability), reason: channel.reason, source: 'magpie' })
+  }
+  for (const source of harnessModels) {
+    if (source.status !== 'ok') continue
+    const hidden = source.hiddenModels ?? []
+    for (const model of source.models) {
+      // A cached model is only a dispatch candidate when the executor supports the model and its metadata does not hide it.
+      const concealed = hidden.includes(model)
+      const dispatchable = !concealed && harnessDispatchable(source.harness, model)
+      add({ harness: source.harness, provider: source.provider, model, dispatchable, availability: 'unknown',
+        state: discoveryState(dispatchable, 'unknown'), source: source.source,
+        reason: concealed
+          ? `[${source.source}] ${source.provider} lists this model, but its metadata marks it hidden or internal, so it is not a dispatch candidate`
+          : `[${source.source}] ${source.provider} lists this model; the ${source.harness} executor ${dispatchable ? 'can' : 'cannot'} dispatch it` })
     }
   }
   return { channels: [...channels.values()], discovered: [...discovered.values()] }

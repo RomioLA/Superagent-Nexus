@@ -27,7 +27,7 @@ import { settingsView } from './views/settings.ts'
 import { sourcesStatus, type SetupState } from './views/sources.ts'
 import { decisionList, search, threadDetail, threadList } from './views/threads.ts'
 import { executorLoad, ticketDetail, ticketList, ticketStatusCountsOf } from './views/tickets.ts'
-import { summarizeCodexQuotaSignals, summarizeHarnessAvailability, summarizeRoutingSignals, diffModelSurface, discoverModelSurface, type AvailabilityReading, type ModelSurfaceSnapshot } from './routing.ts'
+import { summarizeCodexQuotaSignals, summarizeHarnessAvailability, summarizeRoutingSignals, diffModelSurface, discoverModelSurface, type AvailabilityReading, type ModelSurfaceSnapshot, type HarnessModelSource } from './routing.ts'
 import { discoverTools, isRouteAuthorized, readSelection, saveSelection, selectionView } from './models.ts'
 import { KV } from '../kv.ts'
 
@@ -60,6 +60,8 @@ export interface HttpHost {
   readonly magpie?: () => Promise<unknown>
   /** Read-only Codex account quota, read only on an explicit panel scan (it spawns the Codex CLI). */
   readonly codexQuota?: () => Promise<unknown>
+  /** Real per-Harness model lists (Codex/Grok caches, AGY CLI) read only on an explicit panel scan. */
+  readonly harnessModels?: () => Promise<HarnessModelSource[]>
 }
 /**
  * Represents a client-facing 400 or 404 error raised during management route parsing or lookup.
@@ -150,10 +152,11 @@ export async function routingView(runtime: HttpHost) {
   const settings = runtime.store.settings()
   const magpie = runtime.magpie ? await runtime.magpie() : { status: 'not-configured' }
   const routing = summarizeRoutingSignals(magpie)
-  const surface = discoverModelSurface(catalog, routing, settings.executor.model)
+  const scan = runtime.store.get(KV.models.scan)
+  const harnessModels = (scan?.harnessModels as HarnessModelSource[] | undefined) ?? []
+  const surface = discoverModelSurface(catalog, routing, settings.executor.model, harnessModels)
   const tools = discoverTools()
   const selection = readSelection(runtime.store)
-  const scan = runtime.store.get(KV.models.scan)
   // Codex's real quota is read only on an explicit scan; the panel poll keeps it unknown rather than spawning the CLI each time.
   const codex = summarizeCodexQuotaSignals({ status: 'unknown' })
   const qualityReviews = runtime.store.tickets.list()
@@ -188,23 +191,38 @@ export async function scanView(runtime: HttpHost) {
   const codexRaw = runtime.codexQuota ? await runtime.codexQuota() : { status: 'unknown', error: 'reader-not-configured' }
   const routing = summarizeRoutingSignals(magpie)
   const settings = typeof runtime.store.settings === 'function' ? runtime.store.settings() : undefined
-  const surface = discoverModelSurface(catalog, routing, settings?.executor?.model)
+  const harnessModels = runtime.harnessModels ? await runtime.harnessModels() : []
+  const surface = discoverModelSurface(catalog, routing, settings?.executor?.model, harnessModels)
+  const identity = (item: { harness: string; provider: string; model: string }): string => `${item.harness}:${item.provider}:${item.model}`
   const snapshot: ModelSurfaceSnapshot = {
-    catalog: catalog.groups.flatMap(group => group.models.map(model => `${group.id}/${model.id}`)),
-    availability: Object.fromEntries(surface.discovered.map(item => [`${item.harness}:${item.model}`, item.availability])),
-    sources: { catalog: catalog.failures.length ? 'failed' : 'ok', magpie: statusOf(magpie), codex: statusOf(codexRaw) },
+    catalog: surface.discovered.map(identity),
+    availability: Object.fromEntries(surface.discovered.map(item => [identity(item), item.availability])),
+    sources: { catalog: catalog.failures.length ? 'failed' : 'ok', magpie: statusOf(magpie), codex: statusOf(codexRaw),
+      ...Object.fromEntries(harnessModels.map(source => [`${source.harness}-models`, source.status])) },
   }
   const previous = runtime.store.get(KV.models.scan)
-  const diff = diffModelSurface(previous ? previous.snapshot as unknown as ModelSurfaceSnapshot : undefined, snapshot)
+  const prior = previous ? previous.snapshot as unknown as ModelSurfaceSnapshot : undefined
+  // Older scans keyed DSH models as `provider/model`; map them to the current identity so the first scan is not noisy.
+  const priorCatalog = (prior?.catalog ?? []).map(id => id.includes(':') || !id.includes('/')
+    ? id : `dsh:${id.slice(0, id.indexOf('/'))}:${id.slice(id.indexOf('/') + 1)}`)
+  const comparable = prior ? { ...prior, catalog: priorCatalog } : undefined
+  // A source that could not be read is unknown, not empty: keep its last-seen models so a scan does not report them removed.
+  const failedHarnesses = harnessModels.filter(source => source.status === 'failed').map(source => source.harness)
+  if (failedHarnesses.length) {
+    const kept = priorCatalog.filter(id => failedHarnesses.some(harness => id.startsWith(`${harness}:`)) && !snapshot.catalog.includes(id))
+    snapshot.catalog.push(...kept)
+  }
+  const diff = diffModelSurface(comparable, snapshot)
   const harnesses = summarizeHarnessAvailability({ magpie, codex: codexRaw })
   const fetchedAt = new Date().toISOString()
   const providers = catalog.groups.map(group => ({ id: group.id, name: group.name, count: group.models.length }))
   const tools = discoverTools()
-  runtime.store.set(KV.models.scan, { fetchedAt, providers, harnesses, snapshot })
+  runtime.store.set(KV.models.scan, { fetchedAt, providers, harnesses, snapshot, harnessModels })
   const selection = readSelection(runtime.store)
   return { fetched_at: fetchedAt, first: previous === undefined, diff, providers,
     harnesses: harnessRows({ magpie, codex: harnesses.codex, codexSource: 'codex', tools }),
     tools,
+    harness_models: harnessModels,
     channels: surface.channels.map(channel => ({ ...channel, authorized: isRouteAuthorized(selection, channel.harness, channel.model) })),
     discovered: surface.discovered }
 }

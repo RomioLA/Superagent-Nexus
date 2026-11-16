@@ -2,14 +2,17 @@
  * Model authorization: the user's explicit set of enabled logical routes, persisted in KV and read by both the panel and the
  * dispatch gate so the Router can only automatically choose inside that set. Scanning never widens authorization by itself.
  */
+import { execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { delimiter, join } from 'node:path'
+import { promisify } from 'node:util'
 import type { HarnessName } from '../core/ports.ts'
 import { KV } from '../kv.ts'
-import { logicalModelId } from './routing.ts'
+import { logicalModelId, type HarnessModelSource } from './routing.ts'
 import type { Store } from './store.ts'
-import { agyCliPath, codexCliPath } from './tools/cli-isolation.ts'
+import { agyCliPath, codexCliPath, sharedCodexHome, sharedGrokHome } from './tools/cli-isolation.ts'
 
 /** The user's explicit enabled routes (`enabled` = `harness/model` or a whole-harness `harness` key), or `undefined` = all. */
 export type Selection = ReadonlySet<string> | undefined
@@ -71,4 +74,58 @@ export function discoverTools(path: string = process.env.PATH ?? ''): ToolStatus
     return { name, installed, callable: supported && installed ? 'unknown' : 'no',
       status: !installed ? 'not-installed' : supported ? 'supported' : 'unsupported' }
   })
+}
+
+/** Error code of a failed local read, so a missing cache is reported distinctly from a corrupt one. */
+const readErrorCode = (error: unknown): string | undefined =>
+  error && typeof error === 'object' && 'code' in error ? (error as { code?: string }).code : undefined
+const readErrorText = (error: unknown): string =>
+  (readErrorCode(error) ?? (error instanceof Error ? error.message : String(error))).slice(0, 200)
+
+/**
+ * Read each supported Harness's own model catalog from local data, without credentials and without throwing: Codex and Grok
+ * keep a fetched `models_cache.json`, while AGY exposes its list through `agy models` and is queried only on an explicit scan.
+ * A missing or unreadable source stays an explicit failed/not-installed reading with no models.
+ */
+export async function readHarnessModels(): Promise<HarnessModelSource[]> {
+  const sources: HarnessModelSource[] = []
+  try {
+    const data = JSON.parse(await readFile(join(sharedCodexHome(), 'models_cache.json'), 'utf8')) as { models?: unknown; fetched_at?: unknown }
+    const entries = Array.isArray(data.models) ? data.models : []
+    const models = entries
+      .map(item => (item && typeof item === 'object' ? (item as { slug?: unknown }).slug : undefined))
+      .filter((slug): slug is string => typeof slug === 'string' && slug.length > 0)
+    // A model whose own metadata hides it (visibility=hide) or excludes it from the API is not a dispatch candidate.
+    const hiddenModels = entries
+      .filter(item => item && typeof item === 'object') as { slug?: unknown; visibility?: unknown; supported_in_api?: unknown }[]
+    const hidden = hiddenModels
+      .filter(item => item.visibility === 'hide' || item.supported_in_api === false)
+      .map(item => item.slug)
+      .filter((slug): slug is string => typeof slug === 'string' && slug.length > 0)
+    const at = typeof data.fetched_at === 'string' ? data.fetched_at : undefined
+    sources.push({ harness: 'codex', provider: 'codex', status: 'ok', models, hiddenModels: hidden, source: `codex models_cache${at ? ` (${at})` : ''}` })
+  } catch (error) {
+    sources.push({ harness: 'codex', provider: 'codex', status: readErrorCode(error) === 'ENOENT' ? 'not-installed' : 'failed',
+      models: [], source: 'codex models_cache', error: readErrorText(error) })
+  }
+  try {
+    const data = JSON.parse(await readFile(join(sharedGrokHome(), 'models_cache.json'), 'utf8')) as { models?: unknown; fetched_at?: unknown }
+    const table = data.models && typeof data.models === 'object' && !Array.isArray(data.models) ? data.models as Record<string, unknown> : {}
+    const models = Object.keys(table).filter(id => id.length > 0)
+    const at = typeof data.fetched_at === 'string' ? data.fetched_at : undefined
+    sources.push({ harness: 'grok', provider: 'grok', status: 'ok', models, source: `grok models_cache${at ? ` (${at})` : ''}` })
+  } catch (error) {
+    sources.push({ harness: 'grok', provider: 'grok', status: readErrorCode(error) === 'ENOENT' ? 'not-installed' : 'failed',
+      models: [], source: 'grok models_cache', error: readErrorText(error) })
+  }
+  try {
+    const { stdout } = await promisify(execFile)(agyCliPath(), ['models'], { timeout: 20_000, maxBuffer: 1_000_000 })
+    const models = stdout.split(/\r?\n/).map(line => line.split('\t')[0]?.trim() ?? '')
+      .filter(id => /^[A-Za-z0-9._:@/-]+$/.test(id))
+    sources.push({ harness: 'agy', provider: 'agy', status: 'ok', models, source: 'agy models' })
+  } catch (error) {
+    sources.push({ harness: 'agy', provider: 'agy', status: readErrorCode(error) === 'ENOENT' ? 'not-installed' : 'failed',
+      models: [], source: 'agy models', error: readErrorText(error) })
+  }
+  return sources
 }

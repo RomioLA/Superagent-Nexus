@@ -101,7 +101,7 @@ const TEXT = {
   modelColumnModel: ['模型', 'Model'],
   modelStateExecutable: ['实际可执行', 'Executable'],
   modelStateAvailabilityUnknown: ['可用性未知', 'Availability unknown'],
-  modelStateDiscovered: ['已发现（不可执行）', 'Discovered (not executable)'],
+  modelStateDiscovered: ['已发现（未配置派工）', 'Discovered (no dispatch configured)'],
   modelNoDiscovered: ['没有发现任何模型。', 'No models discovered.'],
   modelChannels: ['模型通道', 'Model channels'],
   modelColumnHarness: ['Harness / 模型', 'Harness / model'],
