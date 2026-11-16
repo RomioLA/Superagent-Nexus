@@ -70,6 +70,21 @@ export function ModelsPage() {
         <span className="dt-stat-label">{provider.name}</span><span className="dt-stat-value">{provider.count}</span>
       </span>)}</div>
     </Section>
+    <Section title={t('modelDiscovered')} count={data.discovered.length}>
+      <Hint>{t('modelDiscoveredHint')}</Hint>
+      {data.discovered.length ? <table className="dt-table">
+        <thead><tr>
+          <th>{t('modelColumnProvider')}</th><th>{t('modelColumnModel')}</th><th>{t('modelColumnState')}</th><th>{t('modelColumnAvailability')}</th>
+        </tr></thead>
+        <tbody>{data.discovered.map(item => <tr key={`${item.harness}/${item.provider}/${item.model}`}>
+          <td>{item.provider}</td>
+          <td className="dt-mono">{item.harness}/{item.model}</td>
+          <td>{item.state === 'executable' ? t('modelStateExecutable')
+            : item.state === 'availability-unknown' ? t('modelStateAvailabilityUnknown') : t('modelStateDiscovered')}</td>
+          <td>{item.availability}</td>
+        </tr>)}</tbody>
+      </table> : <Hint>{t('modelNoDiscovered')}</Hint>}
+    </Section>
     <Section title={t('modelHarnessAvailability')} count={data.harnesses.length}>
       <Hint>{t('modelScanCodexHint')}</Hint>
       {data.harnesses.length ? <table className="dt-table">
@@ -79,13 +94,15 @@ export function ModelsPage() {
         </tr></thead>
         <tbody>{data.harnesses.map(harness => <tr key={harness.harness}>
           <td className="dt-mono">{harness.harness}</td>
-          <td>{harness.state}</td>
+          <td>{harness.harness !== 'dsh' && !harness.installed ? t('modelToolNotInstalled') : harness.state}</td>
           <td>{harness.remaining ?? '—'}</td>
           <td>{harness.resets_at ?? '—'}</td>
           <td className="dt-hint">{harness.source}</td>
           <td>{harness.harness === 'dsh'
             ? <span className="dt-hint">{t('modelAuthorizationHint')}</span>
-            : <Switch checked={enabled(harness.harness)} onChange={() => void toggle(harness.harness)} label={harness.harness} />}</td>
+            : harness.installed
+              ? <Switch checked={enabled(harness.harness)} onChange={() => void toggle(harness.harness)} label={harness.harness} />
+              : <span className="dt-hint">{t('modelToolNotInstalled')}</span>}</td>
           <td className="dt-hint">{harness.evidence ?? '—'}</td>
         </tr>)}</tbody>
       </table> : <Hint>{t('modelNoHarness')}</Hint>}

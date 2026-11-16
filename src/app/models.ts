@@ -9,6 +9,7 @@ import type { HarnessName } from '../core/ports.ts'
 import { KV } from '../kv.ts'
 import { logicalModelId } from './routing.ts'
 import type { Store } from './store.ts'
+import { agyCliPath, codexCliPath } from './tools/cli-isolation.ts'
 
 /** The user's explicit enabled routes (`enabled` = `harness/model` or a whole-harness `harness` key), or `undefined` = all. */
 export type Selection = ReadonlySet<string> | undefined
@@ -49,7 +50,12 @@ export interface ToolStatus {
   status: 'supported' | 'unsupported' | 'not-installed'
 }
 const SUPPORTED_TOOLS = new Set(['grok', 'codex', 'agy'])
+/** The exact binaries the executor adapters spawn, so tool detection matches real execution instead of the service PATH. */
+const executorCliPaths = (name: string): string[] =>
+  name === 'codex' ? [codexCliPath()] : name === 'agy' ? [agyCliPath()] : []
 const cliCandidates = (name: string, path: string): string[] => [
+  // Reuse the CLI locations the executor and quota readers resolve; Codex and AGY live outside the service PATH.
+  ...executorCliPaths(name),
   join(homedir(), '.local', 'bin', name), join(homedir(), '.npm-global', 'bin', name), `/usr/local/bin/${name}`, `/opt/homebrew/bin/${name}`,
   ...path.split(delimiter).filter(Boolean).map(entry => join(entry, name)),
 ]

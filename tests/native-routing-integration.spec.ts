@@ -127,6 +127,36 @@ it('excludes known rate-limited Codex and exhausted DSH channels during real dis
   expect(exhausted.ticket.execution?.harness?.harness).toBe('grok')
   expect(exhausted.result.reason).toContain('exhausted')
 })
+it('records a Router-chosen single legal Harness as router-auto, not user-specified', async () => {
+  const source = feishu('883', 'Implement the requested change using a suitable resource')
+  host.runtime.receive(source); await host.runtime.idle()
+  const result = await host.route({ kind: 'accept', trigger_id: source.id, title: 'Single legal choice', worktree_name: 'single-legal',
+    acknowledgement: 'Implement the requested change.', harness: { harness: 'grok' }, harness_origin: 'router-auto' })
+  await host.runtime.idle()
+  const ticket = host.runtime.store.tickets.get((result.ticket as { ticket_id: string }).ticket_id)!
+  expect(ticket.execution?.harness).toEqual({ harness: 'grok' })
+  expect(result.reason).toContain('router-auto')
+  expect(result.reason).not.toContain('user-specified')
+  expect(result.reason).not.toContain('origin unspecified')
+})
+it('dispatches auto_route candidates without configured priority by candidate order, never claiming configured priority or quality evidence', async () => {
+  const unpriced = [
+    { spec: { harness: 'grok', model: 'grok-4.7-build-fast' }, capable: true },
+    { spec: { harness: 'codex', model: 'gpt-6-luna' }, capable: true },
+  ]
+  const source = feishu('884', 'Implement the requested change using an authorized suitable resource')
+  host.runtime.receive(source); await host.runtime.idle()
+  const result = await host.route({ kind: 'accept', trigger_id: source.id, title: 'No priority', worktree_name: 'no-priority',
+    acknowledgement: 'Implement the requested change.', auto_route: { candidates: unpriced, context: autoContext } })
+  await host.runtime.idle()
+  const ticket = host.runtime.store.tickets.get((result.ticket as { ticket_id: string }).ticket_id)!
+  expect(ticket.execution?.harness).toEqual({ harness: 'grok', model: 'grok-4.7-build-fast' })
+  expect(result.reason).toContain('router-auto')
+  expect(result.reason).toContain('candidate order')
+  expect(result.reason).toContain('no configured priority or comparable reviews')
+  expect(result.reason).not.toMatch(/by configured priority \d/)
+  expect(result.reason).not.toContain('calibrated quality evidence')
+})
 it.each(['codex', 'grok', 'agy'] as const)('retains the %s ready gate when native model responses share its Harness history', async harness => {
   const source = feishu('811', 'Use the specified Harness for this change')
   host.runtime.receive(source); await host.runtime.idle()

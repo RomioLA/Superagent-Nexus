@@ -14,6 +14,12 @@ it('shows the model routing page from the shared routing view', async () => {
   // Channel identity, availability and remaining quota come from the routing projection, not a second table.
   expect(text()).toContain('dsh/worker-model')
   expect(text()).toContain('42')
+  // Discovered models show their provider and the executable/availability-unknown distinction.
+  expect(text()).toContain(zh.modelDiscovered)
+  expect(text()).toContain('Worker provider')
+  expect(text()).toContain(zh.modelStateExecutable)
+  // A Harness whose CLI was not detected is shown as not installed instead of an authorizable channel.
+  expect(text()).toContain(zh.modelToolNotInstalled)
   expect(text()).toContain('Selected dsh/worker-model by configured priority 0')
   expect(text()).toContain('Codex account availability is unknown')
   // Quality is reported as insufficient rather than shown as a fabricated score.

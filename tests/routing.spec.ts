@@ -2,7 +2,7 @@ import type { QualityReview } from '../src/app/evaluation.ts'
 import { planResourceFallback } from '../src/app/routing.ts'
 /** P1-S7 lightweight resource-aware routing: trustworthy signals decide, unknown stays unknown, explicit constraints win. */
 import { expect, it } from 'vitest'
-import { availabilityFromWindows, availabilityReadingFor, diffModelSurface, harnessAcceptBlocker, rankRouteCandidates, summarizeHarnessAvailability, summarizeRoutingSignals, type RouteCandidate } from '../src/app/routing.ts'
+import { availabilityFromWindows, availabilityReadingFor, diffModelSurface, discoverModelSurface, harnessAcceptBlocker, rankRouteCandidates, summarizeHarnessAvailability, summarizeRoutingSignals, type RouteCandidate } from '../src/app/routing.ts'
 import { readResource } from '../src/app/resources.ts'
 
 const candidate = (overrides: Partial<RouteCandidate> & Pick<RouteCandidate, 'harness' | 'priority'>): RouteCandidate =>
@@ -164,6 +164,33 @@ it('reports a not-configured Magpie source as unknown rather than healthy', () =
   expect(routing.observed_channels).toEqual([])
   expect(routing.preferred_channel).toBeNull()
   expect(routing.unknown).toEqual(expect.arrayContaining(['cost_usd', 'cache_hit_rate', 'agy_quota', 'grok_quota', 'codex_quota']))
+})
+
+it('marks only the configured DSH executor model as a dispatchable channel and shows the rest as discovered only', () => {
+  const routing = summarizeRoutingSignals({
+    status: 'ok',
+    account_quotas: [{ account_ref: 'ref-a', state: 'ok', windows: [{ remaining: 9 }] }],
+    request_usage: [{ served_model: 'used-model', provider: 'magpie', account_ref: 'ref-a' }],
+  })
+  const catalog = {
+    routableProviders: ['magpie'],
+    groups: [
+      { id: 'magpie', name: 'Magpie', models: [{ id: 'used-model' }, { id: 'configured-model' }] },
+      { id: 'cold', name: 'Cold provider', models: [{ id: 'cold-model' }] },
+    ],
+  }
+  // Only the configured DSH executor model is a real, dispatchable channel; a matching Magpie reading is kept.
+  const observed = discoverModelSurface(catalog, routing, { provider: 'magpie', model: 'used-model' })
+  expect(observed.channels.map(channel => channel.model)).toEqual(['used-model'])
+  expect(observed.channels[0]).toMatchObject({ availability: 'available' })
+  expect(observed.discovered.find(item => item.model === 'configured-model')).toMatchObject({ dispatchable: false, state: 'discovered' })
+  expect(observed.discovered.find(item => item.model === 'cold-model')).toMatchObject({ dispatchable: false, state: 'discovered' })
+  // A configured route known only from the catalog becomes the one channel with unknown availability.
+  const fromCatalog = discoverModelSurface(catalog, routing, { provider: 'magpie', model: 'configured-model' })
+  expect(fromCatalog.channels.map(channel => channel.model)).toEqual(['configured-model'])
+  expect(fromCatalog.channels[0]).toMatchObject({ availability: 'unknown', selectable: true })
+  expect(fromCatalog.discovered.find(item => item.model === 'used-model')).toMatchObject({ dispatchable: false, state: 'discovered', availability: 'available' })
+  expect(fromCatalog.discovered.find(item => item.model === 'configured-model')).toMatchObject({ dispatchable: true, state: 'availability-unknown' })
 })
 
 it('serves the routing projection from the existing models resource alongside the raw snapshot', async () => {

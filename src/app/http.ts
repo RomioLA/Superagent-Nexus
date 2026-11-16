@@ -27,7 +27,7 @@ import { settingsView } from './views/settings.ts'
 import { sourcesStatus, type SetupState } from './views/sources.ts'
 import { decisionList, search, threadDetail, threadList } from './views/threads.ts'
 import { executorLoad, ticketDetail, ticketList, ticketStatusCountsOf } from './views/tickets.ts'
-import { summarizeCodexQuotaSignals, summarizeHarnessAvailability, summarizeRoutingSignals, diffModelSurface, type AvailabilityReading, type ModelSurfaceSnapshot } from './routing.ts'
+import { summarizeCodexQuotaSignals, summarizeHarnessAvailability, summarizeRoutingSignals, diffModelSurface, discoverModelSurface, type AvailabilityReading, type ModelSurfaceSnapshot } from './routing.ts'
 import { discoverTools, isRouteAuthorized, readSelection, saveSelection, selectionView } from './models.ts'
 import { KV } from '../kv.ts'
 
@@ -125,8 +125,9 @@ const statusOf = (value: unknown): string => {
   return typeof status === 'string' ? status : 'unknown'
 }
 /** The four supported Harnesses as panel rows: a real reading where a reader exists, an explicit unknown otherwise. */
-function harnessRows(input: { magpie?: unknown; codex?: AvailabilityReading; codexSource?: string }) {
+function harnessRows(input: { magpie?: unknown; codex?: AvailabilityReading; codexSource?: string; tools?: readonly { name: string; installed: boolean }[] }) {
   const live = summarizeHarnessAvailability({ magpie: input.magpie })
+  const installed = new Map(input.tools?.map(tool => [tool.name, tool.installed]) ?? [])
   const rows = [
     { harness: 'dsh', reading: live.dsh, source: 'magpie' },
     { harness: 'codex', reading: input.codex ?? live.codex, source: input.codex ? (input.codexSource ?? 'codex') : 'unknown' },
@@ -134,6 +135,8 @@ function harnessRows(input: { magpie?: unknown; codex?: AvailabilityReading; cod
     { harness: 'agy', reading: live.agy, source: 'unknown' },
   ]
   return rows.map(({ harness, reading, source }) => ({ harness, state: reading.state,
+    // DSH is the built-in Harness; the others are only executable when their executor CLI was actually found.
+    installed: harness === 'dsh' ? true : installed.get(harness) ?? false,
     ...(reading.evidence ? { evidence: reading.evidence } : {}), ...(reading.remaining !== undefined ? { remaining: reading.remaining } : {}),
     ...(reading.resetsAt ? { resets_at: reading.resetsAt } : {}), source }))
 }
@@ -147,6 +150,8 @@ export async function routingView(runtime: HttpHost) {
   const settings = runtime.store.settings()
   const magpie = runtime.magpie ? await runtime.magpie() : { status: 'not-configured' }
   const routing = summarizeRoutingSignals(magpie)
+  const surface = discoverModelSurface(catalog, routing, settings.executor.model)
+  const tools = discoverTools()
   const selection = readSelection(runtime.store)
   const scan = runtime.store.get(KV.models.scan)
   // Codex's real quota is read only on an explicit scan; the panel poll keeps it unknown rather than spawning the CLI each time.
@@ -157,10 +162,11 @@ export async function routingView(runtime: HttpHost) {
     checked_at: routing.checked_at, status: routing.status,
     roles: { orchestrator: settings.eval.model, worker: settings.executor.model },
     providers: catalog.groups.map(group => ({ id: group.id, name: group.name, count: group.models.length })),
-    channels: routing.observed_channels.map(channel => ({ ...channel, authorized: isRouteAuthorized(selection, channel.harness, channel.model) })),
+    channels: surface.channels.map(channel => ({ ...channel, authorized: isRouteAuthorized(selection, channel.harness, channel.model) })),
+    discovered: surface.discovered,
     preferred: routing.preferred_channel, unknown: routing.unknown, note: routing.note,
     harnesses: harnessRows({ magpie, codex: scan?.harnesses.codex as unknown as AvailabilityReading | undefined,
-      codexSource: scan ? `codex (scan ${scan.fetchedAt})` : undefined }),
+      codexSource: scan ? `codex (scan ${scan.fetchedAt})` : undefined, tools }),
     authorization: selectionView(runtime.store),
     scan: scan ? { fetched_at: scan.fetchedAt } : null,
     codex,
@@ -181,9 +187,11 @@ export async function scanView(runtime: HttpHost) {
   const magpie = runtime.magpie ? await runtime.magpie() : { status: 'not-configured' }
   const codexRaw = runtime.codexQuota ? await runtime.codexQuota() : { status: 'unknown', error: 'reader-not-configured' }
   const routing = summarizeRoutingSignals(magpie)
+  const settings = typeof runtime.store.settings === 'function' ? runtime.store.settings() : undefined
+  const surface = discoverModelSurface(catalog, routing, settings?.executor?.model)
   const snapshot: ModelSurfaceSnapshot = {
     catalog: catalog.groups.flatMap(group => group.models.map(model => `${group.id}/${model.id}`)),
-    availability: Object.fromEntries(routing.observed_channels.map(channel => [`${channel.harness}:${channel.model}`, channel.availability])),
+    availability: Object.fromEntries(surface.discovered.map(item => [`${item.harness}:${item.model}`, item.availability])),
     sources: { catalog: catalog.failures.length ? 'failed' : 'ok', magpie: statusOf(magpie), codex: statusOf(codexRaw) },
   }
   const previous = runtime.store.get(KV.models.scan)
@@ -191,12 +199,14 @@ export async function scanView(runtime: HttpHost) {
   const harnesses = summarizeHarnessAvailability({ magpie, codex: codexRaw })
   const fetchedAt = new Date().toISOString()
   const providers = catalog.groups.map(group => ({ id: group.id, name: group.name, count: group.models.length }))
+  const tools = discoverTools()
   runtime.store.set(KV.models.scan, { fetchedAt, providers, harnesses, snapshot })
   const selection = readSelection(runtime.store)
   return { fetched_at: fetchedAt, first: previous === undefined, diff, providers,
-    harnesses: harnessRows({ magpie, codex: harnesses.codex, codexSource: 'codex' }),
-    tools: discoverTools(),
-    channels: routing.observed_channels.map(channel => ({ ...channel, authorized: isRouteAuthorized(selection, channel.harness, channel.model) })) }
+    harnesses: harnessRows({ magpie, codex: harnesses.codex, codexSource: 'codex', tools }),
+    tools,
+    channels: surface.channels.map(channel => ({ ...channel, authorized: isRouteAuthorized(selection, channel.harness, channel.model) })),
+    discovered: surface.discovered }
 }
 export type ScanView = Awaited<ReturnType<typeof scanView>>
 /** Builds a ticket's detail view; `environment` is empty while waiting for setup because it requires the resolved deployment. */

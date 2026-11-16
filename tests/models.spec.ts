@@ -1,11 +1,14 @@
+import { existsSync } from 'node:fs'
 import { expect, it } from 'vitest'
 import { scanView } from '../src/app/http.ts'
 import { discoverTools, isRouteAuthorized, readSelection, routeKey, saveSelection, selectionView } from '../src/app/models.ts'
+import { codexCliPath } from '../src/app/tools/cli-isolation.ts'
 
 /** Minimal KV-shaped fake so the authorization helpers can be tested without a full SQLite store. */
-function fakeStore() {
+function fakeStore(executorModel: { provider: string; model: string } | null = null) {
   const map = new Map<string, unknown>()
-  return { get: (key: string) => map.get(key), set: (key: string, value: unknown) => { map.set(key, value) } }
+  const settings = { executor: { model: executorModel }, eval: { model: null } }
+  return { get: (key: string) => map.get(key), set: (key: string, value: unknown) => { map.set(key, value) }, settings: () => settings }
 }
 
 it('authorizes every route until the user saves an explicit set', () => {
@@ -58,8 +61,51 @@ it('reports detected tools without ever promoting an unsupported interface (Curs
   expect(cursor.callable).toBe('no')
 })
 
+it.skipIf(!existsSync(codexCliPath()))('detects the Codex CLI the executor and quota reader resolve outside PATH', () => {
+  // The Codex executor and quota reader resolve one specific binary (codexCliPath) that the service PATH does not include.
+  const codex = discoverTools('/nonexistent-dsh-tool-path').find(tool => tool.name === 'codex')!
+  expect(codex.installed).toBe(true)
+})
+
+it('a scan shows every catalog model as discovered but only the configured DSH executor model as a dispatchable channel', async () => {
+  const store = fakeStore({ provider: 'p', model: 'm1' })
+  const groups = [{ id: 'p', name: 'Provider', models: [{ id: 'm1' }, { id: 'm2' }] }]
+  const runtime = { store, models: async () => ({ default: { provider: 'p', model: 'm1' }, routableProviders: ['p'], groups, failures: [] }),
+    magpie: async () => ({ status: 'ok', account_quotas: [{ account_ref: 'r', state: 'ok', windows: [{ remaining: 5 }] }],
+      request_usage: [{ served_model: 'm1', provider: 'p', account_ref: 'r' }] }),
+    codexQuota: async () => ({ status: 'unknown' }) } as never
+  const result = await scanView(runtime)
+  // Only the configured executor model is a real, selectable channel; its Magpie reading is kept.
+  expect(result.channels.map(channel => channel.model)).toEqual(['m1'])
+  expect(result.channels.find(channel => channel.model === 'm1')).toMatchObject({ availability: 'available', selectable: true })
+  expect(result.discovered.find(item => item.model === 'm1')).toMatchObject({ dispatchable: true, state: 'executable' })
+  // m2 is catalogued but is not the DSH dispatch route, so it is discovered-only rather than a channel.
+  expect(result.discovered.find(item => item.model === 'm2')).toMatchObject({ dispatchable: false, state: 'discovered' })
+})
+
+it('never exposes a non-routable provider model as a usable channel', async () => {
+  const store = fakeStore({ provider: 'ready', model: 'm1' })
+  const groups = [{ id: 'ready', name: 'Ready', models: [{ id: 'm1' }] }, { id: 'cold', name: 'Cold', models: [{ id: 'm2' }] }]
+  const runtime = { store, models: async () => ({ default: { provider: 'ready', model: 'm1' }, routableProviders: ['ready'], groups, failures: [] }),
+    magpie: async () => ({ status: 'not-configured' }), codexQuota: async () => ({ status: 'unknown' }) } as never
+  const result = await scanView(runtime)
+  expect(result.channels.map(channel => channel.model)).toEqual(['m1'])
+  expect(result.channels.some(channel => channel.model === 'm2')).toBe(false)
+  expect(result.discovered.find(item => item.model === 'm2')).toMatchObject({ dispatchable: false, state: 'discovered' })
+})
+
+it('a scan never changes the saved authorization', async () => {
+  const store = fakeStore({ provider: 'p', model: 'm1' })
+  saveSelection(store as never, ['dsh/m1'])
+  const groups = [{ id: 'p', name: 'Provider', models: [{ id: 'm1' }, { id: 'm2' }] }]
+  const runtime = { store, models: async () => ({ default: { provider: 'p', model: 'm1' }, routableProviders: ['p'], groups, failures: [] }),
+    magpie: async () => ({ status: 'not-configured' }), codexQuota: async () => ({ status: 'unknown' }) } as never
+  await scanView(runtime)
+  expect(selectionView(store as never)).toEqual({ explicit: true, enabled: ['dsh/m1'] })
+})
+
 it('a scan detects a newly added catalog model and reports detected tools', async () => {
-  const store = fakeStore()
+  const store = fakeStore({ provider: 'p', model: 'm1' })
   let groups = [{ id: 'p', name: 'Provider', models: [{ id: 'm1' }] }]
   const runtime = { store, models: async () => ({ default: { provider: 'p', model: 'm1' }, groups, failures: [] }),
     magpie: async () => ({ status: 'not-configured' }), codexQuota: async () => ({ status: 'unknown' }) } as never

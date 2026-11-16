@@ -416,6 +416,94 @@ export function summarizeRoutingSignals(snapshot: unknown): RoutingSignals {
   }
 }
 
+/**
+ * The parts of the live model catalog that discovery needs, structurally typed so this module stays framework-free.
+ * `routableProviders` names the providers whose catalog actually loaded, so a model under another provider is discovered
+ * but not executable.
+ */
+export interface ModelCatalogInput {
+  readonly groups: readonly { readonly id: string; readonly name: string; readonly models: readonly { readonly id: string }[] }[]
+  readonly routableProviders?: readonly string[]
+}
+
+/** One model found among the catalog, Magpie or a Harness's own data, with the state the panel must distinguish. */
+export interface ModelDiscovery {
+  harness: HarnessName
+  provider: string
+  model: string
+  /** Whether this model can actually be dispatched by its harness right now. */
+  dispatchable: boolean
+  availability: Availability
+  /** `executable` (dispatchable, known availability), `availability-unknown` (dispatchable, no reading) or `discovered`. */
+  state: 'executable' | 'availability-unknown' | 'discovered'
+  reason: string
+}
+
+const discoveryState = (dispatchable: boolean, availability: Availability): ModelDiscovery['state'] =>
+  !dispatchable ? 'discovered' : availability === 'unknown' ? 'availability-unknown' : 'executable'
+
+/**
+ * Merge the model catalog with the Magpie routing projection. Real DSH dispatch uses only the configured
+ * `settings().executor.model`, so only that exact model becomes a dispatchable channel; every other catalog model
+ * (and any Magpie-observed model that is not the configured route) stays visible as discovered-only so it never poses
+ * as an independently dispatchable or authorizable channel. When no DSH route is configured, no DSH model is
+ * dispatchable. Magpie-served readings are preserved. The catalog only covers DSH LLM routes; Codex/Grok/AGY are
+ * reported separately per Harness.
+ */
+export function discoverModelSurface(catalog: ModelCatalogInput | undefined, routing: RoutingSignals,
+  dshRoute?: { provider?: string; model?: string } | null): {
+  channels: RoutingChannel[]
+  discovered: ModelDiscovery[]
+} {
+  const modelKey = (model: string): string => logicalModelId(model) ?? model
+  const routeModel = dshRoute?.model ? modelKey(dshRoute.model) : undefined
+  const routeProvider = dshRoute?.provider
+  const isDispatchRoute = (provider: string | undefined, model: string): boolean =>
+    routeModel !== undefined && modelKey(model) === routeModel
+    && (routeProvider === undefined || provider === undefined || provider === routeProvider)
+  const channels = new Map<string, RoutingChannel>()
+  const discovered = new Map<string, ModelDiscovery>()
+  if (routeModel !== undefined) {
+    const observedRoute = routing.observed_channels.find(channel => channel.harness === 'dsh'
+      && modelKey(channel.model) === routeModel
+      && (routeProvider === undefined || channel.provider === undefined || channel.provider === routeProvider))
+    const availability = observedRoute?.availability ?? ('unknown' as Availability)
+    if (observedRoute) channels.set(routeModel, observedRoute)
+    else channels.set(routeModel, { harness: 'dsh', model: dshRoute!.model!,
+      ...(routeProvider ? { provider: routeProvider } : {}), availability: 'unknown', selectable: true,
+      reason: '[configured executor] the configured DSH dispatch route; no availability reading yet' })
+    discovered.set(routeModel, { harness: 'dsh', provider: routeProvider ?? observedRoute?.provider ?? 'dsh',
+      model: dshRoute!.model!, dispatchable: true, availability, state: discoveryState(true, availability),
+      reason: observedRoute?.reason ?? '[configured executor] the configured DSH dispatch route; no availability reading yet' })
+  }
+  for (const channel of routing.observed_channels) {
+    const key = modelKey(channel.model)
+    if (discovered.has(key)) continue
+    const dispatchable = isDispatchRoute(channel.provider, channel.model)
+    discovered.set(key, { harness: channel.harness, provider: channel.provider ?? channel.harness, model: channel.model,
+      dispatchable, availability: channel.availability, state: discoveryState(dispatchable, channel.availability), reason: channel.reason })
+  }
+  for (const group of catalog?.groups ?? []) {
+    for (const entry of group.models) {
+      const model = modelKey(entry.id)
+      const dispatchable = isDispatchRoute(group.id, entry.id)
+      const observed = routing.observed_channels.find(channel => channel.harness === 'dsh' && modelKey(channel.model) === model)
+      const availability = observed?.availability ?? ('unknown' as Availability)
+      if (dispatchable && !channels.has(model)) {
+        channels.set(model, { harness: 'dsh', model, provider: group.name, availability,
+          selectable: availability !== 'exhausted' && availability !== 'rate-limited',
+          reason: `[configured executor] ${group.name} lists the DSH dispatch route; no availability reading yet` })
+      }
+      const reason = !dispatchable
+        ? observed ? observed.reason : `[catalog] ${group.name} lists this model; it is not the configured DSH dispatch route`
+        : observed ? observed.reason : `[catalog] ${group.name} lists the DSH dispatch route; no availability reading yet`
+      discovered.set(model, { harness: 'dsh', provider: group.name, model, dispatchable, availability,
+        state: discoveryState(dispatchable, availability), reason })
+    }
+  }
+  return { channels: [...channels.values()], discovered: [...discovered.values()] }
+}
+
 /** Aggregate several observed readings without turning a partially-unknown set into a false "exhausted". */
 function combineAvailabilityStates(states: readonly Availability[], count: number, what: string): AvailabilityReading {
   if (!count) return { state: 'unknown', evidence: `no ${what} reading` }
@@ -501,8 +589,10 @@ export function diffModelSurface(previous: ModelSurfaceSnapshot | undefined, cur
   const removed = catalogReadable ? (previous?.catalog ?? []).filter(id => !after.has(id)) : []
   const changed: { channel: string; from: Availability; to: Availability }[] = []
   for (const [channel, state] of Object.entries(current.availability)) {
-    const beforeState = previous?.availability[channel]
-    if (beforeState !== state) changed.push({ channel, from: beforeState ?? 'unknown', to: state })
+    // An absent baseline reads as unknown, so a newly seen model with no reading is not reported as a change; a real
+    // transition (unknown→available, available→exhausted) is.
+    const beforeState = previous?.availability[channel] ?? 'unknown'
+    if (beforeState !== state) changed.push({ channel, from: beforeState, to: state })
   }
   const sources = Object.entries(current.sources)
     .map(([name, status]) => ({ name, status, changed: previous?.sources[name] !== status }))

@@ -218,20 +218,27 @@ function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string
       let selectionReason = `${item.harness_origin ?? 'origin unspecified'} single Harness/model constraint; automatic quality selection bypassed`
       if (!harness && item.auto_route && availability) {
         const automatic = item.auto_route
-        const candidates = automatic.candidates.map(({ spec, priority, capable, required, forbidden }, index) => {
+        // Priority is used only when the Router configured it; candidate input order is never reported as priority.
+        const candidates = automatic.candidates.map(({ spec, priority, capable, required, forbidden }) => {
           const model = spec.harness === 'dsh' ? host.store.settings().executor.model?.model
             : spec.harness === 'grok' ? 'grok-4.7-build-fast' : spec.model
-          return { harness: spec.harness, model, priority: priority ?? index, capable, required,
+          return { harness: spec.harness, model, priority, capable, required,
             forbidden: forbidden || !isRouteAuthorized(availability.authorization, spec.harness, model)
               || (automatic.forbid4a === true && model === '4a'),
             reading: availabilityReadingFor(availability, spec.harness, model) }
         })
         const ranking = rankRouteCandidates(candidates, { allow4a: automatic.forbid4a ? false : automatic.allow4a,
           quality: { context: automatic.context, reviews: liveQualityReviews(host) } })
-        if (!ranking.selected) return { refused: ranking.reason }
-        const index = ranking.evaluated.indexOf(ranking.selected)
+        // Configured priority and comparable reviews decide first. With neither, candidate order is the only legal
+        // tie-break: keep dispatch working and record that basis instead of claiming a configured priority.
+        const noPriority = !automatic.candidates.some(candidate => candidate.priority !== undefined)
+        const chosen = ranking.selected ?? (noPriority ? ranking.ranked[0] : undefined)
+        if (!chosen) return { refused: ranking.reason }
+        const index = ranking.evaluated.indexOf(chosen)
         harness = { ...automatic.candidates[index]!.spec, ...(automatic.forbid4a ? { forbid4a: true } : {}) }
-        selectionReason = `router-auto: ${ranking.reason}`
+        const label = chosen.candidate.model ? `${chosen.candidate.harness}/${chosen.candidate.model}` : chosen.candidate.harness
+        selectionReason = ranking.selected ? `router-auto: ${ranking.reason}`
+          : `router-auto: selected ${label} by resource availability then candidate order; no configured priority or comparable reviews`
       }
       if (availability && harness) {
         const model = harness.harness === 'dsh' ? host.store.settings().executor.model?.model
@@ -273,7 +280,7 @@ function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string
 function routeTool(host: MainToolsHost): Tool {
   return tool({
     name: 'orchestrator_route',
-    description: 'Route candidates, one item each by the card\'s trigger_id, in one call: accept an explicit request as a new ticket, attach a trigger to an existing ticket, stop a ticket on a person\'s stop message, or ignore a candidate that needs no ticket or stop, as dispatch says. Items run in order and each is answered on its own; a refused item leaves the others. An inferred candidate may be ignored here; accepting one goes through orchestrator_eval_decide.',
+    description: 'Route cards by trigger_id per dispatch: accept explicit work as a new Ticket, attach, stop on a person\'s stop, or ignore. Items run independently in order. Inferred accepts require orchestrator_eval_decide.',
     schema: z.object({ decisions: z.array(RouteItemSchema).min(1).max(20) }).strict(),
     execute: async ({ decisions }, signal) => {
       // Single-Harness accepts retain the Magpie gate; Codex quota reads are only needed for automatic candidates.
