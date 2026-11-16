@@ -409,6 +409,10 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/client/marks.ts` | The marks of the states the views classify: a Ticket's or a Thread's stage, a Source's state and a Decision's outcome, each as a dot, an icon, a tone and a label |
 | `src/client/locales.ts` | All copy in both languages, and the glossary of [001 Domain model](001-domain.md) |
 | `src/client/client.css`, `css.d.ts` | The panel's stylesheet, loaded as text |
+| `src/app/harness-evidence.ts` | Shared Harness-run evidence recording, used by both the Executor tool path and the direct Worker path |
+| `src/app/models.ts` | Model discovery, per-model authorization and the routing resources the Router reads |
+| `src/executor/direct.ts` | Direct Worker pure logic: external Harness selection, the full-context task prompt, and the Worker report marker with its safe progress fallback |
+| `src/executor/direct-runner.ts` | The direct Worker runner: dispatches the Codex, Grok or AGY CLI adapter for the Ticket's Harness and model, normalizing the result |
 
 `src/sources/github.ts` and `src/sources/feishu.ts` are also the entries of the two Source plugins, built by `tsdown.config.ts` and exported in `package.json` as `./github-watch` and `./feishu-watch`. The bundle's `cordis.patch.yml` inserts the three plugins, with Feishu disabled.
 
@@ -416,6 +420,12 @@ Some generic modules still refer directly to GitHub or Feishu:
 
 | Test | Covers |
 | --- | --- |
+| `tests/direct-worker.spec.ts` | Direct Worker Harness selection, full-context build, report marker parsing and its safe fallback to progress |
+| `tests/direct-worker-integration.spec.ts` | With the direct-Worker rollout enabled, an external-Harness Ticket runs the CLI as its Worker with no intermediate DSH Session, records Harness evidence and reports
+| `tests/dsh-evidence.spec.ts` | Harness run evidence recorded per Assignment |
+| `tests/models.spec.ts` | Model discovery, authorization and dashboard resources |
+| `tests/routing-accept-gate.spec.ts` | Acceptance gate for routing decisions |
+| `tests/routing-auth-id.spec.ts` | Routing authorization id handling |
 | `tests/core-engine.spec.ts` | Domain rules on in-memory repositories: receiving, Eval, fan-out, resume and stop, interrupted Assignments, the pause, Policy changes, reports and outcomes, attaching, replies, failed deliveries and dismissed problems |
 | `tests/stage.spec.ts` | The Ticket stages, row by row |
 | `tests/policy.spec.ts` | Source scope, the gate, the admission table, Mandate revalidation, the Policy version, settings migrations and assessment outcomes |

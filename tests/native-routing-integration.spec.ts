@@ -1,7 +1,9 @@
 import { mkdir, writeFile, readFile } from 'node:fs/promises'
 /** Native route tool integration: transaction, project target, execution receipt and WorkerSlots. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
-const { agy, codex, grok } = vi.hoisted(() => ({ agy: vi.fn(), codex: vi.fn(), grok: vi.fn() }))
+const { agy, codex, grok, magpie, codexQuota } = vi.hoisted(() => ({ agy: vi.fn(), codex: vi.fn(), grok: vi.fn(), magpie: vi.fn(), codexQuota: vi.fn() }))
+vi.mock('../src/app/magpie.ts', () => ({ createMagpieReader: () => magpie }))
+vi.mock('../src/app/codex-quota.ts', () => ({ createCodexQuotaReader: () => codexQuota }))
 vi.mock('../src/app/tools/agy.ts', async original => {
   const module = await original<typeof import('../src/app/tools/agy.ts')>()
   return { ...module, ticketAgyTool: (ticket: Parameters<typeof module.ticketAgyTool>[0]) => ({ ...module.ticketAgyTool(ticket), execute: agy }) }
@@ -24,10 +26,17 @@ import { feishu, startRuntime, type Host } from './fixtures/host.ts'
 import { key, latestAssignment } from '../src/core/index.ts'
 import { ticketEnvironment } from '../src/app/execution-environment.ts'
 import { evaluationInput } from '../src/app/evaluation.ts'
+import { saveSelection } from '../src/app/models.ts'
+import { createAssistantMessage } from '@deepseek-ai/dsh-llm'
+import { SessionId, SessionSeq } from '@deepseek-ai/dsh-session'
 
 let host: Host
 beforeEach(async () => {
-  host = await startRuntime(); agy.mockReset().mockResolvedValue({ status: 'finished', harness: 'antigravity', requested_model: 'gemini-3.8-flash-medium' })
+  magpie.mockReset().mockResolvedValue({ status: 'not-configured' })
+  codexQuota.mockReset().mockResolvedValue({ status: 'unknown' })
+  host = await startRuntime()
+  { const seeded = host.runtime.store.settings(); host.runtime.store.saveSettings({ ...seeded, executor: { ...seeded.executor, directWorkers: false } }) }
+  agy.mockReset().mockResolvedValue({ status: 'finished', harness: 'antigravity', requested_model: 'gemini-3.8-flash-medium' })
   codex.mockReset().mockResolvedValue({ status: 'finished', summary: 'done' })
   grok.mockReset().mockResolvedValue({
     status: 'finished', summary: 'done', requested_model: 'grok-4.7-build-fast', models: ['grok-4.7-build-fast'],
@@ -38,11 +47,155 @@ beforeEach(async () => {
 })
 afterEach(async () => { await host.stop() })
 const route = (decisions: unknown[]) => host.runTool(host.runtime.masterId, 'orchestrator_route', { decisions })
+const autoContext = { taskType: 'development', difficulty: 'complex', conditions: 'same requirements', ruleVersion: 'ac-v1' }
+const autoCandidates = [
+  { spec: { harness: 'grok', model: 'grok-4.7-build-fast' }, priority: 1, capable: true },
+  { spec: { harness: 'codex', model: 'gpt-6-luna' }, priority: 2, capable: true },
+]
+async function acceptAutomatic(id: string, automatic: Record<string, unknown> = {}, harness?: Record<string, unknown>) {
+  const source = feishu(id, 'Implement the requested change using an authorized suitable resource')
+  host.runtime.receive(source); await host.runtime.idle()
+  const result = await host.route({ kind: 'accept', trigger_id: source.id, title: 'Automatic choice', worktree_name: `automatic-${id}`,
+    acknowledgement: 'Implement the requested change.', auto_route: { candidates: autoCandidates, context: autoContext, ...automatic },
+    ...(harness ? { harness, harness_origin: 'user-specified' } : {}) })
+  await host.runtime.idle()
+  const ticket = host.runtime.store.tickets.get((result.ticket as { ticket_id: string }).ticket_id)!
+  return { result, ticket }
+}
 const tasks = [
   { title: 'AGY change', scope: 'First authorized task', worktree_name: 'agy-change', harness: { harness: 'agy', model: '3.8f', forbid4a: true } },
   { title: 'Codex change', scope: 'Second authorized task', worktree_name: 'codex-change', harness: { harness: 'codex' } },
   { title: 'Native change', scope: 'Third authorized task', worktree_name: 'native-change', harness: { harness: 'dsh' } },
 ]
+it('uses configured priority through the real accept chain without comparable trustworthy reviews', async () => {
+  const { result, ticket } = await acceptAutomatic('861')
+  expect(ticket.execution?.harness).toEqual(autoCandidates[0]!.spec)
+  expect(result.reason).toContain('router-auto')
+  expect(result.reason).toContain('configured priority')
+  expect(ticket.execution?.assignment).toContain('Grok')
+})
+it('keeps a single explicit model authoritative over automatic alternatives', async () => {
+  const { result, ticket } = await acceptAutomatic('862', {}, { harness: 'agy', model: '3.8f', forbid4a: true, allowFallback: false })
+  expect(ticket.execution?.harness).toEqual({ harness: 'agy', model: '3.8f', forbid4a: true, allowFallback: false })
+  expect(result.reason).toContain('user-specified')
+})
+it('accepts a DSH catalog provider+model as a first-class per-Ticket route', async () => {
+  const spec = { harness: 'dsh', provider: 'magpie-worker', model: 'auto/deepseek-v4.1-flash' }
+  const { ticket } = await acceptAutomatic('863', {}, spec)
+  // The provider is stored with the model so dispatch and authorization keep the two providers' same-name models distinct.
+  expect(ticket.execution?.harness).toEqual(spec)
+})
+it('does not infer user intent from a legacy single Harness parameter', async () => {
+  const source = feishu('876', 'Implement the requested change')
+  host.runtime.receive(source); await host.runtime.idle()
+  const result = await host.route({ kind: 'accept', trigger_id: source.id, title: 'Legacy choice', worktree_name: 'legacy-choice',
+    acknowledgement: 'Implement the requested change.', harness: { harness: 'grok' },
+    auto_route: { candidates: autoCandidates, context: autoContext } })
+  const ticket = host.runtime.store.tickets.get((result.ticket as { ticket_id: string }).ticket_id)!
+  expect(ticket.execution?.harness).toEqual({ harness: 'grok' })
+  expect(result.reason).toContain('origin unspecified')
+  expect(result.reason).not.toContain('user-specified')
+})
+it('does not read Codex quota for ordinary single-Harness or split accepts', async () => {
+  codexQuota.mockResolvedValue({ status: 'rate-limited', rate_limit_reached_type: 'primary' })
+  const single = await acceptAutomatic('877', {}, autoCandidates[1]!.spec)
+  expect(single.ticket.execution?.harness?.harness).toBe('codex')
+  const source = feishu('878', 'Implement two changes with the specified resources')
+  host.runtime.receive(source); await host.runtime.idle()
+  await host.route({ kind: 'accept', trigger_id: source.id, acknowledgement: 'Implement the two changes.', tasks: tasks.slice(0, 2) })
+  await host.runtime.idle()
+  expect(codexQuota).not.toHaveBeenCalled()
+})
+it('filters forbidden and panel-disabled alternatives before choosing the actual dispatched Harness', async () => {
+  const forbidden = await acceptAutomatic('863', { candidates: [{ ...autoCandidates[0], forbidden: true }, autoCandidates[1]] })
+  expect(forbidden.ticket.execution?.harness?.harness).toBe('codex')
+  saveSelection(host.runtime.store, ['codex/gpt-6-luna'])
+  const disabled = await acceptAutomatic('864')
+  expect(disabled.ticket.execution?.harness?.harness).toBe('codex')
+  await expect(acceptAutomatic('865', {}, { harness: 'grok' })).rejects.toThrow('disabled in the model authorization')
+})
+it('enforces the 4a ban and required alternatives during actual acceptance', async () => {
+  const candidates = [{ spec: { harness: 'agy', model: '4a' }, priority: 0, capable: true }, ...autoCandidates]
+  const { ticket } = await acceptAutomatic('866', { candidates, forbid4a: true, allow4a: true })
+  expect(ticket.execution?.harness).toEqual({ ...autoCandidates[0]!.spec, forbid4a: true })
+  const required = await acceptAutomatic('867', { candidates: [autoCandidates[0], { ...autoCandidates[1], required: true }] })
+  expect(required.ticket.execution?.harness?.harness).toBe('codex')
+  codexQuota.mockResolvedValue({ status: 'rate-limited', rate_limit_reached_type: 'primary' })
+  await expect(acceptAutomatic('868', { candidates: [autoCandidates[0], { ...autoCandidates[1], required: true }] })).rejects.toThrow('fallback is not authorized')
+})
+it('excludes known rate-limited Codex and exhausted DSH channels during real dispatch', async () => {
+  codexQuota.mockResolvedValue({ status: 'rate-limited', rate_limit_reached_type: 'primary' })
+  const limited = await acceptAutomatic('869', { candidates: [autoCandidates[1], { ...autoCandidates[0], priority: 3 }] })
+  expect(limited.ticket.execution?.harness?.harness).toBe('grok')
+  expect(limited.result.reason).toContain('resource state')
+  await expect(acceptAutomatic('870', { candidates: [autoCandidates[1], { ...autoCandidates[0], forbidden: true }] })).rejects.toThrow('rate-limited')
+  magpie.mockResolvedValue({ status: 'ok', account_quotas: [{ account_ref: 'ref', state: 'ok', windows: [{ remaining: 0 }] }],
+    request_usage: [{ served_model: 'deepseek-v4.1-flash', account_ref: 'ref' }] })
+  const exhausted = await acceptAutomatic('875', { candidates: [{ spec: { harness: 'dsh' }, capable: true, priority: 0 }, autoCandidates[0]] })
+  expect(exhausted.ticket.execution?.harness?.harness).toBe('grok')
+  expect(exhausted.result.reason).toContain('exhausted')
+})
+it('records a Router-chosen single legal Harness as router-auto, not user-specified', async () => {
+  const source = feishu('883', 'Implement the requested change using a suitable resource')
+  host.runtime.receive(source); await host.runtime.idle()
+  const result = await host.route({ kind: 'accept', trigger_id: source.id, title: 'Single legal choice', worktree_name: 'single-legal',
+    acknowledgement: 'Implement the requested change.', harness: { harness: 'grok' }, harness_origin: 'router-auto' })
+  await host.runtime.idle()
+  const ticket = host.runtime.store.tickets.get((result.ticket as { ticket_id: string }).ticket_id)!
+  expect(ticket.execution?.harness).toEqual({ harness: 'grok' })
+  expect(result.reason).toContain('router-auto')
+  expect(result.reason).not.toContain('user-specified')
+  expect(result.reason).not.toContain('origin unspecified')
+})
+it('dispatches auto_route candidates without configured priority by candidate order, never claiming configured priority or quality evidence', async () => {
+  const unpriced = [
+    { spec: { harness: 'grok', model: 'grok-4.7-build-fast' }, capable: true },
+    { spec: { harness: 'codex', model: 'gpt-6-luna' }, capable: true },
+  ]
+  const source = feishu('884', 'Implement the requested change using an authorized suitable resource')
+  host.runtime.receive(source); await host.runtime.idle()
+  const result = await host.route({ kind: 'accept', trigger_id: source.id, title: 'No priority', worktree_name: 'no-priority',
+    acknowledgement: 'Implement the requested change.', auto_route: { candidates: unpriced, context: autoContext } })
+  await host.runtime.idle()
+  const ticket = host.runtime.store.tickets.get((result.ticket as { ticket_id: string }).ticket_id)!
+  expect(ticket.execution?.harness).toEqual({ harness: 'grok', model: 'grok-4.7-build-fast' })
+  expect(result.reason).toContain('router-auto')
+  expect(result.reason).toContain('candidate order')
+  expect(result.reason).toContain('no configured priority or comparable reviews')
+  expect(result.reason).not.toMatch(/by configured priority \d/)
+  expect(result.reason).not.toContain('calibrated quality evidence')
+})
+it.each(['codex', 'grok', 'agy'] as const)('retains the %s ready gate when native model responses share its Harness history', async harness => {
+  const source = feishu('811', 'Use the specified Harness for this change')
+  host.runtime.receive(source); await host.runtime.idle()
+  await route([{ kind: 'accept', trigger_id: source.id, title: 'Native evidence', worktree_name: 'native-evidence', acknowledgement: 'On it',
+    harness: { harness, ...(harness === 'agy' ? { model: '3.8f' } : {}) } }]); await host.runtime.idle()
+  const ticket = host.runtime.store.tickets.list()[0]!, worker = 'worker-' + ticket.id
+  const session = host.ctx.agents.get(SessionId(worker))!.session
+  const observe = (step: number) => {
+    const time = Date.now()
+    host.ctx.emit('session/event', session, { type: 'step/start', seq: SessionSeq(step * 2), time, data: { turn: 1, step } })
+    host.ctx.emit('session/event', session, { type: 'assistant/message', seq: SessionSeq(step * 2 + 1), time, surfaceOp: 'append', data: {
+      turn: 1, step, message: createAssistantMessage({ content: [{ type: 'text', text: 'worker response' }],
+        source: { provider: 'magpie', model: 'requested', replayState: { response: { kind: 'pi-ai', version: 2,
+          provider: 'magpie', model: 'requested', responseModel: 'served' } } } }),
+      stream: [{ type: 'chunk', time, chunk: { type: 'finish', reason: { kind: 'stop' } } }],
+    } })
+  }
+  observe(1)
+  expect(host.runtime.store.tickets.get(ticket.id)?.execution?.harnessRuns?.[0]).toMatchObject({ harness: 'dsh', servedModel: 'served' })
+  await expect(host.runTool(worker, 'orchestrator_report', { state: 'ready', summary: 'Only native evidence' })).rejects.toThrow('No successful execution')
+  const args = { task: 'Do it', mode: 'write', ...(harness === 'agy' ? { model: '3.8f' } : {}) }
+  await host.runTool(worker, 'orchestrator_' + harness, args)
+  const receipt = host.runtime.store.tickets.get(ticket.id)?.execution?.harnessRun
+  observe(2)
+  const current = host.runtime.store.tickets.get(ticket.id)!
+  expect(current.execution?.harnessRun).toEqual(receipt)
+  expect(current.execution?.harnessRuns?.map(run => run.harness)).toEqual(['dsh', harness, 'dsh'])
+  const row = host.runtime.store.db.prepare('SELECT value FROM ticket WHERE id = ?').get(ticket.id) as { value: string }
+  expect(JSON.parse(row.value).execution.harnessRuns).toEqual(current.execution?.harnessRuns)
+  await host.runTool(worker, 'orchestrator_report', { state: 'ready', summary: 'Required Harness finished' })
+})
 it('routes one message to three actual native workers, retains the source and never creates duplicate Tickets', async () => {
   const source = feishu('51', 'Three independent tasks, using the requested Harness for each. Do not commit.')
   host.runtime.receive(source); await host.runtime.idle()
@@ -127,6 +280,8 @@ it('derives re-evaluable evidence from a routed Ticket without another model cal
     acknowledgement: 'On it', harness: { harness: 'codex', model: 'gpt-6-luna' } }]); await host.runtime.idle()
   const ticket = host.runtime.store.tickets.list()[0]!, worker = 'worker-' + ticket.id
   await host.runTool(worker, 'orchestrator_codex', { task: 'Do the change', mode: 'write' })
+  await host.runTool(worker, 'orchestrator_report', { state: 'ready', summary: 'Implementation finished; tests passed.' })
+  expect(host.runtime.store.tickets.get(ticket.id)?.ended?.outcome).toBe('completed')
   const input = evaluationInput(host.runtime.store.tickets.get(ticket.id)!)
   expect(input.team).toMatchObject({ kind: 'single', members: ['codex'] })
   expect(input.runs[0]).toMatchObject({ harness: 'codex', status: 'finished', requestedModel: 'gpt-6-luna' })
@@ -135,6 +290,12 @@ it('derives re-evaluable evidence from a routed Ticket without another model cal
   expect(input.unknowns).toContain('served_model:codex')
   expect(input.unknowns).toContain('cost_usd')
   expect(input.dimensions.evidence.confidence).toBe('verified')
+  expect(input.unknowns).toEqual(expect.arrayContaining(['machine_verified_test_results', 'user_acceptance']))
+  const evidence = await host.runTool(host.runtime.masterId, 'orchestrator_read', { resource: `ticket/${ticket.id}/evidence`, limit: 8000 })
+  expect(evidence.text).toContain('machine_verified_test_results')
+  expect(evidence.text).toContain('not human acceptance')
+  expect(host.runtime.store.tickets.get(ticket.id)?.execution?.qualityReviews).toBeUndefined()
+  expect(codex).toHaveBeenCalledTimes(1)
 })
 
 it('requires the Grok adapter for a Grok Ticket and records its run evidence without fallback', async () => {
@@ -408,25 +569,38 @@ it('does not let another sender replace a Ticket resource or silently remove a r
   expect(host.runtime.store.tickets.get(ticket.id)?.assignments).toHaveLength(1)
 })
 
-it('stores attributable live reviews in existing Tickets and applies them through native candidate advice only', async () => {
-  const context = { taskType: 'development', difficulty: 'complex', conditions: 'same requirements', ruleVersion: 'ac-v1' }
+it('accepts traceable live reviews and changes the actual dispatched Harness through calibrated quality evidence', async () => {
+  const context = autoContext
   const source = feishu('851', 'Two comparable tasks with authorized resources')
   host.runtime.receive(source); await host.runtime.idle()
   await route([{ kind: 'accept', trigger_id: source.id, acknowledgement: 'Inspect the two tasks.', tasks: [
     { title: 'Grok review sample', worktree_name: 'grok-quality', harness: { harness: 'grok' } },
     { title: 'Codex review sample', worktree_name: 'codex-quality', harness: { harness: 'codex', model: 'gpt-6-luna' } },
   ] }]); await host.runtime.idle()
-  codex.mockResolvedValueOnce({ summary: 'done', models: ['gpt-6-luna'] })
+  codex.mockResolvedValueOnce({ status: 'finished', summary: 'done', models: ['gpt-6-luna'] })
   for (const ticket of host.runtime.store.tickets.list()) {
     const harness = ticket.execution!.harness!.harness as 'grok' | 'codex'
     await host.runTool(`worker-${ticket.id}`, `orchestrator_${harness}`, { task: 'Inspect and report the result', mode: 'read-only' })
-    await host.runTool(`worker-${ticket.id}`, 'orchestrator_report', { state: 'progress', summary: 'Mock test evidence; fixture mechanism only.' })
-    const review = { id: `review-${ticket.id}`, harness, model: harness === 'grok' ? 'grok-4.7-build-fast' : 'gpt-6-luna', ...context,
+    await host.runTool(`worker-${ticket.id}`, 'orchestrator_report', { state: 'progress', summary: 'Inspection complete; awaiting review.' })
+    const stored = host.runtime.store.tickets.get(ticket.id)!
+    const run = stored.execution!.harnessRuns!.find(item => item.harness === harness)!
+    const model = run.servedModel ?? (run.models?.length === 1 ? run.models[0] : undefined)
+    expect(run.status).toBe('finished')
+    expect(model).toBe(harness === 'grok' ? 'grok-4.7-build-fast' : 'gpt-6-luna')
+    expect(stored.assignments.find(assignment => assignment.id === run.assignmentId)?.report).toBeDefined()
+    const review = { id: `review-${ticket.id}`, harness, model, ...context,
       artifact: `patch-${ticket.id}`, evaluator: 'reviewer', assignmentId: latestAssignment(ticket)!.id, evidenceRefs: [`ticket/${ticket.id}`],
       verdict: harness === 'grok' ? 'does-not-meet' : 'meets', origin: 'live', calibration: 'same objective criteria', sufficiency: 'explicit reviewer decision', at: '2026-11-15T00:00:00Z' }
     await expect(host.runTool(host.runtime.masterId, 'orchestrator_ticket_evaluate', { ticket_id: ticket.id, review: { ...review, origin: 'fixture' } })).rejects.toThrow('Fixture')
-    await host.runTool(host.runtime.masterId, 'orchestrator_ticket_evaluate', { ticket_id: ticket.id, review })
-    await expect(host.runTool(host.runtime.masterId, 'orchestrator_ticket_evaluate', { ticket_id: ticket.id, review: { ...review, verdict: 'unknown' } })).rejects.toThrow('immutable')
+    await expect(host.runTool(host.runtime.masterId, 'orchestrator_ticket_evaluate', { ticket_id: ticket.id, review })).resolves.toEqual({ recorded: true, provisional: false })
+    expect(host.runtime.store.tickets.get(ticket.id)?.execution?.qualityReviews).toEqual([review])
+    await expect(host.runTool(host.runtime.masterId, 'orchestrator_ticket_evaluate', { ticket_id: ticket.id,
+      review: { ...review, sufficiency: 'changed' } })).rejects.toThrow('immutable')
+    // Legacy reviews without the Ticket reference must still be excluded on advice and dispatch.
+    const withLegacy = host.runtime.store.tickets.get(ticket.id)!
+    withLegacy.execution!.qualityReviews!.push({ ...withLegacy.execution!.qualityReviews![0]!, id: `legacy-${ticket.id}`,
+      evidenceRefs: ['untraceable'], verdict: harness === 'grok' ? 'meets' : 'does-not-meet' })
+    host.runtime.store.tickets.save(withLegacy)
   }
   const result = await host.runTool(host.runtime.masterId, 'orchestrator_rank_candidates', { context, candidates: [
     { harness: 'grok', model: 'grok-4.7-build-fast', priority: 1, capable: true },
@@ -435,6 +609,9 @@ it('stores attributable live reviews in existing Tickets and applies them throug
   expect(result.selected.candidate.harness).toBe('codex')
   expect(result.reason).toContain('calibrated quality evidence')
   expect(host.runtime.store.tickets.list()).toHaveLength(2)
+  const routed = await acceptAutomatic('852')
+  expect(routed.ticket.execution?.harness).toEqual(autoCandidates[1]!.spec)
+  expect(routed.result.reason).toContain('quality evidence')
 })
 
 it('blocks replacement execution when a Job cancellation was requested but not confirmed', async () => {

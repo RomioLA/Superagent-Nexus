@@ -103,7 +103,8 @@ export function ticketCodexTool(ticket: Ticket): Tool<typeof toolArgs> {
       if (!directory) throw new Error('Native Ticket has no prepared workspace')
       // A structured Codex model binding is applied here from the Ticket's HarnessSpec, never a shared config write.
       const bound = ticket.execution?.harness?.harness === 'codex' ? ticket.execution.harness.model : undefined
-      const outcome = await runTicketCodex(directory, ticket.id, args.task, { ...args, ...(bound ? { model: bound } : {}) }, signal)
+      if (!bound) throw new Error('Codex requires an explicit authorized model; the CLI default model would bypass the per-model whitelist. Choose an authorized Codex model in the routing panel and set it in the Harness spec.')
+      const outcome = await runTicketCodex(directory, ticket.id, args.task, { ...args, model: bound }, signal)
       return { status: 'finished', ...outcome }
     },
   } satisfies Tool

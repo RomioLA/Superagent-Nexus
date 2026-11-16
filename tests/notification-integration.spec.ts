@@ -34,7 +34,7 @@ describe('native worker notification routing', () => {
   })
 })
 
-import { afterEach, beforeEach } from 'vitest'
+import { afterEach, beforeEach, vi } from 'vitest'
 import { key } from '../src/core/index.ts'
 import { feishu, startRuntime, type Host } from './fixtures/host.ts'
 
@@ -43,6 +43,48 @@ beforeEach(async () => { host = await startRuntime() })
 afterEach(async () => { await host.stop() })
 
 describe('Runtime result delivery', () => {
+  it('delivers one safe Worker failure without the Router, deduplicates errors and later replies, and allows a real retry', async () => {
+    const { ticket, sessionId, trigger } = await host.acceptedTicket(feishu('60', '@bot 部署整合版本', { root_id: 'om_origin' }))
+    const main = host.agents.get(host.runtime.masterId)!
+    main.steer.mockImplementation(() => { throw new Error('Router model unavailable') })
+    const fail = () => host.ctx.emit('agent/error', { agent: host.agents.get(sessionId), turn: 1, step: 1,
+      error: Object.assign(new Error('authentication_error: invalid key sk-private /internal/private/config'), { status: 401 }) } as never)
+    const results = () => (host.runtime.store.db.prepare('SELECT value FROM outbox').all() as { value: string }[])
+      .map(row => JSON.parse(row.value)).filter(row => row.ticketId === ticket.id && row.purpose === 'result')
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      fail()
+      await host.runtime.idle()
+      await host.runtime.sendReplies()
+      const report = host.runtime.store.tickets.get(ticket.id)!.assignments.at(-1)!.report!
+      const id = key('result', ticket.id, ticket.assignments.at(-1)!.id, 'failed', report.at)
+      const receipt = host.runtime.store.receipts.get(id)!
+      expect(receipt).toMatchObject({ status: 'sent', purpose: 'result', channel: trigger.channel,
+        text: expect.stringContaining(`工单 ${ticket.shortId}`) })
+      expect(receipt.text).toContain('执行失败（Worker 执行异常）')
+      expect(receipt.text).toContain('需要人工检查后重试')
+      expect(receipt.text).not.toMatch(/sk-private|internal|authentication_error/)
+      expect(host.runtime.store.db.prepare("SELECT key FROM effect WHERE kind = 'relay'").all()).toHaveLength(1)
+      // The same terminal error must not acquire a fresh report time / result ID on redelivery.
+      vi.setSystemTime(Date.now() + 1000)
+      fail()
+      await host.runtime.idle()
+      await host.runtime.sendReplies()
+      expect(host.runtime.store.tickets.get(ticket.id)!.assignments.at(-1)!.report!.at).toBe(report.at)
+      expect(host.runtime.engine.reply({ purpose: 'result', ticketId: ticket.id, text: 'Router later explains the failure.' }))
+        .toMatchObject({ id, reused: true, status: 'sent' })
+      expect(results()).toHaveLength(1)
+      // An explicitly retried assignment has its own failure event and receipt.
+      host.runtime.engine.retryTicket(ticket.id)
+      await host.runtime.idle()
+      fail()
+      await host.runtime.idle()
+      await host.runtime.sendReplies()
+      expect(results()).toHaveLength(2)
+      expect(new Set(results().map(row => row.id)).size).toBe(2)
+    } finally { vi.useRealTimers() }
+  })
+
   it('queues one automatic stop receipt and deduplicates a later result with changed wording', async () => {
     const { ticket } = await host.acceptedTicket(feishu('51', '@bot stop this'))
     host.runtime.engine.stopTicket(ticket.id, 'No longer needed')

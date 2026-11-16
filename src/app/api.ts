@@ -1,7 +1,7 @@
 /** Type-only management API contract between the web panel and host routes, imported by the panel without bundling host code. */
 import type { ModelCatalog } from '@deepseek-ai/dsh-api-session-controller/types'
 import type { PromptConfig, Prompts } from './prompts.ts'
-import type { PromptsView, RoutingView, StateView, TicketPageView } from './http.ts'
+import type { PromptsView, RoutingView, ScanView, StateView, TicketPageView } from './http.ts'
 import type { HistoryView } from './settings-history.ts'
 import type { OverviewView } from './views/overview.ts'
 import type { SettingsView } from './views/settings.ts'
@@ -41,6 +41,8 @@ export interface Api {
   'POST setup/check': { response: { restarting: true } }
   'GET models': { response: ModelCatalog }
   'GET models/routing': { response: RoutingView }
+  'POST models/scan': { response: ScanView }
+  'PUT models/selection': { body: { enabled: string[] }; response: { explicit: boolean; enabled: string[] | null } }
   'GET prompts': { query?: { revision?: number; offset?: number }; response: PromptsView }
   'PUT prompts': { body: { config: PromptConfig; baseRevision: number }; response: { revision: number; context_delivery: Delivery } }
   'POST prompts/preview': { body: PromptConfig; response: ReturnType<Prompts['preview']> }

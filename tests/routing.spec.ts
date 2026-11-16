@@ -2,7 +2,7 @@ import type { QualityReview } from '../src/app/evaluation.ts'
 import { planResourceFallback } from '../src/app/routing.ts'
 /** P1-S7 lightweight resource-aware routing: trustworthy signals decide, unknown stays unknown, explicit constraints win. */
 import { expect, it } from 'vitest'
-import { availabilityFromWindows, diffModelSurface, rankRouteCandidates, summarizeRoutingSignals, type RouteCandidate } from '../src/app/routing.ts'
+import { availabilityFromWindows, availabilityReadingFor, diffModelSurface, discoverModelSurface, harnessAcceptBlocker, rankRouteCandidates, summarizeHarnessAvailability, summarizeRoutingSignals, type RouteCandidate } from '../src/app/routing.ts'
 import { readResource } from '../src/app/resources.ts'
 
 const candidate = (overrides: Partial<RouteCandidate> & Pick<RouteCandidate, 'harness' | 'priority'>): RouteCandidate =>
@@ -166,6 +166,35 @@ it('reports a not-configured Magpie source as unknown rather than healthy', () =
   expect(routing.unknown).toEqual(expect.arrayContaining(['cost_usd', 'cache_hit_rate', 'agy_quota', 'grok_quota', 'codex_quota']))
 })
 
+it('marks every catalog model of a loaded provider as a dispatchable DSH route and only the configured one as a channel', () => {
+  const routing = summarizeRoutingSignals({
+    status: 'ok',
+    account_quotas: [{ account_ref: 'ref-a', state: 'ok', windows: [{ remaining: 9 }] }],
+    request_usage: [{ served_model: 'used-model', provider: 'magpie', account_ref: 'ref-a' }],
+  })
+  const catalog = {
+    routableProviders: ['magpie'],
+    groups: [
+      { id: 'magpie', name: 'Magpie', models: [{ id: 'used-model' }, { id: 'configured-model' }] },
+      { id: 'cold', name: 'Cold provider', models: [{ id: 'cold-model' }] },
+    ],
+  }
+  // Only the configured DSH executor model is a selectable availability channel; a matching Magpie reading is kept.
+  const observed = discoverModelSurface(catalog, routing, { provider: 'magpie', model: 'used-model' })
+  expect(observed.channels.map(channel => channel.model)).toEqual(['used-model'])
+  expect(observed.channels[0]).toMatchObject({ availability: 'available' })
+  // Another model of the same loaded provider is a resolvable DSH route, so it is dispatchable with unknown quota.
+  expect(observed.discovered.find(item => item.model === 'configured-model')).toMatchObject({ dispatchable: true, state: 'availability-unknown' })
+  // A model of a provider that did not load stays discovered-only.
+  expect(observed.discovered.find(item => item.model === 'cold-model')).toMatchObject({ dispatchable: false, state: 'discovered' })
+  // A configured route known only from the catalog becomes the one channel with unknown availability.
+  const fromCatalog = discoverModelSurface(catalog, routing, { provider: 'magpie', model: 'configured-model' })
+  expect(fromCatalog.channels.map(channel => channel.model)).toEqual(['configured-model'])
+  expect(fromCatalog.channels[0]).toMatchObject({ availability: 'unknown', selectable: true })
+  expect(fromCatalog.discovered.find(item => item.model === 'used-model')).toMatchObject({ dispatchable: true, state: 'executable', availability: 'available' })
+  expect(fromCatalog.discovered.find(item => item.model === 'configured-model')).toMatchObject({ dispatchable: true, state: 'availability-unknown' })
+})
+
 it('serves the routing projection from the existing models resource alongside the raw snapshot', async () => {
   const snapshot = {
     status: 'partial',
@@ -188,6 +217,10 @@ it('serves the routing projection from the existing models resource alongside th
   } as never, 'models', 0, undefined) as Record<string, any>
   expect(result.magpie).toEqual(snapshot)
   expect(result.routing).toMatchObject({ source: 'magpie', preferred_channel: null })
+  // The same per-Harness availability the dispatch gate uses is exposed to the Router here.
+  expect(result.harnesses.dsh.state).toBe('available')
+  expect(result.harnesses.codex.state).toBe('unknown')
+  expect(result.harnesses.grok.state).toBe('unknown')
   // The models resource now reports a real refresh diff, whose first read establishes the baseline.
   expect(result.refresh).toMatchObject({ first: true })
 })
@@ -261,6 +294,17 @@ it('adjusts comparable quality order while quota exhaustion/restoration leaves h
   expect(rankRouteCandidates(qualityCandidates, options).selected?.candidate.harness).toBe('codex')
   expect(qualityReviews[1]?.verdict).toBe('meets')
 })
+it.each(['required', 'forbidden', '4a', 'exhausted', 'rate-limited'] as const)('better comparable quality cannot bypass %s', constraint => {
+  const candidates = qualityCandidates.map(row => ({ ...row }))
+  if (constraint === 'required') candidates[0]!.required = true
+  if (constraint === 'forbidden') candidates[1]!.forbidden = true
+  if (constraint === '4a') candidates[1] = { ...candidates[1]!, harness: 'agy', model: '4a' }
+  if (constraint === 'exhausted' || constraint === 'rate-limited')
+    candidates[1]!.reading = { state: constraint, evidence: `known ${constraint}` }
+  const reviews = qualityReviews.map(row => constraint === '4a' && row.harness === 'codex' ? { ...row, harness: 'agy' as const, model: '4a' } : row)
+  const result = rankRouteCandidates(candidates, { quality: { context: qualityContext, reviews, origin: 'fixture' } })
+  expect(result.selected?.candidate.harness).toBe('grok')
+})
 it('keeps fixtures, uncalibrated reviews, different difficulty/model/Harness out of live quality ranking', () => {
   expect(rankRouteCandidates(qualityCandidates, { quality: { context: qualityContext, reviews: qualityReviews } }).selected?.candidate.harness).toBe('grok')
   const renamed = qualityCandidates.map(row => row.harness === 'codex' ? { ...row, model: 'new-model' } : row)
@@ -280,4 +324,121 @@ it('blocks illegal fallback and unreviewed existing side effects instead of sele
   const safe = planResourceFallback(candidates, options, { oldWorkerActive: false, hasSideEffects: true, checked: true })
   expect(safe.status).toBe('ready'); expect(safe.decision.selected?.candidate.harness).toBe('codex')
   expect(planResourceFallback(candidates.slice(0, 2), options, { oldWorkerActive: false, hasSideEffects: false, checked: true }).status).toBe('blocked')
+})
+
+it('folds several Magpie accounts serving one model into a single logical channel', () => {
+  const snapshot = {
+    status: 'ok',
+    account_quotas: [
+      { provider: 'deepseek', account_ref: 'ref-a', state: 'ok', windows: [{ remaining: 500 }] },
+      { provider: 'deepseek', account_ref: 'ref-b', state: 'ok', windows: [{ remaining: 0 }] },
+      { provider: 'deepseek', account_ref: 'ref-c', state: 'ok', windows: [{ remaining: 0 }] },
+    ],
+    request_usage: ['ref-a', 'ref-b', 'ref-c'].map(ref => ({ provider: 'deepseek', served_model: 'deepseek-v4.1-flash', account_ref: ref })),
+  }
+  const routing = summarizeRoutingSignals(snapshot)
+  expect(routing.observed_channels).toHaveLength(1)
+  const channel = routing.observed_channels[0]!
+  expect(channel).toMatchObject({ harness: 'dsh', model: 'deepseek-v4.1-flash', availability: 'available', selectable: true })
+  expect(channel.remaining).toBeUndefined() // no invented aggregate number across accounts
+  expect(channel.accounts).toHaveLength(3)
+  expect(channel.accounts!.map(account => account.availability)).toEqual(['available', 'exhausted', 'exhausted'])
+})
+
+it('marks a logically merged model exhausted only when no account is available', () => {
+  const snapshot = {
+    status: 'ok',
+    account_quotas: ['ref-a', 'ref-b'].map(ref => ({ account_ref: ref, state: 'ok', windows: [{ remaining: 0 }] })),
+    request_usage: ['ref-a', 'ref-b'].map(ref => ({ served_model: 'm', account_ref: ref })),
+  }
+  const routing = summarizeRoutingSignals(snapshot)
+  expect(routing.observed_channels).toHaveLength(1)
+  expect(routing.observed_channels[0]).toMatchObject({ availability: 'exhausted', selectable: false, excluded_because: 'exhausted' })
+})
+
+it('summarizes each Harness availability from its own reader and keeps Grok/AGY unknown', () => {
+  const availability = summarizeHarnessAvailability({
+    magpie: { status: 'ok', account_quotas: [{ account_ref: 'ref-a', state: 'ok', windows: [{ remaining: 5 }] }],
+      request_usage: [{ served_model: 'm', account_ref: 'ref-a' }] },
+    codex: { status: 'rate-limited', rate_limit_reached_type: 'primary' },
+  })
+  expect(availability.dsh.state).toBe('available')
+  expect(availability.codex.state).toBe('rate-limited')
+  expect(availability.grok.state).toBe('unknown')
+  expect(availability.agy.state).toBe('unknown')
+})
+
+it('does not report a channel exhausted when some accounts are exhausted and others have no reading', () => {
+  const snapshot = {
+    status: 'ok',
+    account_quotas: [{ account_ref: 'ref-a', state: 'ok', windows: [{ remaining: 0 }] }],
+    request_usage: [{ served_model: 'm', account_ref: 'ref-a' }, { served_model: 'm', account_ref: 'ref-unread' }],
+  }
+  const routing = summarizeRoutingSignals(snapshot)
+  expect(routing.observed_channels).toHaveLength(1)
+  expect(routing.observed_channels[0]).toMatchObject({ availability: 'unknown', selectable: true })
+  expect(routing.observed_channels[0]!.excluded_because).toBeUndefined()
+})
+
+it('checks the selected DSH model channel, not "any account in the Harness"', () => {
+  const snapshot = {
+    status: 'ok',
+    account_quotas: [
+      { account_ref: 'a', state: 'ok', windows: [{ remaining: 0 }] },
+      { account_ref: 'b', state: 'ok', windows: [{ remaining: 5 }] },
+    ],
+    request_usage: [{ served_model: 'm1', account_ref: 'a' }, { served_model: 'm2', account_ref: 'b' }],
+  }
+  expect(availabilityReadingFor({ magpie: snapshot }, 'dsh', 'm1').state).toBe('exhausted')
+  expect(availabilityReadingFor({ magpie: snapshot }, 'dsh', 'm2').state).toBe('available')
+  // The Harness-level summary says available because m2 exists — a blanket check would wrongly admit the exhausted m1.
+  expect(summarizeHarnessAvailability({ magpie: snapshot }).dsh.state).toBe('available')
+  expect(availabilityReadingFor({ magpie: snapshot }, 'dsh', 'missing-model').state).toBe('unknown')
+  // A provider-qualified role model resolves to the same observed served channel, so the real config still checks it.
+  expect(availabilityReadingFor({ magpie: snapshot }, 'dsh', 'magpie-worker/m1').state).toBe('exhausted')
+})
+
+it('blocks acceptance only for a known exhausted or rate-limited chosen route', () => {
+  const exhausted = { state: 'exhausted' as const, remaining: 0, evidence: 'quota window exhausted (remaining=0)' }
+  const limited = { state: 'rate-limited' as const, evidence: 'Codex rate limit reached' }
+  const unknown = { state: 'unknown' as const, evidence: 'no reader' }
+  expect(harnessAcceptBlocker({ harness: 'dsh' }, exhausted)).toContain('exhausted')
+  expect(harnessAcceptBlocker({ harness: 'codex' }, limited)).toContain('rate-limited')
+  expect(harnessAcceptBlocker({ harness: 'grok' }, unknown)).toBeUndefined()
+  expect(harnessAcceptBlocker({ harness: 'agy' }, unknown)).toBeUndefined()
+  expect(harnessAcceptBlocker({ harness: 'dsh' }, { state: 'available' as const, evidence: 'remaining' })).toBeUndefined()
+  // A bare allowFallback boolean does not let an already exhausted chosen route be accepted.
+  expect(harnessAcceptBlocker({ harness: 'dsh', allowFallback: true }, exhausted)).toContain('exhausted')
+})
+
+it('keys discovered models by harness+provider+model so same-name models from different providers stay separate', () => {
+  const routing = summarizeRoutingSignals({ status: 'not-configured' })
+  const catalog = { groups: [
+    { id: 'magpie', name: 'magpie', models: [{ id: 'auto/gpt-5.6-sol' }] },
+    { id: 'magpie-worker', name: 'magpie-worker', models: [{ id: 'auto/gpt-5.6-sol' }] },
+  ] }
+  const surface = discoverModelSurface(catalog, routing, null, [
+    { harness: 'codex', provider: 'codex', status: 'ok', source: 'codex models_cache', models: ['gpt-5.6-sol'] },
+  ])
+  const dsh = surface.discovered.filter(item => item.harness === 'dsh' && item.model === 'gpt-5.6-sol')
+  expect(dsh.map(item => item.provider).sort()).toEqual(['magpie', 'magpie-worker'])
+  expect(surface.discovered.find(item => item.harness === 'codex')).toMatchObject({ model: 'gpt-5.6-sol', dispatchable: true })
+})
+
+it('attributes dispatchability and availability per provider for the same DSH model', () => {
+  const routing = summarizeRoutingSignals({
+    status: 'ok',
+    account_quotas: [{ provider: 'deepseek', account_ref: 'r', state: 'ok', windows: [{ remaining: 5 }] }],
+    request_usage: [{ provider: 'deepseek', served_model: 'shared-model', account_ref: 'r' }],
+  })
+  const catalog = { routableProviders: ['magpie', 'magpie-worker'], groups: [
+    { id: 'magpie', name: 'Magpie', models: [{ id: 'shared-model' }] },
+    { id: 'magpie-worker', name: 'Magpie Worker', models: [{ id: 'shared-model' }] },
+  ] }
+  const surface = discoverModelSurface(catalog, routing, { provider: 'magpie', model: 'shared-model' })
+  const rows = surface.discovered.filter(item => item.harness === 'dsh' && item.model === 'shared-model')
+  expect(rows.find(row => row.provider === 'magpie')).toMatchObject({ dispatchable: true, availability: 'available' })
+  // The sibling provider serves the same model independently: it is dispatchable in its own right, quota unknown, not a copy
+  // of the configured provider's reading.
+  expect(rows.find(row => row.provider === 'magpie-worker')).toMatchObject({ dispatchable: true, state: 'availability-unknown', availability: 'unknown' })
 })

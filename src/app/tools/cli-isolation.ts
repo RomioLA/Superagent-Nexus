@@ -57,6 +57,8 @@ export async function reuseCredential(target: string, link: string): Promise<voi
 
 /** The shared Antigravity home the deployment already authenticated. */
 export const sharedAgyHome = (): string => join(homedir(), '.gemini')
+/** The AGY CLI binary the executor spawns, shared with tool detection so both resolve the same install. */
+export const agyCliPath = (): string => join(homedir(), '.local/bin/agy')
 /** The Codex CLI binary shared by the Executor and the read-only account quota reader. */
 export const codexCliPath = (): string => join(homedir(), 'opt/codex/node_modules/.bin/codex')
 /** The shared Codex home the deployment already authenticated. */

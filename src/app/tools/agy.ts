@@ -3,11 +3,10 @@
  */
 import { spawn } from 'node:child_process'
 import { realpath, stat } from 'node:fs/promises'
-import { homedir } from 'node:os'
 import { isAbsolute, join, relative, sep } from 'node:path'
 import { z } from 'zod'
 import type { HarnessUsage, Ticket } from '../../core/index.ts'
-import { cliStateDir, ensureCliDir, prepareAgyHome } from './cli-isolation.ts'
+import { agyCliPath, cliStateDir, ensureCliDir, prepareAgyHome } from './cli-isolation.ts'
 import type { Tool } from './tool.ts'
 
 export const agyArgs = z.object({
@@ -18,7 +17,7 @@ export const agyArgs = z.object({
 }).strict()
 
 type AgyArgs = z.infer<typeof agyArgs>
-const cliPath = () => join(homedir(), '.local/bin/agy')
+const cliPath = (): string => agyCliPath()
 const timeoutMs = (mode: AgyArgs['mode']) => mode === 'read-only' ? 150_000 : 8 * 60_000
 const printTimeout = (mode: AgyArgs['mode']) => mode === 'read-only' ? '120s' : '450s'
 const maxCapture = 2_000_000

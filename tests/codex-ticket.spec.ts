@@ -25,4 +25,9 @@ describe('Codex is a native Executor tool, not an independent job scheduler', ()
     expect(reportedCodexTokens('tokens used\n15,001\n')).toBe(15001)
     expect(reportedCodexTokens('no metric')).toBeUndefined()
   })
+  it('refuses to run without an explicit authorized model so the CLI default cannot bypass the whitelist', async () => {
+    const ticket = { id: 't', execution: { directory: '/tmp/dsh-ticket', name: 't', assignment: '', harness: { harness: 'codex' } } } as Ticket
+    await expect(ticketCodexTool(ticket).execute({ task: 'Make a change', mode: 'write' }, new AbortController().signal))
+      .rejects.toThrow(/explicit authorized model/)
+  })
 })

@@ -2,14 +2,15 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
-import { UserError, followupOwners, key, reasonText, type Decision, type DecisionKind, type EngineForMainSession, type EngineForPeople }
+import { UserError, followupOwners, key, reasonText, type Decision, type DecisionKind, type EngineForMainSession, type EngineForPeople, type HarnessSpec }
   from '../../core/index.ts'
 import { IM_WORDS, NOTE_WORDS, wordCount } from '../../infra/text.ts'
 import { AssessmentSchema, EvalReadSchema, WorktreeNameSchema, type MasterAssessor } from '../assessment.ts'
 import { ticketCard } from '../cards.ts'
 import { runAsWorker } from '../../infra/environment.ts'
 import { QualityReviewSchema, validateQualityReview } from '../evaluation.ts'
-import { rankRouteCandidates, planResourceFallback, summarizeCodexQuotaSignals, summarizeRoutingSignals } from '../routing.ts'
+import { rankRouteCandidates, planResourceFallback, summarizeCodexQuotaSignals, summarizeRoutingSignals, availabilityReadingFor, harnessAcceptBlocker } from '../routing.ts'
+import { isRouteAuthorized, readSelection, type Selection } from '../models.ts'
 import { composeTicketReceipt, isChinese } from '../receipts.ts'
 import { PromptConfigSchema, savePrompts, type Prompts } from '../prompts.ts'
 import { readResource, type MainResourceHost, type ResourceHost } from '../resources.ts'
@@ -28,7 +29,7 @@ export interface MainToolsHost {
   readonly context: Context
   workerActive?(ticket: import('../../core/index.ts').Ticket): boolean
   readonly engine: Pick<EngineForMainSession, 'decide' | 'acceptTasks' | 'attach' | 'reply' | 'requestStatus' | 'note'> & EngineForPeople
-  readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'atomic' | 'replyStatus' | 'settings'>
+  readonly store: Pick<Store, 'tickets' | 'triggers' | 'threads' | 'atomic' | 'replyStatus' | 'settings' | 'get'>
   readonly prompts: Pick<Prompts, 'preview' | 'save'>
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery' | 'modelRetry'>
   readonly settings: Pick<Settings, 'view' | 'block' | 'save' | 'pause' | 'sync'>
@@ -53,7 +54,8 @@ const fromDecision = (decision: Decision) => ({ decision: decision.kind, reason:
 const HarnessSpecSchema = z.object({
   harness: z.enum(['dsh', 'agy', 'codex', 'grok']).describe('The Worker backend you judge suitable and authorized from the request and task, not a fixed default; AGY requires agy.'),
   mode: z.enum(['read-only', 'write']).optional(),
-  model: z.string().min(1).max(120).optional().describe('AGY 3.8f/4a; Codex alias; Grok pinned.'),
+  model: z.string().min(1).max(120).optional().describe('AGY 3.8f/4a; Codex id; Grok pin.'),
+  provider: z.string().optional(),
   forbid4a: z.boolean().optional().describe('Never upgrade to 4a.'),
   allowFallback: z.boolean().optional().describe('Only explicit authorization permits fallback.'),
 }).strict().refine(spec => !(spec.model === '4a' && spec.forbid4a), '4a conflicts with forbid4a')
@@ -61,11 +63,13 @@ const HarnessSpecSchema = z.object({
     if (spec.model === undefined) return
     if (spec.harness === 'agy' && !['3.8f', '4a'].includes(spec.model))
       ctx.addIssue({ code: 'custom', path: ['model'], message: 'AGY accepts only 3.8f or 4a' })
-    if (spec.harness === 'dsh')
-      ctx.addIssue({ code: 'custom', path: ['model'], message: 'DSH does not accept a model selection' })
+    if (spec.harness !== 'dsh' && spec.provider !== undefined)
+      ctx.addIssue({ code: 'custom', path: ['provider'], message: 'Only DSH selects a catalog provider' })
+    if (spec.harness === 'dsh' && spec.provider === undefined)
+      ctx.addIssue({ code: 'custom', path: ['provider'], message: 'A DSH model must name the catalog provider that owns it' })
     if (spec.harness === 'grok' && spec.model !== 'grok-4.7-build-fast')
       ctx.addIssue({ code: 'custom', path: ['model'], message: 'Grok is pinned to grok-4.7-build-fast' })
-  })
+  }).meta({ id: 'RouteHarness' })
 const TaskSpecSchema = z.object({
   title: z.string().trim().min(1).max(200).describe('Original subrequest label.'),
   scope: z.string().trim().min(1).max(2000).optional().describe('Narrow scope; original source retains authority.'),
@@ -74,6 +78,26 @@ const TaskSpecSchema = z.object({
   note: RoutingNoteSchema.optional(),
   project_id: z.string().optional(),
   harness: HarnessSpecSchema.optional().describe('Overrides the item Harness.'),
+}).strict()
+const AutoRouteSchema = z.object({
+  candidates: z.array(z.object({
+    spec: z.object({
+      harness: z.enum(['dsh', 'agy', 'codex', 'grok']),
+      mode: z.enum(['read-only', 'write']).optional(),
+      model: z.string().min(1).max(120).optional(),
+      forbid4a: z.boolean().optional(),
+      allowFallback: z.boolean().optional(),
+    }).strict().superRefine((spec, ctx) => {
+      // Shape checks run above; retain the shared model restrictions without duplicating shape errors.
+      for (const issue of HarnessSpecSchema.safeParse(spec).error?.issues ?? [])
+        if (issue.code === 'custom') ctx.addIssue({ ...issue })
+    }),
+    priority: z.number().finite().optional(),
+    capable: z.boolean(), required: z.boolean().optional(), forbidden: z.boolean().optional(),
+  }).strict()).min(2).max(30),
+  context: z.object({ taskType: z.string().min(1), difficulty: z.string().min(1), conditions: z.string().min(1), ruleVersion: z.string().min(1) }).strict(),
+  forbid4a: z.boolean().optional(),
+  allow4a: z.boolean().optional(),
 }).strict()
 
 /**
@@ -92,10 +116,12 @@ const RouteItemSchema = z.object({
   project_id: z.string().nullish().describe('accept: registered project id; ask if ambiguous.'),
   tasks: z.array(TaskSpecSchema).max(6).nullish().describe('accept: independent subrequests, each a native Ticket; omit for one.'),
   harness: HarnessSpecSchema.nullish().describe('accept: the Worker backend/model you judged suitable and authorized, not merely a note; inherited by tasks.'),
+  harness_origin: z.enum(['user-specified', 'router-auto']).nullish(),
+  auto_route: AutoRouteSchema.nullish(),
 }).strict()
 type RouteItem = z.infer<typeof RouteItemSchema>
 type Kind = RouteItem['kind']
-type Field = Exclude<keyof RouteItem, 'kind' | 'trigger_id' | 'tasks' | 'harness' | 'project_id'>
+type Field = Exclude<keyof RouteItem, 'kind' | 'trigger_id' | 'tasks' | 'harness' | 'harness_origin' | 'project_id' | 'auto_route'>
 /** Each field's check, the kinds whose items read it and those that need it; an item of another kind leaves it unread. */
 const FIELDS: Record<Field, { check: z.ZodType; reads: readonly Kind[]; needs: readonly Kind[] }> = {
   ticket_id: { check: z.string(), reads: ['attach', 'stop'], needs: ['attach', 'stop'] },
@@ -110,6 +136,8 @@ function invalid(item: RouteItem): string | undefined {
   // Accepting several independent tasks carries its own per-task labels, so the single-ticket fields are optional then.
   const split = item.kind === 'accept' && Array.isArray(item.tasks) && item.tasks.length >= 2
   if (item.kind === 'accept' && item.tasks && item.tasks.length === 1) return 'tasks: give at least two tasks, or none for one Ticket'
+  if (item.kind === 'accept' && item.harness_origin && !item.harness) return 'harness_origin needs a single structured harness'
+  if (split && item.auto_route) return 'auto_route: use a single Ticket, or give each split task an explicit harness'
   for (const [field, { check, reads, needs }] of Object.entries(FIELDS) as [Field, typeof FIELDS[Field]][]) {
     const value = item[field]
     if (!reads.includes(item.kind)) continue
@@ -122,17 +150,35 @@ function invalid(item: RouteItem): string | undefined {
     const checked = check.safeParse(value)
     if (!checked.success) return `${field}: ${checked.error.issues[0]?.message ?? 'invalid'}`
   }
-  if (item.kind === 'accept' && (split ? item.tasks!.some(task => !(task.harness ?? item.harness)) : !item.harness))
+  if (item.kind === 'accept' && (split ? item.tasks!.some(task => !(task.harness ?? item.harness)) : !item.harness && !item.auto_route))
     return 'accept needs structured harness: choose the backend and model that fit the request and task from those authorized; a routing note is not a Harness constraint.'
 
   return undefined
 }
 type Routed = { decision?: DecisionKind; reason: string; ticketId?: string | undefined; ticketIds?: readonly string[]; triggerIds?: readonly string[] }
+type AvailabilityInput = { magpie?: unknown; codex?: unknown; authorization: Selection }
+/** Revalidate stored reviews on every dispatch; legacy or invalid claims never enter the live ranking pool. */
+function liveQualityReviews(host: MainToolsHost) {
+  return host.store.tickets.list().flatMap(ticket => (ticket.execution?.qualityReviews ?? []).filter(review => {
+    try { validateQualityReview(ticket, review); return true } catch { return false }
+  }))
+}
+/**
+ * The concrete route a Harness spec dispatches. DSH carries its own catalog provider+model when named and otherwise the
+ * configured executor route, so the gate checks the exact model the Worker will run; Grok is pinned by its adapter.
+ */
+function dispatchRoute(host: MainToolsHost, spec: HarnessSpec): { model?: string; provider?: string } {
+  if (spec.harness === 'dsh') {
+    const configured = host.store.settings().executor.model
+    return spec.model ? { model: spec.model, provider: spec.provider } : { model: configured?.model, provider: configured?.provider }
+  }
+  return { model: spec.harness === 'grok' ? 'grok-4.7-build-fast' : spec.model }
+}
 /**
  * Carry out one routing decision as its Engine command, in a transaction of its own. `decided` holds the Triggers that this
  * call's earlier items decided, with their batches.
  */
-function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string, string>): Routed | { refused: string } {
+function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string, string>, availability: AvailabilityInput | undefined): Routed | { refused: string } {
   const trigger = host.store.triggers.get(item.trigger_id)
   const target = (id?: string | null) => {
     if (!trigger?.meta.projectRequired) return undefined
@@ -153,6 +199,19 @@ function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string
   switch (item.kind) {
     case 'accept': {
       if (item.tasks && item.tasks.length >= 2) {
+        if (availability) {
+          for (const task of item.tasks) {
+            const spec = task.harness ?? item.harness
+            if (!spec) continue
+            // Check the exact route the Worker will run — a named DSH catalog model is a real independent route, not the
+            // configured default — so the gate enforces this model's authorization and its own availability.
+            const { model, provider } = dispatchRoute(host, spec)
+            if (!isRouteAuthorized(availability.authorization, spec.harness, model, provider))
+              return { refused: `Task "${task.title}" not accepted: ${spec.harness}${model ? `/${model}` : ''} is disabled in the model authorization panel` }
+            const blocked = harnessAcceptBlocker(spec, availabilityReadingFor(availability, spec.harness, model))
+            if (blocked) return { refused: `Task "${task.title}" not accepted: ${blocked}` }
+          }
+        }
         const accepted = host.engine.acceptTasks(item.trigger_id, {
           tasks: item.tasks.map((task, index) => ({ title: task.title, name: task.worktree_name,
             ...(task.scope ? { scope: task.scope } : {}),
@@ -165,12 +224,44 @@ function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string
           ...(item.harness ? { harness: item.harness } : {}),
         })
         if (!accepted.ticketIds.length) return { refused: 'No Tickets were created' }
-        return { decision: 'accept', reason: `Accepted as ${accepted.ticketIds.length} independent Tickets`,
+        return { decision: 'accept', reason: `Accepted as ${accepted.ticketIds.length} independent Tickets; explicit per-task Harness constraints`,
           ticketIds: accepted.ticketIds, triggerIds: [item.trigger_id] }
       }
+      let harness = item.harness
+      let selectionReason = `${item.harness_origin ?? 'origin unspecified'} single Harness/model constraint; automatic quality selection bypassed`
+      if (!harness && item.auto_route && availability) {
+        const automatic = item.auto_route
+        // Priority is used only when the Router configured it; candidate input order is never reported as priority.
+        const candidates = automatic.candidates.map(({ spec, priority, capable, required, forbidden }) => {
+          const { model, provider } = dispatchRoute(host, spec)
+          return { harness: spec.harness, model, priority, capable, required,
+            forbidden: forbidden || !isRouteAuthorized(availability.authorization, spec.harness, model, provider)
+              || (automatic.forbid4a === true && model === '4a'),
+            reading: availabilityReadingFor(availability, spec.harness, model) }
+        })
+        const ranking = rankRouteCandidates(candidates, { allow4a: automatic.forbid4a ? false : automatic.allow4a,
+          quality: { context: automatic.context, reviews: liveQualityReviews(host) } })
+        // Configured priority and comparable reviews decide first. With neither, candidate order is the only legal
+        // tie-break: keep dispatch working and record that basis instead of claiming a configured priority.
+        const noPriority = !automatic.candidates.some(candidate => candidate.priority !== undefined)
+        const chosen = ranking.selected ?? (noPriority ? ranking.ranked[0] : undefined)
+        if (!chosen) return { refused: ranking.reason }
+        const index = ranking.evaluated.indexOf(chosen)
+        harness = { ...automatic.candidates[index]!.spec, ...(automatic.forbid4a ? { forbid4a: true } : {}) }
+        const label = chosen.candidate.model ? `${chosen.candidate.harness}/${chosen.candidate.model}` : chosen.candidate.harness
+        selectionReason = ranking.selected ? `router-auto: ${ranking.reason}`
+          : `router-auto: selected ${label} by resource availability then candidate order; no configured priority or comparable reviews`
+      }
+      if (availability && harness) {
+        const { model, provider } = dispatchRoute(host, harness)
+        if (!isRouteAuthorized(availability.authorization, harness.harness, model, provider))
+          return { refused: `${harness.harness}${model ? `/${model}` : ''} is disabled in the model authorization panel` }
+        const blocked = harnessAcceptBlocker(harness, availabilityReadingFor(availability, harness.harness, model))
+        if (blocked) return { refused: blocked }
+      }
       const before = host.store.triggers.disposition(item.trigger_id)?.decisionId
-      const decision = host.engine.decide(item.trigger_id, { kind: 'accept', title: item.title!, scope: item.title!, reason: { code: 'explicitRouted' },
-        acknowledgement: item.acknowledgement!, name: item.worktree_name!, ...note, project: target(item.project_id), ...(item.harness ? { harness: item.harness } : {}) })
+      const decision = host.engine.decide(item.trigger_id, { kind: 'accept', title: item.title!, scope: item.title!, reason: selectionReason,
+        acknowledgement: item.acknowledgement!, name: item.worktree_name!, ...note, project: target(item.project_id), ...(harness ? { harness } : {}) })
       // A Decision that created no ticket is the item's refusal; one that existed before keeps what it was accepted with.
       if (decision.kind !== 'accept' || !decision.ticketId) return { refused: `Ticket was not created: ${reasonText(decision.reason)}` }
       if (decision.id === before) {
@@ -200,16 +291,37 @@ function route(host: MainToolsHost, item: RouteItem, decided: ReadonlyMap<string
 function routeTool(host: MainToolsHost): Tool {
   return tool({
     name: 'orchestrator_route',
-    description: 'Route candidates, one item each by the card\'s trigger_id, in one call: accept an explicit request as a new ticket, attach a trigger to an existing ticket, stop a ticket on a person\'s stop message, or ignore a candidate that needs no ticket or stop, as dispatch says. Items run in order and each is answered on its own; a refused item leaves the others. An inferred candidate may be ignored here; accepting one goes through orchestrator_eval_decide.',
+    description: 'Route cards by trigger_id per dispatch: accept explicit work as a new Ticket, attach, stop on a person\'s stop, or ignore. Items run independently in order. Inferred accepts require orchestrator_eval_decide.',
     schema: z.object({ decisions: z.array(RouteItemSchema).min(1).max(20) }).strict(),
-    execute: async ({ decisions }) => {
+    execute: async ({ decisions }, signal) => {
+      // Single-Harness accepts retain the Magpie gate; Codex quota reads are only needed for automatic candidates.
+      // Failed reads stay unknown; known quota blocks dispatch.
+      const accepts = decisions.filter(item => item.kind === 'accept')
+      const chosen = accepts.flatMap(item => [
+        ...(item.harness ? [item.harness.harness] : []),
+        ...(!item.harness ? (item.auto_route?.candidates ?? []).map(candidate => candidate.spec.harness) : []),
+        ...(item.tasks ?? []).map(task => task.harness?.harness ?? item.harness?.harness),
+      ])
+      const automatic = accepts.flatMap(item => !item.harness ? item.auto_route?.candidates ?? [] : [])
+      const safeRead = async (fn?: (signal?: AbortSignal) => Promise<unknown>): Promise<unknown> => {
+        if (!fn) return undefined
+        try { return await fn(signal) } catch { return undefined }
+      }
+      const readings = await Promise.all([
+        chosen.includes('dsh') ? safeRead(host.resources.magpie) : undefined,
+        automatic.some(candidate => candidate.spec.harness === 'codex') ? safeRead(host.resources.codexQuota) : undefined,
+      ])
+      const availability = accepts.length ? {
+        magpie: readings[0], codex: readings[1],
+        authorization: readSelection(host.store),
+      } satisfies AvailabilityInput : undefined
       const decided = new Map<string, string>()
       const results = decisions.map(item => {
         const head = { trigger_id: item.trigger_id, kind: item.kind }
         const problem = invalid(item)
         if (problem) return { ...head, refused: problem }
         try {
-          const result = route(host, item, decided)
+          const result = route(host, item, decided, availability)
           if ('refused' in result) return { ...head, ...result }
           for (const id of result.triggerIds ?? []) if (!decided.has(id)) decided.set(id, item.trigger_id)
           const ticket = result.ticketId ? host.store.tickets.get(result.ticketId) : undefined
@@ -230,6 +342,7 @@ function routeTool(host: MainToolsHost): Tool {
 /** Builds the main Session's tools; `agent` scopes prompt preview resources to that Session. */
 export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
   const resources: MainResourceHost = { ...host.resources, sessions: host.sessions, settings: host.settings }
+  // The dialect URI is redundant in each tool's parameters; keep the schemas and validation intact.
   return [
     readTool('Read one page of a resource the resource parameter lists, such as the ticket list or a ticket. Follow next_offset, and next_resource where a page names one.',
       false, (resource, offset, limit, signal) => readResource(resources, resource, offset, limit, undefined, signal)),
@@ -246,7 +359,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
         const existing = reviews.find(item => item.id === review.id)
         if (existing && JSON.stringify(existing) !== JSON.stringify(review)) throw new Error('Review IDs are immutable; append a superseding review')
         if (!existing) { ticket.execution.qualityReviews = [...reviews, review]; host.store.tickets.save(ticket) }
-        return { recorded: true, provisional: !review.calibration || !review.sufficiency }
+        return { recorded: true, provisional: review.verdict === 'unknown' || !review.calibration || !review.sufficiency }
       }),
     }),
     tool({
@@ -272,9 +385,7 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
             : channel ? { reading: { state: channel.availability, evidence: channel.reason } }
             : { unknownReason: 'No current resource reading for this Harness/model' }) }
         })
-        const reviews = host.store.tickets.list().flatMap(ticket => (ticket.execution?.qualityReviews ?? []).filter(review => {
-          try { validateQualityReview(ticket, review); return true } catch { return false }
-        }))
+        const reviews = liveQualityReviews(host)
         const options = { allow4a: required?.forbid4a ? false : args.allow4a,
           allowFallback: required ? required.allowFallback === true : args.allowFallback, quality: { context: args.context, reviews } }
         if (!ticket) return rankRouteCandidates(candidates, options)
@@ -363,7 +474,17 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
       description: 'Record the decision of an assessment, as admission describes it, after orchestrator_eval with the same trigger_id.',
       schema: z.object({ trigger_id: z.string().min(1), ...AssessmentSchema.shape }).strict(),
       execute: async ({ trigger_id, ...result }, signal) => {
-        const decided = await host.assessor.decide(trigger_id, AssessmentSchema.parse(result), signal)
+        const assessment = AssessmentSchema.parse(result)
+        // An inferred acceptance runs on the default DSH route (its assessment carries no Harness), so it must obey the same
+        // authorization set as explicit dispatch — reuse the one rule instead of a second copy. Scan and inference never widen it.
+        if (assessment.decision === 'accept') {
+          const route = host.store.settings().executor.model
+          const model = route?.model
+          if (!isRouteAuthorized(readSelection(host.store), 'dsh', model, route?.provider)) {
+            return { refused: `The default DSH route${model ? ` (${model})` : ''} is disabled in the model authorization panel; enable it or route an authorized Harness explicitly with orchestrator_route.` }
+          }
+        }
+        const decided = await host.assessor.decide(trigger_id, assessment, signal)
         return routed(host, { decision: decided.state as DecisionKind, reason: decided.reason, ticketId: decided.ticket_id })
       },
     }),
@@ -464,5 +585,5 @@ export function mainTools(host: MainToolsHost, agent: Agent): Tool[] {
         return saved
       },
     }),
-  ]
+  ].map(definition => ({ ...definition, schema: definition.schema.meta({ $schema: undefined }) }))
 }

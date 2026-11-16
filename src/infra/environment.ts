@@ -4,7 +4,8 @@
  * Provides default-path guardrails rather than an OS-level security boundary, as workers run under the operator's OS user.
  */
 import { lstat, mkdir, readdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
-import { realpathSync } from 'node:fs'
+import { existsSync, realpathSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { delimiter, join, resolve } from 'node:path'
 import type { SubprocessOutputReader, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import type { Deployment } from '../deployment.ts'
@@ -15,7 +16,7 @@ const MARKER = '# Written by dsh-superagent on every start; edits are lost.'
 /** Markers of files written under the project's earlier names (`dsh-tag`, `dsh-go`, `dsh-freelancer`), which `dsh-superagent` owns and replaces too. */
 const LEGACY_MARKERS = ['dsh-tag', 'dsh-go', 'dsh-freelancer'].map(name => `# Written by ${name} on every start; edits are lost.`)
 /** Commands workers need, which `blockedCommands` cannot block: the shims and git. */
-export const WORKER_COMMANDS: readonly string[] = ['gh', 'git', 'lark-cli']
+export const WORKER_COMMANDS: readonly string[] = ['gh', 'git', 'lark-cli', 'grok']
 export const workerBin = (stateDir: string): string => join(stateDir, 'worker-bin')
 export const workerGitConfig = (stateDir: string): string => join(stateDir, 'worker-gitconfig')
 const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`
@@ -73,6 +74,23 @@ async function own(file: string, text: string, mode = 0o644): Promise<void> {
 }
 
 /**
+ * The absolute Grok Build CLI path to pin in the `grok` shim: an explicit `GROK_CLI`, the deployment user's local bin, or a
+ * PATH lookup that skips the shim directory itself. Recreating this shim on every start is what keeps the restart-safe entry.
+ */
+function findGrok(stateDir: string, path: string): string | undefined {
+  const candidates = [process.env.GROK_CLI, join(homedir(), '.local', 'bin', 'grok'), join(homedir(), '.npm-global', 'bin', 'grok'),
+    '/usr/local/bin/grok', '/opt/homebrew/bin/grok'].filter((value): value is string => Boolean(value))
+  for (const candidate of candidates) if (existsSync(candidate)) return candidate
+  const shimDir = resolve(workerBin(stateDir))
+  for (const entry of path.split(delimiter)) {
+    if (!entry || resolve(entry) === shimDir) continue
+    const candidate = join(entry, 'grok')
+    if (existsSync(candidate)) return candidate
+  }
+  return undefined
+}
+
+/**
  * Atomically writes worker CLI shims and the isolated git configuration file into the state directory, refusing to overwrite foreign files.
  * Each shim strips the shim directory from PATH before exec so wrapper scripts resolving `gh` or `lark-cli` by name reach the real binary.
  */
@@ -99,6 +117,10 @@ export async function writeEnvironment(deployment: Pick<Deployment, 'stateDir' |
   const fail = (message: string): string => `echo ${shellQuote(message)} >&2\nexit 1`
   await shim('gh', run(github.cli))
   await shim('lark-cli', feishu ? run(feishu.cli) : fail('lark-cli is unavailable: this installation has no Feishu bot.'))
+  // Grok Build lives outside the service PATH on some hosts; a shim here is written on every start so a restart never loses it.
+  // When no CLI is found the shim fails loudly, making the missing Grok install a visible error instead of a silent one.
+  const grok = findGrok(stateDir, process.env.PATH ?? '')
+  await shim('grok', grok ? run(grok) : fail('Grok Build CLI is not installed on this host; install it or set GROK_CLI to its executable.'))
   for (const name of new Set(blockedCommands.filter(name => !WORKER_COMMANDS.includes(name)))) {
     await shim(name, fail(`${name} is blocked in this installation; use gh, which acts as ${github.login}.`))
   }

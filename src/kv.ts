@@ -31,6 +31,25 @@ export const KV = {
     builtIn: family<string, [base: string]>('prompt-built-in:') },
   /** Runtime: the main Session's ID. */
   runtime: { masterId: record<string>('master-id') },
+  /**
+   * Model management: the user's explicit enabled logical routes (an absent selection means every route is authorized) and
+   * the last manual scan, whose snapshot is the baseline the next scan reports changes against.
+   */
+  models: {
+    selection: record<{ enabled: string[]; updatedAt: string }>('models-selection'),
+    scan: record<{
+      fetchedAt: string
+      providers: { id: string; name: string; count: number }[]
+      harnesses: Record<string, { state: string; evidence?: string; remaining?: number; resetsAt?: string }>
+      /** Real per-Harness model lists read on the last scan; the panel poll shows them without re-reading CLIs. */
+      harnessModels?: { harness: string; provider: string; source: string; status: string; fetched_at?: string; models: readonly string[]; hiddenModels?: readonly string[]; error?: string }[]
+      /** The last scan's raw Codex quota snapshot, so the poll can show it without re-spawning the CLI. */
+      codexQuota?: unknown
+      /** Every resolvable DSH route the last scan read, per provider, so the candidate pool offers models the panel authorizes. */
+      dshCatalog?: { provider: string; model: string }[]
+      snapshot: { catalog: string[]; availability: Record<string, string>; sources: Record<string, string> }
+    }>('models-scan'),
+  },
   /** Sessions: prompt revisions each Session has worked under, ordered oldest first; the last entry (`.at(-1)`) is its active revision. */
   sessions: { prompts: family<number[], [session: string]>('session-prompts:') },
   /** Schema 11 migration: legacy main-Session queues imported into the effect table. */

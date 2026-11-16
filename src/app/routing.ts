@@ -2,8 +2,8 @@
  * Lightweight, explainable resource-aware candidate ordering for the Router (P1-S7).
  *
  * It only consumes trustworthy values that a source actually reported. A value the source did not return stays `unknown`
- * and never becomes a number, so no cost, quota or cache score is invented. Real quality scoring and dynamic learning are
- * deferred to S9: this is a temporary, transparent rule set — not a second Router, Queue, database or scoring service.
+ * and never becomes a number, so no cost, quota or cache score is invented. Comparable validated reviews can reorder
+ * evidence-backed candidates; incomplete quality remains provisional.
  *
  * The rules are deliberately narrow:
  *  - A person's explicit requirement (a named Harness/model, `forbid4a`, "no fallback") is authoritative over any advice.
@@ -17,6 +17,13 @@ import type { HarnessName } from '../core/index.ts'
 
 /** Known availability of one candidate from a trustworthy reading; `unknown` means no usable signal was obtained. */
 export type Availability = 'available' | 'exhausted' | 'rate-limited' | 'unknown'
+
+/**
+ * The logical model id used everywhere for authorization and channel matching. A role model can be provider-qualified
+ * (e.g. `auto/deepseek-v4.1-flash` while the observed served model is `deepseek-v4.1-flash`); comparing the last path
+ * segment keeps a checked box and the real dispatch on the same id instead of rejecting a name mismatch.
+ */
+export const logicalModelId = (model?: string): string | undefined => model ? model.split('/').at(-1) : undefined
 
 /**
  * A normalized availability reading for one candidate. `remaining` and `resetsAt` are present only when the source named
@@ -225,6 +232,7 @@ export function rankRouteCandidates(candidates: readonly RouteCandidate[], optio
   // when no required candidate is itself selectable.
   const pool = required.length ? (requiredSelectable.length ? requiredSelectable : options.allowFallback === true ? selectable : []) : selectable
   const ranked = [...pool].sort(compare)
+  const configuredSelection = ranked[0]
   const quality = options.quality ? summarizeQuality(options.quality.reviews, options.quality.context, options.quality.origin) : []
   const standing = (item: CandidateEvaluation) => quality.find(row => row.harness === item.candidate.harness && row.model === item.candidate.model)
   // Keep unknown candidates in their configured slots; only comparable evidence-backed candidates change places.
@@ -241,9 +249,13 @@ export function rankRouteCandidates(candidates: readonly RouteCandidate[], optio
   const parts: string[] = []
   if (selected) {
     const label = selected.candidate.model ? `${selected.candidate.harness}/${selected.candidate.model}` : selected.candidate.harness
-    parts.push(standing(selected)?.status === 'evidence-backed'
+    parts.push(selected.candidate.required
+      ? `Selected ${label} by user-specified requirement`
+      : selected !== configuredSelection || selected.candidate.priority === undefined
       ? `Selected ${label} using comparable calibrated quality evidence (${options.quality!.context.ruleVersion}); availability remains independent`
       : `Selected ${label} by configured priority ${selected.candidate.priority}${selected.candidate.reading?.state === 'available' ? ' with a known available reading' : ' with availability unknown'}`)
+    if (excluded.some(item => item.excludedBecause === 'exhausted' || item.excludedBecause === 'rate-limited'))
+      parts.push('resource state excludes known unavailable candidates')
   } else if (ranked.length) {
     parts.push('No trustworthy priority: only resource evidence is reported')
   } else if (required.length) {
@@ -272,6 +284,8 @@ export interface RoutingChannel {
   selectable: boolean
   excluded_because?: CandidateEvaluation['excludedBecause']
   reason: string
+  /** Per-account detail when several Magpie accounts serve this one logical model; top-level availability is the aggregate. */
+  accounts?: { account_ref?: string; availability: Availability; remaining?: number; resets_at?: string }[]
 }
 
 /** The explainable resource projection the Router reads; it states what is known and what is still unknown. */
@@ -311,29 +325,65 @@ export function summarizeRoutingSignals(snapshot: unknown): RoutingSignals {
       : { state: 'unknown', evidence: `quota card state=${text(card.state) ?? 'unknown'}` })
   }
 
-  // Build candidates from the model channels actually observed for these keys; unknown account linkage stays unknown.
-  const candidates: RouteCandidate[] = []
-  const meta = new Map<RouteCandidate, { provider?: string; account_ref?: string }>()
+  // Fold per-account observations into one logical channel per (model, provider): several Magpie accounts that serve the
+  // same model become one candidate row (their per-account quota stays as detail) instead of duplicate rows.
+  interface ChannelGroup { model: string; provider?: string; accounts: { account_ref?: string; reading?: AvailabilityReading }[] }
+  const groups = new Map<string, ChannelGroup>()
   const usage = Array.isArray(data.request_usage) ? data.request_usage : []
-  usage.forEach(group => {
-    if (!isRecord(group)) return
+  for (const group of usage) {
+    if (!isRecord(group)) continue
     const model = text(group.served_model) ?? text(group.requested_model)
-    if (!model) return
+    if (!model) continue
+    const provider = text(group.provider)
     const ref = text(group.account_ref)
+    const key = `${model}\u0000${provider ?? ''}`
+    let entry = groups.get(key)
+    if (!entry) { entry = { model, ...(provider ? { provider } : {}), accounts: [] }; groups.set(key, entry) }
     const reading = ref ? byAccount.get(ref) : undefined
+    entry.accounts.push({ ...(ref ? { account_ref: ref } : {}), ...(reading ? { reading } : {}) })
+  }
+  // A group with one account keeps that account's exact reading (remaining/resets_at/evidence). Several accounts aggregate:
+  // available when any account is available; unknown when any account has no trustworthy reading (partial exhaustion must NOT
+  // be reported as a fully exhausted channel — an unknown account may still serve); only exhausted/rate-limited when every
+  // account is known and none is available.
+  const aggregateReading = (accounts: ChannelGroup['accounts']): AvailabilityReading | undefined => {
+    if (accounts.length === 1) return accounts[0]!.reading
+    const states = accounts.map(account => account.reading?.state ?? 'unknown')
+    if (states.includes('available'))
+      return { state: 'available', evidence: `at least one of ${accounts.length} Magpie accounts is available` }
+    if (states.includes('unknown'))
+      return { state: 'unknown', evidence: `${states.filter(state => state === 'unknown').length} of ${accounts.length} Magpie accounts have no trustworthy reading` }
+    if (states.every(state => state === 'rate-limited')) return { state: 'rate-limited', evidence: 'every Magpie account is rate-limited' }
+    return { state: 'exhausted', evidence: 'every Magpie account is exhausted' }
+  }
+  const candidates: RouteCandidate[] = []
+  const meta = new Map<RouteCandidate, { provider?: string; account_ref?: string; accounts: ChannelGroup['accounts'] }>()
+  for (const entry of groups.values()) {
+    const reading = aggregateReading(entry.accounts)
+    const linked = entry.accounts.some(account => account.account_ref)
     const candidate: RouteCandidate = {
-      harness: 'dsh', model, capable: true,
-      ...(reading ? { reading } : { unknownReason: ref ? 'no matching quota snapshot for this account' : 'account not linked to a quota snapshot' }),
+      harness: 'dsh', model: entry.model, capable: true,
+      ...(reading ? { reading } : { unknownReason: linked ? 'no matching quota snapshot for this account' : 'account not linked to a quota snapshot' }),
     }
-    meta.set(candidate, { ...(text(group.provider) ? { provider: text(group.provider) } : {}), ...(ref ? { account_ref: ref } : {}) })
+    meta.set(candidate, {
+      ...(entry.provider ? { provider: entry.provider } : {}),
+      ...(entry.accounts.length === 1 && entry.accounts[0]!.account_ref ? { account_ref: entry.accounts[0]!.account_ref } : {}),
+      accounts: entry.accounts,
+    })
     candidates.push(candidate)
-  })
+  }
 
   const decision = rankRouteCandidates(candidates)
   // Every observed channel is shown, including one excluded as exhausted, so the Router sees the real evidence and why.
   const observedChannels: RoutingChannel[] = decision.evaluated.map(item => {
     const reading = item.candidate.reading
     const channel = meta.get(item.candidate)
+    const accounts = channel?.accounts.map(account => ({
+      ...(account.account_ref ? { account_ref: account.account_ref } : {}),
+      availability: account.reading?.state ?? ('unknown' as Availability),
+      ...(account.reading?.remaining !== undefined ? { remaining: account.reading.remaining } : {}),
+      ...(account.reading?.resetsAt ? { resets_at: account.reading.resetsAt } : {}),
+    }))
     return {
       harness: item.candidate.harness, model: item.candidate.model!,
       ...(item.candidate.priority !== undefined ? { priority: item.candidate.priority } : {}),
@@ -344,6 +394,7 @@ export function summarizeRoutingSignals(snapshot: unknown): RoutingSignals {
       ...(reading?.resetsAt ? { resets_at: reading.resetsAt } : {}),
       selectable: item.selectable, ...(item.excludedBecause ? { excluded_because: item.excludedBecause } : {}),
       reason: item.reasons.join('; '),
+      ...(accounts && accounts.length > 1 ? { accounts } : {}),
     }
   })
 
@@ -363,6 +414,212 @@ export function summarizeRoutingSignals(snapshot: unknown): RoutingSignals {
       : null,
     unknown: [...unknown], note: ROUTING_NOTE,
   }
+}
+
+/**
+ * The parts of the live model catalog that discovery needs, structurally typed so this module stays framework-free.
+ * `routableProviders` names the providers whose catalog actually loaded, so a model under another provider is discovered
+ * but not executable.
+ */
+export interface ModelCatalogInput {
+  readonly groups: readonly { readonly id: string; readonly name: string; readonly models: readonly { readonly id: string }[] }[]
+  readonly routableProviders?: readonly string[]
+}
+
+/** One model found among the catalog, Magpie or a Harness's own data, with the state the panel must distinguish. */
+export interface ModelDiscovery {
+  harness: HarnessName
+  provider: string
+  model: string
+  /** The provider-owned catalog id carrying any adapter prefix (for example `auto/deepseek-v4.1-flash`), which dispatch passes verbatim to the live resolver. */
+  catalog_model?: string
+  /** Whether this model can actually be dispatched by its harness right now. */
+  dispatchable: boolean
+  availability: Availability
+  /** `executable` (dispatchable, known availability), `availability-unknown` (dispatchable, no reading) or `discovered`. */
+  state: 'executable' | 'availability-unknown' | 'discovered'
+  reason: string
+  /** Source of this model discovery (catalog, dsh route, magpie channel, external harness data). */
+  source: string
+}
+
+const discoveryState = (dispatchable: boolean, availability: Availability): ModelDiscovery['state'] =>
+  !dispatchable ? 'discovered' : availability === 'unknown' ? 'availability-unknown' : 'executable'
+
+export interface HarnessModelSource {
+  harness: HarnessName
+  provider: string
+  source: string
+  status: 'ok' | 'failed' | 'not-installed'
+  fetched_at?: string
+  models: readonly string[]
+  /** Models whose own metadata marks them hidden or internal, so cached presence is not a dispatch capability. */
+  hiddenModels?: readonly string[]
+  error?: string
+}
+
+export function harnessDispatchable(harness: HarnessName, model: string): boolean {
+  return harness === 'codex' ? true
+    : harness === 'grok' ? model === 'grok-4.7-build-fast'
+      : harness === 'agy' ? /^gemini-3\.8-flash-(low|medium|high)$/.test(model)
+        : false
+}
+
+/**
+ * Merge the model catalog with the Magpie routing projection. Real DSH dispatch uses only the configured
+ * `settings().executor.model`, so only that exact model becomes a dispatchable channel; every other catalog model
+ * (and any Magpie-observed model that is not the configured route) stays visible as discovered-only so it never poses
+ * as an independently dispatchable or authorizable channel. When no DSH route is configured, no DSH model is
+ * dispatchable. Magpie-served readings are preserved. The catalog only covers DSH LLM routes; Codex/Grok/AGY are
+ * reported separately per Harness.
+ */
+export function discoverModelSurface(catalog: ModelCatalogInput | undefined, routing: RoutingSignals,
+  dshRoute?: { provider?: string; model?: string } | null, harnessModels: readonly HarnessModelSource[] = []): {
+  channels: RoutingChannel[]
+  discovered: ModelDiscovery[]
+} {
+  const modelKey = (model: string): string => logicalModelId(model) ?? model
+  const routeModel = dshRoute?.model ? modelKey(dshRoute.model) : undefined
+  const routeProvider = dshRoute?.provider
+  const isDispatchRoute = (provider: string | undefined, model: string): boolean =>
+    routeModel !== undefined && modelKey(model) === routeModel
+    && (routeProvider === undefined || provider === undefined || provider === routeProvider)
+  const channels = new Map<string, RoutingChannel>()
+  const discovered = new Map<string, ModelDiscovery>()
+  const add = (row: ModelDiscovery): void => { discovered.set(`${row.harness}\u0000${row.provider}\u0000${row.model}`, row) }
+  // Provider identity is the catalog provider id; matching by model alone would blur two providers that share a model.
+  const rowFor = (harness: string, model: string, provider?: string): ModelDiscovery | undefined =>
+    [...discovered.values()].find(row => row.harness === harness && row.model === model
+      && (provider === undefined || row.provider === provider))
+  const observedFor = (model: string): RoutingChannel | undefined =>
+    routing.observed_channels.find(channel => channel.harness === 'dsh' && modelKey(channel.model) === model)
+  for (const group of catalog?.groups ?? []) {
+    const routable = catalog?.routableProviders === undefined || catalog.routableProviders.includes(group.id)
+    for (const entry of group.models) {
+      const model = modelKey(entry.id)
+      // A catalog model of a loaded provider is resolvable by the DSH executor, so it is a dispatch candidate in its own
+      // right, exactly as a Codex/Grok/AGY model is; only an unloaded provider's rows stay discovered-only.
+      const dispatchable = routable
+      const configured = isDispatchRoute(group.id, entry.id)
+      // Only the configured DSH provider inherits a Magpie reading; a sibling provider that shares the model stays unknown.
+      const observed = routeProvider === undefined || group.id === routeProvider ? observedFor(model) : undefined
+      const availability = observed?.availability ?? ('unknown' as Availability)
+      if (configured && !channels.has(model)) {
+        channels.set(model, { harness: 'dsh', model, provider: group.id, availability,
+          selectable: availability !== 'exhausted' && availability !== 'rate-limited',
+          reason: `[configured executor] ${group.name} lists the DSH dispatch route; no availability reading yet` })
+      }
+      const reason = !dispatchable
+        ? `[catalog] ${group.name} lists this model, but its provider did not load, so the dsh executor cannot resolve it`
+        : configured
+          ? observed ? observed.reason : `[catalog] ${group.name} lists the configured DSH dispatch route; no availability reading yet`
+          : observed?.reason ?? `[catalog] ${group.name} lists this model; the dsh executor can resolve it, quota ${availability}`
+      add({ harness: 'dsh', provider: group.id, model, catalog_model: entry.id, dispatchable, availability,
+        state: discoveryState(dispatchable, availability), reason, source: 'catalog' })
+    }
+  }
+  if (routeModel !== undefined) {
+    const observedRoute = routing.observed_channels.find(channel => channel.harness === 'dsh'
+      && modelKey(channel.model) === routeModel
+      && (routeProvider === undefined || channel.provider === undefined || channel.provider === routeProvider))
+    const availability = observedRoute?.availability ?? ('unknown' as Availability)
+    if (!channels.has(routeModel)) {
+      if (observedRoute) channels.set(routeModel, observedRoute)
+      else channels.set(routeModel, { harness: 'dsh', model: dshRoute!.model!,
+        ...(routeProvider ? { provider: routeProvider } : {}), availability: 'unknown', selectable: true,
+        reason: '[configured executor] the configured DSH dispatch route; no availability reading yet' })
+    }
+    const existing = rowFor('dsh', routeModel, routeProvider)
+    if (existing) { existing.dispatchable = true; existing.state = discoveryState(true, existing.availability) }
+    else add({ harness: 'dsh', provider: routeProvider ?? observedRoute?.provider ?? 'dsh', model: dshRoute!.model!,
+      dispatchable: true, availability, state: discoveryState(true, availability), source: 'executor',
+      reason: observedRoute?.reason ?? '[configured executor] the configured DSH dispatch route; no availability reading yet' })
+  }
+  for (const channel of routing.observed_channels) {
+    const dispatchable = isDispatchRoute(channel.provider, channel.model)
+    // Magpie reports the upstream vendor, not the DSH provider id, so a DSH channel merges into the configured provider row.
+    const existing = channel.harness === 'dsh'
+      ? rowFor('dsh', modelKey(channel.model), routeProvider) ?? rowFor('dsh', modelKey(channel.model))
+      : rowFor(channel.harness, channel.model, channel.provider)
+    if (existing) {
+      if (dispatchable) existing.dispatchable = true
+      existing.availability = channel.availability
+      existing.state = discoveryState(existing.dispatchable, channel.availability)
+      existing.reason = channel.reason
+    } else add({ harness: channel.harness, provider: channel.provider ?? channel.harness, model: channel.model,
+      dispatchable, availability: channel.availability, state: discoveryState(dispatchable, channel.availability), reason: channel.reason, source: 'magpie' })
+  }
+  for (const source of harnessModels) {
+    if (source.status !== 'ok') continue
+    const hidden = source.hiddenModels ?? []
+    for (const model of source.models) {
+      // A cached model is only a dispatch candidate when the executor supports the model and its metadata does not hide it.
+      const concealed = hidden.includes(model)
+      const dispatchable = !concealed && harnessDispatchable(source.harness, model)
+      add({ harness: source.harness, provider: source.provider, model, dispatchable, availability: 'unknown',
+        state: discoveryState(dispatchable, 'unknown'), source: source.source,
+        reason: concealed
+          ? `[${source.source}] ${source.provider} lists this model, but its metadata marks it hidden or internal, so it is not a dispatch candidate`
+          : `[${source.source}] ${source.provider} lists this model; the ${source.harness} executor ${dispatchable ? 'can' : 'cannot'} dispatch it` })
+    }
+  }
+  return { channels: [...channels.values()], discovered: [...discovered.values()] }
+}
+
+/** Aggregate several observed readings without turning a partially-unknown set into a false "exhausted". */
+function combineAvailabilityStates(states: readonly Availability[], count: number, what: string): AvailabilityReading {
+  if (!count) return { state: 'unknown', evidence: `no ${what} reading` }
+  if (states.includes('available')) return { state: 'available', evidence: `at least one of ${count} ${what} is available` }
+  if (states.includes('unknown'))
+    return { state: 'unknown', evidence: `${states.filter(state => state === 'unknown').length} of ${count} ${what} have no trustworthy reading` }
+  if (states.every(state => state === 'rate-limited')) return { state: 'rate-limited', evidence: `every ${what} is rate-limited` }
+  return { state: 'exhausted', evidence: `every ${what} is exhausted` }
+}
+
+/**
+ * Normalize each Harness's known availability from the readers that actually exist, for the panel's overview. Magpie
+ * channels describe DSH; Codex has an independent quota reader; Grok and AGY expose no readable quota, so they stay explicitly
+ * unknown rather than being assumed healthy. This is a Harness-level summary; dispatch must use `availabilityReadingFor` so a
+ * specific model is checked against its own logical channel rather than "any account somewhere in the Harness".
+ */
+export function summarizeHarnessAvailability(input: { magpie?: unknown; codex?: unknown }): Record<HarnessName, AvailabilityReading> {
+  const routing = summarizeRoutingSignals(input.magpie)
+  const dshChannels = routing.observed_channels.filter(channel => channel.harness === 'dsh')
+  const codex = summarizeCodexQuotaSignals(input.codex ?? { status: 'unknown' })
+  return {
+    dsh: combineAvailabilityStates(dshChannels.map(channel => channel.availability), dshChannels.length, 'Magpie channel'),
+    codex: { state: codex.availability, evidence: codex.reason },
+    grok: { state: 'unknown', evidence: 'Grok quota is not readable; availability is unknown' },
+    agy: { state: 'unknown', evidence: 'AGY quota is not readable; availability is unknown' },
+  }
+}
+
+/**
+ * The availability of the specific logical route being dispatched: for DSH/Magpie, only the channel(s) of the selected model
+ * (never "some account in the Harness is available"); other Harnesses use their reader. Unknown stays unknown.
+ */
+export function availabilityReadingFor(input: { magpie?: unknown; codex?: unknown }, harness: HarnessName,
+  model?: string): AvailabilityReading {
+  if (harness !== 'dsh') return summarizeHarnessAvailability(input)[harness]
+  const channels = summarizeRoutingSignals(input.magpie).observed_channels
+    .filter(channel => channel.harness === 'dsh' && (model === undefined || logicalModelId(channel.model) === logicalModelId(model)))
+  if (!channels.length) return { state: 'unknown', evidence: model ? `no Magpie channel for ${model}` : 'no Magpie channel reading' }
+  return combineAvailabilityStates(channels.map(channel => channel.availability), channels.length, model ? `Magpie channel for ${model}` : 'Magpie channel')
+}
+
+/**
+ * Why the Harness a router chose must not be accepted right now: only a KNOWN exhausted or rate-limited reading blocks it.
+ * Unknown availability never blocks, and a person's explicit Harness/model is preserved — the caller reports the blocker so
+ * the Router can choose an authorized available resource instead of this code silently substituting one.
+ */
+export function harnessAcceptBlocker(spec: { harness: HarnessName; model?: string; forbid4a?: boolean; allowFallback?: boolean },
+  reading: AvailabilityReading): string | undefined {
+  const candidate: RouteCandidate = { harness: spec.harness, ...(spec.model ? { model: spec.model } : {}), capable: true, required: true, reading }
+  const evaluation = rankRouteCandidates([candidate], { allowFallback: spec.allowFallback === true }).evaluated[0]!
+  if (evaluation.excludedBecause === 'exhausted' || evaluation.excludedBecause === 'rate-limited')
+    return `Chosen ${spec.harness}${spec.model ? `/${spec.model}` : ''} is known ${evaluation.excludedBecause}: ${evaluation.reasons.join('; ')}.`
+      + ' Choose an authorized available resource or call orchestrator_rank_candidates.'
+  return undefined
 }
 
 /** A compact, comparable view of exactly what one model-surface refresh read, so a later refresh reports real changes. */
@@ -394,8 +651,10 @@ export function diffModelSurface(previous: ModelSurfaceSnapshot | undefined, cur
   const removed = catalogReadable ? (previous?.catalog ?? []).filter(id => !after.has(id)) : []
   const changed: { channel: string; from: Availability; to: Availability }[] = []
   for (const [channel, state] of Object.entries(current.availability)) {
-    const beforeState = previous?.availability[channel]
-    if (beforeState !== state) changed.push({ channel, from: beforeState ?? 'unknown', to: state })
+    // An absent baseline reads as unknown, so a newly seen model with no reading is not reported as a change; a real
+    // transition (unknown→available, available→exhausted) is.
+    const beforeState = previous?.availability[channel] ?? 'unknown'
+    if (beforeState !== state) changed.push({ channel, from: beforeState, to: state })
   }
   const sources = Object.entries(current.sources)
     .map(([name, status]) => ({ name, status, changed: previous?.sources[name] !== status }))

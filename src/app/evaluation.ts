@@ -24,6 +24,10 @@ export interface EvaluationRun {
   error?: string
   at?: string
   assignmentId: string
+  provider?: string
+  sessionId?: string
+  eventSeq?: number
+  requestId?: string
 }
 
 export interface EvaluationInput {
@@ -70,6 +74,10 @@ export function evaluationInput(ticket: Ticket): EvaluationInput {
     ?? (ticket.execution?.harnessRun ? [ticket.execution.harnessRun] : []))
     .map(run => ({
       harness: run.harness, assignmentId: run.assignmentId,
+      ...(run.provider ? { provider: run.provider } : {}),
+      ...(run.sessionId ? { sessionId: run.sessionId } : {}),
+      ...(run.eventSeq !== undefined ? { eventSeq: run.eventSeq } : {}),
+      ...(run.requestId ? { requestId: run.requestId } : {}),
       ...(run.status ? { status: run.status } : {}),
       ...(run.requestedModel ? { requestedModel: run.requestedModel } : {}),
       ...(run.servedModel ? { servedModel: run.servedModel } : {}),
@@ -100,6 +108,10 @@ export function evaluationInput(ticket: Ticket): EvaluationInput {
   }
   const resources: HarnessUsage & { unknown: string[] } = { ...fullSubtotals, unknown: resourcesUnknown }
   const unknowns = new Set<string>()
+  // Neither worker reports nor successful model settlements verify artifact quality. No structured result/acceptance
+  // source is currently recorded on a Ticket; keep that gap visible even after its execution ends.
+  unknowns.add('machine_verified_test_results')
+  unknowns.add('user_acceptance')
   for (const key of USAGE_KEYS) if (!(key in fullSubtotals)) unknowns.add(usageLabel(key))
 
   const failures = runs.filter(run => run.status === 'failed')
@@ -107,6 +119,7 @@ export function evaluationInput(ticket: Ticket): EvaluationInput {
   for (const run of runs) if (!run.servedModel) unknowns.add(`served_model:${run.harness}`)
 
   const latestAssignmentId = ticket.assignments.at(-1)?.id
+  // Verified means an observed completion, not a verified model identity; missing served models remain in unknowns.
   const verified = runs.some(run => run.status === 'finished' && run.assignmentId === latestAssignmentId)
   const confidence = verified ? 'verified' : runs.length ? 'claimed' : 'none'
   const latest = latestReport(ticket)

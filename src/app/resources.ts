@@ -1,6 +1,6 @@
 /** Serves paginated context resources to orchestrator_read so large bodies stay out of model prompts until requested. */
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import { UserError, key, latestReport, reached, runningAssignment, threadKey, type Ticket, type Trigger } from '../core/index.ts'
+import { UserError, key, latestReport, reached, runningAssignment, threadKey, type HarnessName, type Ticket, type Trigger } from '../core/index.ts'
 import { batchOf, inputMessage, triggerMessage, workerSessionId } from '../executor/dsh.ts'
 import { readGithub } from '../sources/github-read.ts'
 import { feishuReferences, feishuRead } from '../sources/feishu-read.ts'
@@ -12,8 +12,9 @@ import { threadTitle } from './views/records.ts'
 import { ticketStatusCountsOf } from './views/tickets.ts'
 import { transcriptEntry } from './context.ts'
 import { builtInParts, defaultPrompts } from './prompts.ts'
-import { diffModelSurface, summarizeCodexQuotaSignals, summarizeRoutingSignals, type ModelSurfaceSnapshot } from './routing.ts'
+import { diffModelSurface, harnessDispatchable, summarizeCodexQuotaSignals, summarizeHarnessAvailability, summarizeRoutingSignals, type HarnessModelSource, type ModelSurfaceSnapshot } from './routing.ts'
 import { evaluationInput } from './evaluation.ts'
+import { isRouteAuthorized, readSelection, selectionView } from './models.ts'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Commands } from '../infra/commands.ts'
 import type { PromptVersion, Prompts } from './prompts.ts'
@@ -59,6 +60,36 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
 ]
 export const resourceGrammar = (executor: boolean): string => RESOURCES.filter(resource => !executor || resource.executor)
   .map(resource => `${resource.name}: ${resource.holds}`).join('; ')
+
+/**
+ * The authorizable Worker model pool the Router may pick from: every resolvable DSH catalog route read on the last scan
+ * (per provider, so same-name models stay independent) plus dispatchable external models, each with the user's
+ * authorization. Availability is not fabricated here; an unknown route stays in the pool to be scored, not assumed healthy.
+ */
+function authorizedModelPool(host: ResourceHost, catalog?: { groups: readonly { id: string; models: readonly { id: string }[] }[];
+  routableProviders?: readonly string[] }): { harness: HarnessName; provider: string; model: string; authorized: boolean }[] {
+  const readable = typeof host.store.get === 'function'
+  const scan = readable ? host.store.get(KV.models.scan) : undefined
+  const selection = readable ? readSelection(host.store) : undefined
+  const sources = (scan?.harnessModels ?? []) as HarnessModelSource[]
+  const external = sources.filter(source => source.status === 'ok').flatMap(source => source.models
+    .filter(model => harnessDispatchable(source.harness as HarnessName, model))
+    .map(model => ({ harness: source.harness as HarnessName, provider: source.provider, model,
+      authorized: isRouteAuthorized(selection, source.harness as HarnessName, model) })))
+  const route = host.store.settings().executor.model
+  // Prefer the live catalog so the pool does not wait for a scan; fall back to the last scan's recorded routes.
+  const live = catalog ? catalog.groups
+    .filter(group => catalog.routableProviders === undefined || catalog.routableProviders.includes(group.id))
+    .flatMap(group => group.models.map(model => ({ provider: group.id, model: model.id }))) : []
+  const routes = live.length ? live : (scan?.dshCatalog ?? [])
+  const dsh = routes.map(entry => ({ harness: 'dsh' as HarnessName, provider: entry.provider,
+    model: entry.model, authorized: isRouteAuthorized(selection, 'dsh', entry.model, entry.provider) }))
+  // Before a scan or for a configured route absent from the catalog, keep the configured DSH route as one candidate.
+  const configured = route?.model && !dsh.some(entry => entry.provider === (route.provider ?? 'dsh') && entry.model === route.model)
+    ? [{ harness: 'dsh' as HarnessName, provider: route.provider ?? 'dsh', model: route.model,
+      authorized: isRouteAuthorized(selection, 'dsh', route.model, route.provider) }] : []
+  return [...dsh, ...configured, ...external]
+}
 
 export interface ResourceHost {
   readonly store: Pick<Store, 'get' | 'settings' | 'triggers' | 'tickets' | 'threads' | 'read' | 'decisions' | 'replyStatus'>
@@ -222,6 +253,11 @@ const ROUTES: readonly Route[] = [
     return { default: catalog.default, roles, failures: catalog.failures,
       providers: catalog.groups.map(group => ({ id: group.id, name: group.name, count: group.models.length, read: `models/${group.id}` })),
       magpie, codex_quota: codexQuota, routing, codex_routing: summarizeCodexQuotaSignals(codexQuota),
+      // The same per-Harness availability the dispatch gate uses, so the Router reads one consistent view.
+      harnesses: summarizeHarnessAvailability({ magpie, codex: codexQuota }),
+      // The user's explicit enabled-route set the dispatch gate enforces (null = every route is authorized).
+      authorization: typeof host.store.get === 'function' ? selectionView(host.store) : { explicit: false, enabled: null },
+      authorized_models: authorizedModelPool(host, catalog),
       quality_reviews: host.store.tickets.list().flatMap(ticket => (ticket.execution?.qualityReviews ?? []).map(review => ({ ticket_id: ticket.id, ...review }))),
       quality_status: 'Provisional unless exact live identity, comparable context, calibrated review and sufficiency evidence exist; use orchestrator_rank_candidates.',
       refresh: { first: previous === undefined, ...refresh } }

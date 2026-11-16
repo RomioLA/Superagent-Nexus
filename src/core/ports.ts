@@ -43,8 +43,10 @@ export interface ProjectTarget { repository: string; root?: string; localOnly?: 
 export type HarnessName = 'dsh' | 'agy' | 'codex' | 'grok'
 export interface HarnessSpec {
   harness: HarnessName
-  /** AGY takes '3.8f' | '4a'; Codex takes a model alias such as 'gpt-6-luna'; Grok is pinned by its adapter. */
+  /** AGY takes '3.8f' | '4a'; Codex takes a model alias such as 'gpt-6-luna'; Grok is pinned by its adapter; DSH takes one catalog model id. */
   model?: string
+  /** DSH only: the catalog provider that owns `model`, so the same model name under two providers stays a separate route. */
+  provider?: string
   /** Per-task access restriction; omitted on a correction preserves the prior restriction. */
   mode?: 'read-only' | 'write'
   /** The owner forbade model=4a, so a 3.8f capacity failure must be reported, never upgraded. */
